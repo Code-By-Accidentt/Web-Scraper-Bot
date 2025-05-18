@@ -1,8 +1,6 @@
 # 🕵️‍♂️ Website Contract Monitor Bot
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python)
-![License](https://img.shields.io/github/license/Tomashevskyi-Vladyslav/Website_Contract_Monitor_Bot/blob/main/SECURITY.md/website‑contract‑monitor)
-![Issues](https://img.shields.io/github/issues/your‑org/website‑contract‑monitor)
 
 > **Automated Web Watcher for Smart‑Contract Addresses**
 > Tracks multiple websites (and their common sub‑pages) for Ethereum & Solana addresses, validates them over RPC, sends Telegram alerts, **auto‑pauses** when too many contracts appear, and keeps a full change‑log diff of every page.
