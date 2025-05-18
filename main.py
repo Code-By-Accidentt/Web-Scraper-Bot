@@ -35,9 +35,9 @@ solana_client = SolanaClient(SOLANA_RPC_URL)
 
 
 # ──────────────── TELEGRAM ────────────────
-TELEGRAM_BOT_TOKEN = "7902331563:AAHZMdJ8ODtn6cJnw3Tx8sJIw1CoVtCv7_0"
+TELEGRAM_BOT_TOKEN = ""
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-CHAT_IDS = [995250840, 697976816]
+CHAT_IDS = []
 
 
 # ──────────────── FILES ────────────────
