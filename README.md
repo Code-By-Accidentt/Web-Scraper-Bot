@@ -117,8 +117,6 @@ Feel free to tweak those values at the top of `bot.py`.
    * Auto‑pauses the root site (and all its sub‑pages).
 4. All snapshots, counters and caches are flushed to disk every time a diff or command modifies the state.
 
-![flowchart](docs/flowchart.svg)
-
 ---
 
 ## 🛠 Development
