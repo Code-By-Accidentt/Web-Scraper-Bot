@@ -145,7 +145,7 @@ make lint      # ruff + mypy
 4. Push to the branch: `git push origin feat/amazing`
 5. Open a **Pull Request**
 
-Please run `pre‑commit` before pushing 🙏
+Please run `pre‑commit` before pushing
 
 ---
 
