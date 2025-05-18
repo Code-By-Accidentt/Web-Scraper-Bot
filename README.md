@@ -1,7 +1,7 @@
 # 🕵️‍♂️ Website Contract Monitor Bot
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python)
-![License](https://img.shields.io/github/license/your‑org/website‑contract‑monitor)
+![License](https://github.com/Tomashevskyi-Vladyslav/Website_Contract_Monitor_Bot/blob/main/SECURITY.md)
 ![Issues](https://img.shields.io/github/issues/your‑org/website‑contract‑monitor)
 
 > **Automated Web Watcher for Smart‑Contract Addresses**
