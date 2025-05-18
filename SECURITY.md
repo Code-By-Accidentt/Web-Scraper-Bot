@@ -66,7 +66,3 @@ pip list --outdated
 * **Monitoring & Logging:** Review logs for unexpected errors and monitor for unusual bot behavior.
 
 ---
-
-## Acknowledgments
-
-Thank you to everyone who helps keep this project secure! ❤️
