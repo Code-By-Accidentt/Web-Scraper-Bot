@@ -44,8 +44,8 @@
 
 ```bash
 # 1.  Clone the repo
-$ git clone https://github.com/your‑org/website‑contract‑monitor.git
-$ cd website‑contract‑monitor
+$ git clone https://github.com/Tomashevskyi-Vladyslav/Website_Contract_Monitor_Bot.git
+$ cd Website_Contract_Monitor_Bot
 
 # 2.  Create Python 3.10+ venv & install deps
 $ python -m venv .venv && source .venv/bin/activate
