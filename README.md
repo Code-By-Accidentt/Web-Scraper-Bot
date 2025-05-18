@@ -162,7 +162,6 @@ Distributed under the MIT License.  See `LICENSE` for more information.
 ## 🙏 Acknowledgements
 
 * [web3.py](https://github.com/ethereum/web3.py)
-* [solana‑py](https://github.com/michaelhly/solana‑py)
-* [Selenium](https://selenium.dev/) & [ChromeDriver](https://chromedriver.chromium.org/)
-* [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/)
-* All the awesome open‑source maintainers out there ❤️
+* [solana‑py](https://github.com/michaelhly/solana-py)
+* [Selenium](https://www.selenium.dev/documentation/) & [ChromeDriver](https://developer.chrome.com/docs/chromedriver/get-started)
+* [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/bs4/doc/)
