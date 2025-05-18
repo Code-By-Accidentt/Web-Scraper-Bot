@@ -27,7 +27,8 @@
 
 ```text
 .
-├── main.py                  # Main entry‑point (this repo’s giant script)
+├── main.py                 # Main entry‑point (this repo’s giant script)
+├── rebooter.py             # A mandatory rebooter so that the bot continues working immediately after rebooting.
 ├── requirements.txt        # Exact, pinned runtime deps
 ├── snapshots/              # HTML snapshots for diffing (auto‑generated)
 ├── monitored_sites.txt     # URLs added via /add (one per line)
