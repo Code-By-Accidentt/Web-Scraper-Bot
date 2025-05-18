@@ -1,7 +1,5 @@
 # Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International Public License
 
-**This is a human-readable summary of (and not a substitute for) the license.**
-
 ## Preamble
 
 The Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International Public License ("CC BY-NC-ND 4.0") grants you the rights to share this work — to copy and redistribute the material in any medium or format — under the following terms.
