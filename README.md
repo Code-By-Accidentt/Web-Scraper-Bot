@@ -140,7 +140,7 @@ make lint      # ruff + mypy
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 1. **Fork** the repo
 2. Create your feature branch: `git checkout -b feat/amazing`
