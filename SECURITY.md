@@ -19,7 +19,7 @@ If you discover a security vulnerability in this project, please follow these st
 1. **Do NOT create a public issue.** Instead, send an email to the security mailing list:
 
    ```
-   security@your-org.dev
+   security@Tomashevskyi-Vladyslav.dev
    ```
 2. Include in your report:
 
