@@ -158,7 +158,7 @@ Distributed under the MIT License.  See `LICENSE` for more information.
 
 ---
 
-## Acknowledgements
+## Acknowledgements/Additional Documentation
 
 * [web3.py](https://github.com/ethereum/web3.py)
 * [solana‑py](https://github.com/michaelhly/solana-py)
