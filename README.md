@@ -27,6 +27,7 @@
 .
 ├── main.py                    # Main entry‑point (this repo’s giant script)
 ├── rebooter.py                # A mandatory rebooter so that the bot continues working immediately after rebooting.
+├── pons_dev_fees.py           # Standalone: creator‑fee forensics for Pons launches on Robinhood Chain
 ├── requirements.txt           # Exact, pinned runtime deps
 ├── snapshots/                 # HTML snapshots for diffing (auto‑generated)
 ├── monitored_sites.txt        # URLs added via /add (one per line)
@@ -117,6 +118,49 @@ Feel free to tweak those values at the top of `bot.py`.
    * Sends them as a `.txt` document.
    * Auto‑pauses the root site (and all its sub‑pages).
 4. All snapshots, counters and caches are flushed to disk every time a diff or command modifies the state.
+
+---
+
+## 🧾 Pons Creator‑Fee Analyser (Robinhood Chain)
+
+`pons_dev_fees.py` is a standalone CLI, independent of the Telegram bot. Given a token launched
+through [pons.family](https://ponsfamily.com) on Robinhood Chain (chain id `4663`), it answers
+**how much the token's dev actually earned in fees** and **where that money is now**.
+
+```bash
+python pons_dev_fees.py 0x<token> \
+    --rpc https://rpc.mainnet.chain.robinhood.com \
+    --json report.json
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--rpc URL` | JSON‑RPC endpoint (default: the public Robinhood Chain RPC, which is rate‑limited) |
+| `--explorer URL` | Blockscout base URL, used only for wallet history (default `robinhoodchain.blockscout.com`) |
+| `--no-explorer` | RPC‑only mode: skips wallet history and claim tracing via the explorer index |
+| `--from-block N` | Force the first block to scan (otherwise the launch block is discovered automatically) |
+| `--chunk N` | `eth_getLogs` window size; the client narrows it automatically when a node rejects the range |
+| `--json FILE` | Dump every decoded record, event and balance as JSON |
+
+**What it reports**
+
+* **Earned** — creator fees actually credited, summed from `FeesSwept` (bonding curve, pre‑graduation)
+  and `PoolFeesSwept` (the `PonsV2MemeHook` on the graduated Uniswap V4 pool). Both figures already
+  include the creator tax, which bypasses the protocol/buyback split.
+* **Pending** — fees accrued but not yet swept, read live from `quoteFeeBalance` / `creatorTaxBalance`
+  on the curve and `pendingFees` / `pendingCreatorTax` on the hook, reported as a min–max range because
+  the buyback earmark folds back into the creator's payout when the venue is too thin to execute it.
+* **Where it is now** — unclaimed balance in `PonsV2FeeEscrow`, claim payouts to the fee wallet,
+  the wallet's current balance, and where value left it afterwards.
+* **Fee wallet changes** — every `CreatorFeeRecipientUpdated` for the launch.
+
+Pons **V1** launches (`PonsLaunchFactory`) are handled too: there the creator's revenue is the Uniswap V3
+fee on the permanently locked position, so the tool sums the position's `Collect` events and simulates a
+`collect` call for the amount still uncollected.
+
+The fee accounting mirrors the verified sources at
+[`ponsdotdev/ponsfamily`](https://github.com/ponsdotdev/ponsfamily); factory addresses are pinned in the
+script. Requires `requests`, `eth-abi` and `eth-utils` — all already in `requirements.txt`.
 
 ---
 
