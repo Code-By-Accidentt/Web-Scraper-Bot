@@ -11,7 +11,10 @@ Telegram-controlled watcher that renders websites in a headless browser, reports
 * **Real rendering, fast** – one shared Chromium (Playwright), pages rendered in parallel tabs, waits for network idle instead of sleeping.
 * **Root URL + sub-pages** – every site is watched together with a configurable set of derived pages (`app.<domain>`, `docs.<domain>`, `/dashboard`, …); a sub-page is announced once when it first appears.
 * **Change detection that does not lie** – structural diff of the rendered DOM (text + attributes), every change confirmed by a second render, everything that differs between the two renders (timers, counters, banners) is ignored. Alerts say *what* changed, not only how much.
-* **Contract discovery** – `0x…` and Solana addresses are extracted from the full HTML, validated over JSON-RPC (bytecode + ERC-20 probe on 8 EVM networks in parallel, program / SPL-mint check on Solana) and cached.
+* **Contract discovery** – `0x…` and Solana addresses are extracted from the full rendered HTML (text, attributes, comments, meta, inline scripts and JSON) and, with deep scan, from iframes, shadow DOM and every script or JSON answer the page loaded. Candidates are validated over JSON-RPC (bytecode + ERC-20 probe on 8 EVM networks in parallel, program / SPL-mint check on Solana) and cached.
+* **Noise control** – an element that keeps changing round after round (counters, rotating banners) is silenced after two alerts for as long as it keeps flapping.
+* **Turbo mode** – `/turbo <url>` renders a site every 2 s (optionally from a scheduled time) and announces every new address immediately, even before the chain confirms it; the session ends by itself after the first confirmed contract or when the time is up.
+* **Block awareness** – 403/429/503 answers, WAF challenge pages and connection resets are recognised; the site's interval doubles per round (up to `BLOCK_MAX_BACKOFF`), turbo stops, and you get one warning plus a recovery notice.
 * **Auto-pause** – when one page reveals ≥ N new contracts at once the addresses are shipped as a `.txt` document and the site is paused.
 * **Persistent** – sites, pause/notification flags, snapshots and caches live under `data/` and survive restarts. `rebooter.py` restarts the bot when it dies or stops heart-beating.
 
@@ -30,6 +33,9 @@ scraper_bot/
   fetcher.py                # PlaywrightFetcher (browser) + HttpProber (HEAD/GET probe)
   html_normalizer.py        # rendered HTML -> ordered list of nodes
   change_detector.py        # diff of node lists, volatile-node filtering
+  noise_filter.py           # silences elements that keep changing (flapping memory)
+  blocking.py               # recognises rate limits, WAF challenges and connection resets
+  turbo.py                  # turbo sessions and their manager (/turbo)
   address_extractor.py      # regex + syntactic validation (EIP-55, base58)
   contract_validators.py    # EVM / Solana RPC checks + caching facade
   rpc.py                    # tiny JSON-RPC client
@@ -37,6 +43,7 @@ scraper_bot/
   site_monitor.py           # loop for one root site and its sub-pages
   monitor_manager.py        # add / remove / pause / resume, task lifecycle
   commands.py               # Telegram command parsing + long-polling listener
+  status.py                 # /status report (uptime, browser, rounds, caches)
   notifier.py               # alert formatting
   storage.py                # state.json, snapshots, address caches
   telegram_client.py        # Bot API client (httpx)
@@ -84,8 +91,13 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty = everyone | Chats allowed to send commands |
 | `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX` | 5 / 15 | Seconds between two rounds of one site (random within the range) |
 | `MAX_CONCURRENT_PAGES` | 6 | Browser tabs rendered at the same time |
-| `PAGE_LOAD_TIMEOUT` / `NETWORK_IDLE_TIMEOUT` / `SETTLE_DELAY` | 30 / 6 / 1 | Rendering timing, seconds |
+| `PAGE_LOAD_TIMEOUT` / `NETWORK_IDLE_TIMEOUT` / `SETTLE_DELAY` | 30 / 4 / 0.5 | Rendering timing, seconds (measured: pages go idle in ~1 s, 0.5 s settle gives identical output) |
 | `CONFIRM_DELAY` | 2 | Seconds between the two renders that confirm a change |
+| `FLAP_WINDOW_HOURS` / `FLAP_THRESHOLD` | 24 / 2 | Silence an element after it alerted `FLAP_THRESHOLD` times within the window (0 hours = off) |
+| `DEEP_SCAN` / `DEEP_SCAN_MAX_MB` | true / 10 | Also search iframes, shadow DOM and the scripts/JSON the page loaded; byte budget per render |
+| `TURBO_INTERVAL` / `TURBO_DEFAULT_MINUTES` / `TURBO_MAX_MINUTES` | 2 / 30 / 180 | Seconds between turbo renders, default and maximum session length |
+| `TURBO_STOP_AFTER` / `TURBO_MAX_SITES` / `TURBO_MAX_PAGES` / `TURBO_RECHECK_INTERVAL` | 1 / 1 / 4 / 5 | Confirmed contracts that end a session (0 = timer only), concurrent turbo sites, pages rendered per cycle (root included), seconds between on-chain re-checks of unverified addresses |
+| `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot |
 | `CONTRACT_PAUSE_THRESHOLD` | 5 | New contracts on one page that trigger the auto-pause |
 | `SUB_URL_PATTERNS` | see `.env.example` | Sub-pages derived from every root URL (`{domain}` = host without `www.`) |
 | `IGNORED_ATTRIBUTES` | nonce, csrf-token, … | HTML attributes that are never compared |
@@ -112,6 +124,9 @@ Every setting is an environment variable. A `.env` file in the working directory
 /list            sites with alert status, running state and last change
 /nonotifi <url>  mute change alerts for a site (contracts are still reported)   alias: /mute
 /notify <url>    un-mute change alerts                                         alias: /unmute
+/turbo <url> [minutes] [at HH:MM | in 10m]   turbo mode: render every 2 s until a contract appears
+/turbo stop <url>                            end turbo mode;  /turbo alone shows turbo status
+/status          uptime, browser state, blocked sites, turbo sessions, cache sizes
 /help            command list
 /start           command list + your chat id
 ```
@@ -122,11 +137,16 @@ Every setting is an environment variable. A `.env` file in the working directory
 
 1. Derived sub-pages are probed with a cheap `HEAD` (falling back to `GET`). Only pages that are conclusively missing (DNS failure, 404/410) are skipped; everything else is rendered.
 2. The page is rendered in Chromium: DOM content loaded → network idle (bounded) → short settle delay.
-3. The full HTML is scanned for addresses. Unknown candidates are validated: `eth_getCode` on every EVM network in parallel (plus the ERC-20 calls when required) or `getAccountInfo` on Solana. Verdicts are cached: confirmed forever, rejected for `REJECTED_TTL_HOURS`, failed lookups retried after `RPC_RETRY_DELAY`. Concurrent checks of the same address share one lookup.
+3. The full rendered HTML is scanned for addresses; with `DEEP_SCAN` the markup of iframes and shadow roots and the bodies of the scripts and JSON answers the page loaded are scanned too (they were downloaded by the browser anyway). Unknown candidates are validated: `eth_getCode` on every EVM network in parallel (plus the ERC-20 calls when required) or `getAccountInfo` on Solana. Verdicts are cached: confirmed forever, rejected for `REJECTED_TTL_HOURS`, failed lookups retried after `RPC_RETRY_DELAY`. Concurrent checks of the same address share one lookup.
 4. The HTML is reduced to an ordered list of nodes (tag, attributes, own text). Scripts, styles, svg and meta tags are dropped, tracking parameters are stripped from URLs, class tokens are sorted. The list is compared with the stored snapshot.
 5. If it differs, the page is rendered again after `CONFIRM_DELAY`. Nodes that differ between the two renders are volatile and excluded from the report together with their previous values. If one render is much smaller than the other (a truncated load) the round is skipped. Otherwise the snapshot advances to the second render, so noise never accumulates.
-6. A non-empty remaining diff is sent as an alert with counts and examples: `-` removed, `+` added, `~` attribute changes.
+6. Elements that already alerted `FLAP_THRESHOLD` times within `FLAP_WINDOW_HOURS` are dropped from the diff (the memory lives in the page's snapshot file and expires on its own). A non-empty remaining diff is sent as an alert with counts and examples: `-` removed, `+` added, `~` attribute changes.
 7. Contracts found on a page: fewer than the threshold → one message each; threshold or more → a `.txt` document and the site is auto-paused until `/resume`.
+8. Answers that look like a block (HTTP 401/403/407/429/503, a WAF challenge title such as "Just a moment…", a `cf-mitigated: challenge` header, connection resets) are never diffed. The site's interval doubles on every such round (bounded by `BLOCK_MAX_BACKOFF` and honouring `Retry-After`), one warning is sent, and a recovery notice follows when the root page answers normally again. The bot never tries to get around a block: slowing down is the only sane reaction.
+
+## 🚀 Turbo mode
+
+`/turbo https://launch.example` renders up to `TURBO_MAX_PAGES` pages per cycle (the root page plus its live sub-pages) every `TURBO_INTERVAL` seconds (full renders with deep scan, no change alerts) for `TURBO_DEFAULT_MINUTES` minutes, or `/turbo <url> 15` for 15 minutes. `/turbo <url> at 15:30` or `/turbo <url> in 10m` arms it for a launch time. Addresses that were already on the pages when the session started are watched silently; every address that appears later is announced at once as *unverified* and re-checked on-chain every `TURBO_RECHECK_INTERVAL` seconds, ignoring the regular negative cache, so an address published before its contract is deployed is confirmed as soon as the deployment lands. The session ends after `TURBO_STOP_AFTER` confirmed contracts, when the time is up, on `/turbo stop <url>`, or when the site starts refusing us; the closing message lists what was found. At most `TURBO_MAX_SITES` sites can be in turbo at once and sessions do not survive a restart.
 
 ---
 
@@ -136,6 +156,7 @@ Every setting is an environment variable. A `.env` file in the working directory
 pip install -r requirements-dev.txt
 pytest -q                                # unit tests (no network, no browser)
 ruff check . && ruff format --check .    # lint + formatting
+SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/test_fetcher_browser.py   # real-browser test (opt-in)
 ```
 
 ---

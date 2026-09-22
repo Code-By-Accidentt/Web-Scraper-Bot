@@ -174,29 +174,42 @@ class ContractValidator:
         self._retry_after: dict[Address, float] = {}
         self._inflight: dict[Address, asyncio.Task[ValidationResult]] = {}
 
-    async def validate_many(self, addresses: Iterable[Address]) -> list[ValidationResult]:
-        return list(await asyncio.gather(*(self.validate(a) for a in addresses)))
+    async def validate_many(
+        self, addresses: Iterable[Address], *, negative_cache: bool = True
+    ) -> list[ValidationResult]:
+        return list(
+            await asyncio.gather(
+                *(self.validate(a, negative_cache=negative_cache) for a in addresses)
+            )
+        )
 
-    async def validate(self, address: Address) -> ValidationResult:
+    async def validate(self, address: Address, *, negative_cache: bool = True) -> ValidationResult:
+        """Verdict for ``address``.
+
+        With ``negative_cache=False`` (turbo mode) earlier rejections and RPC
+        failures are ignored and a new rejection is not remembered, so an address
+        published before its contract is deployed can be re-checked freely.
+        """
         if self._cache.is_known(address):
             return ValidationResult(address, ValidationStatus.ALREADY_KNOWN)
-        if self._cache.is_rejected(address):
-            return ValidationResult(address, ValidationStatus.ALREADY_REJECTED)
-        not_before = self._retry_after.get(address)
-        if not_before is not None:
-            if self._clock() < not_before:
-                return ValidationResult(address, ValidationStatus.UNAVAILABLE)
-            del self._retry_after[address]
+        if negative_cache:
+            if self._cache.is_rejected(address):
+                return ValidationResult(address, ValidationStatus.ALREADY_REJECTED)
+            not_before = self._retry_after.get(address)
+            if not_before is not None:
+                if self._clock() < not_before:
+                    return ValidationResult(address, ValidationStatus.UNAVAILABLE)
+                del self._retry_after[address]
 
         task = self._inflight.get(address)
         if task is None:
-            task = asyncio.create_task(self._validate_uncached(address))
+            task = asyncio.create_task(self._validate_uncached(address, negative_cache))
             self._inflight[address] = task
             task.add_done_callback(lambda _: self._inflight.pop(address, None))
         # shield: a cancelled caller must not cancel the check other callers wait for
         return await asyncio.shield(task)
 
-    async def _validate_uncached(self, address: Address) -> ValidationResult:
+    async def _validate_uncached(self, address: Address, negative_cache: bool) -> ValidationResult:
         async with self._semaphore:
             try:
                 network = await self._lookup(address)
@@ -210,10 +223,12 @@ class ContractValidator:
                     exc,
                     self._retry_delay,
                 )
-                self._retry_after[address] = self._clock() + self._retry_delay
+                if negative_cache:
+                    self._retry_after[address] = self._clock() + self._retry_delay
                 return ValidationResult(address, ValidationStatus.UNAVAILABLE)
         if network is None:
-            self._cache.add_rejected(address)
+            if negative_cache:
+                self._cache.add_rejected(address)
             log.info("%s %s is not a contract", address.chain.value, address)
             return ValidationResult(address, ValidationStatus.REJECTED)
         self._cache.add_known(ConfirmedContract(address, network))

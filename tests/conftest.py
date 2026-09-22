@@ -23,6 +23,8 @@ from scraper_bot.models import (
     ValidationResult,
     ValidationStatus,
 )
+from scraper_bot.site_monitor import MonitorStats
+from scraper_bot.turbo import TurboStats
 
 MINIMAL_ENV = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_IDS": "1,2"}
 
@@ -53,8 +55,21 @@ class FakeFetcher:
     def script(self, url: str, *results: FetchResult) -> None:
         self.scripts[url].extend(results)
 
-    def html(self, url: str, *pages: str, status: int = 200) -> None:
-        self.script(url, *(FetchResult(url, status, page) for page in pages))
+    def html(
+        self,
+        url: str,
+        *pages: str,
+        status: int = 200,
+        extra: tuple[str, ...] = (),
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.script(
+            url,
+            *(
+                FetchResult(url, status, page, extra_texts=extra, headers=headers or {})
+                for page in pages
+            ),
+        )
 
     async def fetch(self, url: str) -> FetchResult:
         self.calls.append(url)
@@ -65,17 +80,43 @@ class FakeFetcher:
 
 
 class FakeValidator:
+    """Scripted verdicts: a list per address, the last entry repeats forever."""
+
     def __init__(self) -> None:
-        self.verdicts: dict[Address, ValidationResult] = {}
+        self.verdicts: dict[Address, list[ValidationResult]] = {}
         self.calls: list[list[Address]] = []
+        self.negative_cache_calls: list[bool] = []
 
     def confirm(self, address: Address, network: str = "Ethereum") -> None:
-        self.verdicts[address] = ValidationResult(address, ValidationStatus.CONFIRMED, network)
+        self.verdicts[address] = [ValidationResult(address, ValidationStatus.CONFIRMED, network)]
 
-    async def validate_many(self, addresses: Iterable[Address]) -> list[ValidationResult]:
+    def reject_then_confirm(
+        self, address: Address, network: str = "Ethereum", rejections: int = 1
+    ) -> None:
+        self.verdicts[address] = [ValidationResult(address, ValidationStatus.REJECTED)] * (
+            rejections
+        ) + [ValidationResult(address, ValidationStatus.CONFIRMED, network)]
+
+    def known(self, address: Address) -> None:
+        self.verdicts[address] = [ValidationResult(address, ValidationStatus.ALREADY_KNOWN)]
+
+    async def validate(self, address: Address, *, negative_cache: bool = True) -> ValidationResult:
+        return (await self.validate_many([address], negative_cache=negative_cache))[0]
+
+    async def validate_many(
+        self, addresses: Iterable[Address], *, negative_cache: bool = True
+    ) -> list[ValidationResult]:
         batch = list(addresses)
         self.calls.append(batch)
-        return [self.verdicts.get(a, ValidationResult(a, ValidationStatus.REJECTED)) for a in batch]
+        self.negative_cache_calls.append(negative_cache)
+        results: list[ValidationResult] = []
+        for address in batch:
+            queue = self.verdicts.get(address)
+            if not queue:
+                results.append(ValidationResult(address, ValidationStatus.REJECTED))
+            else:
+                results.append(queue.pop(0) if len(queue) > 1 else queue[0])
+        return results
 
 
 class FakeProber:
@@ -98,6 +139,12 @@ class FakeNotifier:
         self.contracts: list[tuple[ConfirmedContract, str]] = []
         self.batches: list[tuple[str, str, tuple[ConfirmedContract, ...]]] = []
         self.paused: list[tuple[str, str, int]] = []
+        self.turbo_started_calls: list[tuple[str, int, float, float, int]] = []
+        self.unverified: list[tuple[Address, str]] = []
+        self.confirmed: list[tuple[ConfirmedContract, str]] = []
+        self.turbo_finished_calls: list[tuple[str, str, int]] = []
+        self.blocked: list[tuple[str, str, str, float]] = []
+        self.recovered: list[str] = []
 
     async def page_discovered(self, page_url: str) -> None:
         self.discovered.append(page_url)
@@ -117,6 +164,37 @@ class FakeNotifier:
         self, site_url: str, page_url: str, count: int, pages: Sequence[str]
     ) -> None:
         self.paused.append((site_url, page_url, count))
+
+    async def turbo_started(
+        self, site_url: str, pages: int, interval: float, minutes: float, stop_after: int
+    ) -> None:
+        self.turbo_started_calls.append((site_url, pages, interval, minutes, stop_after))
+
+    async def unverified_address(
+        self, address: Address, page_url: str, recheck_interval: float
+    ) -> None:
+        self.unverified.append((address, page_url))
+
+    async def address_confirmed(self, contract: ConfirmedContract, page_url: str) -> None:
+        self.confirmed.append((contract, page_url))
+
+    async def turbo_finished(
+        self,
+        site_url: str,
+        reason: str,
+        contracts: Sequence[ConfirmedContract],
+        seconds: float,
+        renders: int,
+    ) -> None:
+        self.turbo_finished_calls.append((site_url, reason, len(contracts)))
+
+    async def site_blocked(
+        self, site_url: str, page_url: str, reason: str, next_delay: float
+    ) -> None:
+        self.blocked.append((site_url, page_url, reason, next_delay))
+
+    async def site_recovered(self, site_url: str) -> None:
+        self.recovered.append(site_url)
 
 
 class FakeChecker:
@@ -175,6 +253,7 @@ class StubMonitor:
         self.on_auto_pause = on_auto_pause
         self.crash = crash
         self.started = False
+        self.stats = MonitorStats()
         self._stop = asyncio.Event()
 
     @property
@@ -189,3 +268,29 @@ class StubMonitor:
         if self.crash:
             raise RuntimeError("boom")
         await self._stop.wait()
+
+
+class StubTurboSession:
+    """Stand-in for TurboSession: records its arguments and runs until stopped."""
+
+    def __init__(self, url: str, pages: list[str], duration: float) -> None:
+        self.url = url
+        self.pages = list(pages)
+        self.duration = duration
+        self.stats = TurboStats()
+        self.stop_reason: str | None = None
+        self._stop = asyncio.Event()
+
+    @property
+    def seconds_left(self) -> float:
+        return self.duration
+
+    def request_stop(self, reason: str = "stopped manually") -> None:
+        self.stop_reason = reason
+        self._stop.set()
+
+    async def run(self) -> TurboStats:
+        self.stats.started_at = 0.0
+        await self._stop.wait()
+        self.stats.stop_reason = self.stop_reason
+        return self.stats

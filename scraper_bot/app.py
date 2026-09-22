@@ -13,6 +13,7 @@ import httpx
 
 from scraper_bot import __version__
 from scraper_bot.address_extractor import AddressExtractor
+from scraper_bot.blocking import BlockDetector
 from scraper_bot.change_detector import ChangeDetector
 from scraper_bot.commands import BotCommands, TelegramListener
 from scraper_bot.config import ConfigError, Settings
@@ -25,9 +26,11 @@ from scraper_bot.fetcher import HttpProber, PlaywrightFetcher
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import SiteState
 from scraper_bot.monitor_manager import MonitorManager
+from scraper_bot.noise_filter import NoiseFilter
 from scraper_bot.notifier import Notifier
 from scraper_bot.page_checker import PageChecker
 from scraper_bot.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
+from scraper_bot.status import StatusReporter
 from scraper_bot.storage import (
     AddressCache,
     LegacyStateImporter,
@@ -36,6 +39,7 @@ from scraper_bot.storage import (
     atomic_write_text,
 )
 from scraper_bot.telegram_client import TelegramAuthError, TelegramClient
+from scraper_bot.turbo import TurboLimits, TurboManager, TurboSession
 from scraper_bot.urls import SubUrlDeriver
 
 log = logging.getLogger(__name__)
@@ -98,14 +102,18 @@ class Application:
             retry_delay=cfg.rpc_retry_delay,
         )
         snapshots = SnapshotStore(cfg.data_dir / "snapshots")
+        extractor = AddressExtractor()
+        block_detector = BlockDetector()
         checker = PageChecker(
             fetcher=fetcher,
             normalizer=HtmlNormalizer(cfg.ignored_attributes),
             detector=ChangeDetector(),
-            extractor=AddressExtractor(),
+            extractor=extractor,
             validator=validator,
             snapshots=snapshots,
+            noise_filter=NoiseFilter(cfg.flap_window, cfg.flap_threshold),
             confirm_delay=cfg.confirm_delay,
+            block_detector=block_detector,
         )
         prober = HttpProber(http)
         deriver = SubUrlDeriver(cfg.sub_url_patterns)
@@ -123,7 +131,36 @@ class Application:
                 on_auto_pause=on_auto_pause,
                 poll_interval=(cfg.poll_interval_min, cfg.poll_interval_max),
                 contract_threshold=cfg.contract_pause_threshold,
+                max_backoff=cfg.block_max_backoff,
             )
+
+        turbo_limits = TurboLimits(
+            interval=cfg.turbo_interval,
+            default_minutes=cfg.turbo_default_minutes,
+            max_minutes=cfg.turbo_max_minutes,
+            stop_after=cfg.turbo_stop_after,
+            max_sites=cfg.turbo_max_sites,
+            max_pages=cfg.turbo_max_pages,
+            recheck_interval=cfg.turbo_recheck_interval,
+        )
+
+        def build_turbo(url: str, pages: list[str], duration: float) -> TurboSession:
+            return TurboSession(
+                url,
+                pages,
+                fetcher=fetcher,
+                extractor=extractor,
+                validator=validator,
+                cache=cache,
+                notifier=notifier,
+                block_detector=block_detector,
+                limits=turbo_limits,
+                duration=duration,
+            )
+
+        turbo = TurboManager(
+            limits=turbo_limits, deriver=deriver, prober=prober, session_factory=build_turbo
+        )
 
         manager = MonitorManager(
             state_store=StateStore(cfg.data_dir / "state.json"),
@@ -134,11 +171,16 @@ class Application:
         )
         await manager.start()
 
+        status = StatusReporter(
+            version=__version__, manager=manager, cache=cache, browser=fetcher, turbo=turbo
+        )
         commands = BotCommands(
             manager,
             telegram,
             allowed_chat_ids=cfg.allowed_chat_ids,
             alert_chat_ids=cfg.chat_ids,
+            status_provider=status.render,
+            turbo=turbo,
         )
         listener = TelegramListener(telegram, commands)
         heartbeat = Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval)
@@ -152,6 +194,7 @@ class Application:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await turbo.shutdown()
             await manager.shutdown()
 
     @staticmethod

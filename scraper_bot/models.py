@@ -82,6 +82,25 @@ Signature = tuple[Node, ...]
 
 
 @dataclass(frozen=True, slots=True)
+class NoiseEntry:
+    """How often an element changed recently; used to silence flapping elements."""
+
+    count: int
+    last_seen: float
+
+
+NoiseMemory = dict[str, NoiseEntry]
+
+
+@dataclass(slots=True)
+class Snapshot:
+    """What is stored per page: the last accepted signature plus the noise memory."""
+
+    signature: Signature
+    noise: NoiseMemory = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class ChangeCounts:
     removed: int = 0
     added: int = 0
@@ -167,6 +186,14 @@ class SiteState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BlockSignal:
+    """Evidence that the site is refusing us (rate limit, WAF challenge, IP ban)."""
+
+    reason: str
+    retry_after: float | None = None
+
+
 class PageStatus(Enum):
     UNAVAILABLE = "unavailable"  # fetch failed or non-2xx: nothing was compared
     BASELINE = "baseline"  # first snapshot stored
@@ -182,6 +209,7 @@ class PageCheckOutcome:
     contracts: tuple[ConfirmedContract, ...] = ()
     report: ChangeReport | None = None
     error: str | None = None
+    block: BlockSignal | None = None
 
 
 def shorten(text: str, limit: int) -> str:

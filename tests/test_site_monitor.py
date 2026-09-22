@@ -4,6 +4,7 @@ from typing import Any
 
 from scraper_bot.models import (
     Address,
+    BlockSignal,
     Chain,
     ChangeReport,
     ConfirmedContract,
@@ -64,6 +65,9 @@ async def test_round_checks_root_and_only_live_sub_pages() -> None:
     assert sorted(h.prober.calls) == [APP, DOCS]
     assert h.checker.calls == [ROOT, DOCS]
     assert [o.url for o in outcomes] == [ROOT, DOCS]
+    stats = h.monitor.stats
+    assert (stats.rounds, stats.last_pages) == (1, 2)
+    assert stats.last_round_at is not None and stats.last_round_seconds >= 0
 
 
 async def test_discovered_sub_page_is_announced_once_and_persisted() -> None:
@@ -147,3 +151,39 @@ async def test_run_loops_until_stopped() -> None:
     h.monitor.request_stop()
     await asyncio.wait_for(task, timeout=2)
     assert len(h.checker.calls) >= 2
+
+
+async def test_block_signal_doubles_the_interval_and_warns_once() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 403", block=BlockSignal("HTTP 403"))
+    await h.monitor.run_once()
+    assert h.monitor.stats.block_level == 1
+    assert h.monitor.stats.blocked and h.monitor.stats.block_reason == "HTTP 403"
+    assert len(h.notifier.blocked) == 1
+    site_url, page_url, reason, delay = h.notifier.blocked[0]
+    assert (site_url, page_url, reason) == (ROOT, ROOT, "HTTP 403")
+    assert 0.02 <= delay <= 0.04  # base 0.01-0.02 doubled once
+
+    await h.monitor.run_once()
+    assert h.monitor.stats.block_level == 2
+    assert len(h.notifier.blocked) == 1  # warned only once per block episode
+    assert 0.04 <= h.monitor.next_delay() <= 0.08
+
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()
+    assert not h.monitor.stats.blocked
+    assert h.notifier.recovered == [ROOT]
+
+
+async def test_retry_after_and_max_backoff_bound_the_delay() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, block=BlockSignal("HTTP 429", retry_after=5.0))
+    await h.monitor.run_once()
+    assert h.monitor.next_delay() == 5.0
+
+    capped = Harness(statuses={APP: 404, DOCS: 404})
+    capped.monitor._max_backoff = 0.03
+    for _ in range(6):
+        capped.outcome(ROOT, PageStatus.UNAVAILABLE, block=BlockSignal("HTTP 403"))
+        await capped.monitor.run_once()
+    assert capped.monitor.next_delay() <= 0.03

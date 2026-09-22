@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.models import SiteState
+from scraper_bot.models import SiteState, Snapshot
 from scraper_bot.monitor_manager import (
     MonitorManager,
     SiteAlreadyPaused,
@@ -98,12 +98,12 @@ async def test_remove_stops_monitor_and_deletes_only_its_snapshots(tmp_path: Pat
         await h.manager.add_site(ROOT)
         await h.manager.add_site("https://other.io")
         for url in (ROOT, APP, "https://other.io"):
-            h.snapshots.save(url, SIGNATURE)
+            h.snapshots.save(url, Snapshot(SIGNATURE))
         removed = await h.manager.remove_site("example.com")
         assert removed.url == ROOT
         assert not h.manager.is_running(ROOT)
         assert h.snapshots.load(ROOT) is None and h.snapshots.load(APP) is None
-        assert h.snapshots.load("https://other.io") == SIGNATURE
+        assert h.snapshots.load("https://other.io").signature == SIGNATURE
         assert ROOT not in h.state.load()
         with pytest.raises(SiteNotTracked):
             await h.manager.remove_site(ROOT)
@@ -115,13 +115,16 @@ async def test_start_restores_state_and_prunes_orphan_snapshots(tmp_path: Path) 
     h = Harness(tmp_path)
     h.state.save({ROOT: SiteState(ROOT, paused=True), "https://b.io": SiteState("https://b.io")})
     for url in (ROOT, APP, "https://gone.io"):
-        h.snapshots.save(url, SIGNATURE)
+        h.snapshots.save(url, Snapshot(SIGNATURE))
     await h.manager.start()
     try:
         assert not h.manager.is_running(ROOT)
         assert h.manager.is_running("https://b.io")
         assert h.snapshots.load("https://gone.io") is None
-        assert h.snapshots.load(ROOT) == SIGNATURE and h.snapshots.load(APP) == SIGNATURE
+        assert (
+            h.snapshots.load(ROOT).signature == SIGNATURE
+            and h.snapshots.load(APP).signature == SIGNATURE
+        )
         assert [site.url for site in h.manager.sites()] == ["https://b.io", ROOT]
     finally:
         await h.manager.shutdown()

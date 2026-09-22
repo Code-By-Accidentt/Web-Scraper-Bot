@@ -254,3 +254,25 @@ async def test_concurrent_checks_of_one_address_share_a_single_lookup(tmp_path: 
         results = await asyncio.gather(*(validator.validate(ETH) for _ in range(3)))
     assert [r.status for r in results] == [ValidationStatus.CONFIRMED] * 3
     assert rpc.count("alpha.rpc", "eth_getCode") == 1
+
+
+async def test_turbo_checks_bypass_and_do_not_write_the_negative_cache(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", no_contract)
+    rpc.route("beta.rpc", no_contract)
+    async with rpc.client() as http:
+        validator = build(rpc, http, tmp_path, FakeClock())
+        first = await validator.validate(ETH, negative_cache=False)
+        second = await validator.validate(ETH, negative_cache=False)
+        assert (first.status, second.status) == (
+            ValidationStatus.REJECTED,
+            ValidationStatus.REJECTED,
+        )
+        assert rpc.count("alpha.rpc", "eth_getCode") == 2  # nothing was cached
+        assert (await validator.validate(ETH)).status is ValidationStatus.REJECTED
+        assert (await validator.validate(ETH)).status is ValidationStatus.ALREADY_REJECTED
+        # the regular rejection is ignored by a turbo check
+        assert (await validator.validate(ETH, negative_cache=False)).status is (
+            ValidationStatus.REJECTED
+        )
+        assert rpc.count("alpha.rpc", "eth_getCode") == 4

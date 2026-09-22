@@ -12,13 +12,23 @@ from pathlib import Path
 from typing import Any
 
 from scraper_bot.address_extractor import canonical_address
-from scraper_bot.models import Address, Chain, ConfirmedContract, Node, Signature, SiteState
+from scraper_bot.models import (
+    Address,
+    Chain,
+    ConfirmedContract,
+    Node,
+    NoiseEntry,
+    NoiseMemory,
+    Signature,
+    SiteState,
+    Snapshot,
+)
 from scraper_bot.urls import InvalidUrlError, normalize_url, url_to_filename
 
 log = logging.getLogger(__name__)
 
 STATE_VERSION = 1
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -124,7 +134,7 @@ class LegacyStateImporter:
 
 
 class SnapshotStore:
-    """One JSON file per page holding the last accepted page signature."""
+    """One JSON file per page holding the last accepted signature and noise memory."""
 
     def __init__(self, directory: Path) -> None:
         self._dir = directory
@@ -133,26 +143,37 @@ class SnapshotStore:
     def path_for(self, url: str) -> Path:
         return self._dir / f"{url_to_filename(url)}.json"
 
-    def load(self, url: str) -> Signature | None:
+    def load(self, url: str) -> Snapshot | None:
         path = self.path_for(url)
         if not path.is_file():
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return tuple(
+            signature: Signature = tuple(
                 Node(str(tag), tuple((str(k), str(v)) for k, v in attrs), str(text))
                 for tag, attrs, text in data["nodes"]
             )
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raw_noise = data.get("noise")
+            if raw_noise is None:
+                raw_noise = {}
+            if not isinstance(raw_noise, dict):
+                raise TypeError("noise must be an object")
+            noise: NoiseMemory = {
+                str(key): NoiseEntry(int(count), float(last_seen))
+                for key, (count, last_seen) in raw_noise.items()
+            }
+            return Snapshot(signature, noise)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("snapshot %s is unreadable (%s); it will be rebuilt", path.name, exc)
             return None
 
-    def save(self, url: str, signature: Signature) -> None:
+    def save(self, url: str, snapshot: Snapshot) -> None:
         payload = {
             "version": SNAPSHOT_VERSION,
             "url": url,
             "saved_at": time.time(),
-            "nodes": [[node.tag, list(node.attrs), node.text] for node in signature],
+            "nodes": [[node.tag, list(node.attrs), node.text] for node in snapshot.signature],
+            "noise": {key: [entry.count, entry.last_seen] for key, entry in snapshot.noise.items()},
         }
         atomic_write_text(self.path_for(url), json.dumps(payload, ensure_ascii=False))
 
@@ -229,6 +250,10 @@ class AddressCache:
 
     def is_known(self, address: Address) -> bool:
         return address in self._known
+
+    def known_network(self, address: Address) -> str | None:
+        """Network a confirmed contract was found on, ``None`` if it is not known."""
+        return self._known.get(address)
 
     def is_rejected(self, address: Address) -> bool:
         rejected_at = self._rejected.get(address)

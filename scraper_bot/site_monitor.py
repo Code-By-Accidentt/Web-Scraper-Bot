@@ -8,6 +8,7 @@ import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 
 from scraper_bot.fetcher import HttpProber
 from scraper_bot.models import (
@@ -25,6 +26,28 @@ log = logging.getLogger(__name__)
 
 PersistCallback = Callable[[], None]
 AutoPauseCallback = Callable[[str, str], Awaitable[None]]
+
+
+@dataclass(slots=True)
+class MonitorStats:
+    """Runtime counters of one monitor, shown by /status (not persisted)."""
+
+    rounds: int = 0
+    last_round_at: float | None = None
+    last_round_seconds: float = 0.0
+    last_pages: int = 0
+    # Suspected block: every round with a block signal doubles the interval (see max_backoff).
+    block_level: int = 0
+    block_reason: str | None = None
+    blocked_since: float | None = None
+    retry_after: float | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.block_level > 0
+
+
+_MAX_BLOCK_LEVEL = 8
 
 
 class SiteMonitor:
@@ -48,6 +71,7 @@ class SiteMonitor:
         on_auto_pause: AutoPauseCallback,
         poll_interval: tuple[float, float],
         contract_threshold: int,
+        max_backoff: float = 600.0,
         rng: random.Random | None = None,
     ) -> None:
         self._site = site
@@ -59,12 +83,19 @@ class SiteMonitor:
         self._on_auto_pause = on_auto_pause
         self._poll_interval = poll_interval
         self._threshold = contract_threshold
+        self._max_backoff = max_backoff
         self._rng = rng or random.Random()
         self._stop = asyncio.Event()
+        self._stats = MonitorStats()
+        self._planned_delay: float | None = None
 
     @property
     def site(self) -> SiteState:
         return self._site
+
+    @property
+    def stats(self) -> MonitorStats:
+        return self._stats
 
     @property
     def stopped(self) -> bool:
@@ -86,6 +117,7 @@ class SiteMonitor:
 
     async def run_once(self) -> list[PageCheckOutcome]:
         """One round over every live page; outcomes are acted upon as they arrive."""
+        started = time.perf_counter()
         pages = await self._live_pages()
         results = await asyncio.gather(
             *(self._check_and_handle(url) for url in pages), return_exceptions=True
@@ -100,7 +132,20 @@ class SiteMonitor:
                 log.error(
                     "[%s] check of %s failed: %r", self._site.url, url, result, exc_info=result
                 )
+        self._stats.rounds += 1
+        self._stats.last_round_at = time.time()
+        self._stats.last_round_seconds = time.perf_counter() - started
+        self._stats.last_pages = len(pages)
+        await self._update_block_state(outcomes)
         return outcomes
+
+    def next_delay(self) -> float:
+        """Seconds until the next round: the random interval, doubled per block level."""
+        base = self._rng.uniform(*self._poll_interval)
+        delay = min(base * (2**self._stats.block_level), max(self._max_backoff, base))
+        if self._stats.retry_after:
+            delay = max(delay, self._stats.retry_after)
+        return delay
 
     # ── internals ───────────────────────────────────────────────────────────
     async def _live_pages(self) -> list[str]:
@@ -166,7 +211,44 @@ class SiteMonitor:
         )
         await self._on_auto_pause(site.url, page_url)
 
+    async def _update_block_state(self, outcomes: Sequence[PageCheckOutcome]) -> None:
+        """Slow down on block signals; restore the pace (and tell the user) on recovery."""
+        site, stats = self._site, self._stats
+        signals = [(o.url, o.block) for o in outcomes if o.block is not None]
+        if signals:
+            page_url, signal = signals[0]
+            first_time = stats.blocked_since is None
+            stats.block_level = min(stats.block_level + 1, _MAX_BLOCK_LEVEL)
+            stats.block_reason = signal.reason
+            stats.retry_after = signal.retry_after
+            if first_time:
+                stats.blocked_since = time.time()
+            self._planned_delay = self.next_delay()
+            log.warning(
+                "[%s] possible block on %s (%s); next round in %.0fs",
+                site.url,
+                page_url,
+                signal.reason,
+                self._planned_delay,
+            )
+            if first_time:
+                await self._notifier.site_blocked(
+                    site.url, page_url, signal.reason, self._planned_delay
+                )
+            return
+        root_answered = any(
+            o.url == site.url and o.status is not PageStatus.UNAVAILABLE for o in outcomes
+        )
+        if stats.blocked and root_answered:
+            stats.block_level = 0
+            stats.block_reason = None
+            stats.blocked_since = None
+            stats.retry_after = None
+            log.info("[%s] answers normally again; normal interval restored", site.url)
+            await self._notifier.site_recovered(site.url)
+
     async def _sleep_between_rounds(self) -> None:
-        delay = self._rng.uniform(*self._poll_interval)
+        delay = self._planned_delay if self._planned_delay is not None else self.next_delay()
+        self._planned_delay = None
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._stop.wait(), timeout=delay)

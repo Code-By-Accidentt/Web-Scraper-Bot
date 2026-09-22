@@ -71,10 +71,15 @@ class AddressExtractor:
 
     def extract(self, text: str) -> list[Address]:
         """Unique, syntactically valid addresses in order of first appearance."""
+        return self.extract_many((text,))
+
+    def extract_many(self, texts: Iterable[str]) -> list[Address]:
+        """Like :meth:`extract` over several texts (page HTML, frames, scripts, API bodies)."""
         found: dict[Address, None] = {}
-        for chain in self._chains:
-            for match in self._PATTERNS[chain].finditer(text):
-                address = canonical_address(chain, match.group(0))
-                if address is not None:
-                    found.setdefault(address, None)
+        for text in texts:
+            for chain in self._chains:
+                for match in self._PATTERNS[chain].finditer(text):
+                    address = canonical_address(chain, match.group(0))
+                    if address is not None:
+                        found.setdefault(address, None)
         return list(found)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
@@ -15,6 +15,28 @@ from scraper_bot.config import Settings
 
 log = logging.getLogger(__name__)
 
+# Deep scan: response types whose bodies may hide addresses (bundles, API answers, raw HTML).
+_SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
+_SCANNED_CONTENT_TYPES = ("javascript", "ecmascript", "json", "text/", "xml")
+_PER_RESPONSE_LIMIT = 3 * 1024 * 1024
+
+# Collects the markup of every (open) shadow root on the page, nested ones included.
+_SHADOW_ROOTS_JS = """
+() => {
+  const parts = [];
+  const walk = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) {
+        parts.push(el.shadowRoot.innerHTML);
+        walk(el.shadowRoot);
+      }
+    }
+  };
+  walk(document);
+  return parts.join('\\n');
+}
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class FetchResult:
@@ -22,6 +44,9 @@ class FetchResult:
     status: int | None
     html: str = ""
     error: str | None = None
+    extra_texts: tuple[str, ...] = ()  # frames, shadow roots, script/JSON bodies (deep scan)
+    headers: dict[str, str] = field(default_factory=dict)  # of the main document
+    retry_after: float | None = None  # seconds, from a Retry-After header
 
     @property
     def ok(self) -> bool:
@@ -30,6 +55,11 @@ class FetchResult:
     @property
     def reason(self) -> str:
         return self.error or f"HTTP {self.status}"
+
+    @property
+    def scan_texts(self) -> tuple[str, ...]:
+        """Everything worth searching for addresses: the DOM first, then the extras."""
+        return (self.html, *self.extra_texts)
 
 
 class PageFetcher(Protocol):
@@ -43,7 +73,10 @@ class PlaywrightFetcher:
 
     A tab is opened per fetch and closed afterwards; the browser itself lives for
     the whole process and is relaunched transparently if it crashes. Concurrency
-    is bounded by ``max_concurrent_pages``.
+    is bounded by ``max_concurrent_pages``. With ``deep_scan`` enabled the fetch
+    also returns the markup of iframes and shadow roots and the bodies of the
+    scripts and JSON answers the page loaded, so addresses hidden there can be
+    found without any extra request.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -61,6 +94,10 @@ class PlaywrightFetcher:
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self.stop()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._browser is not None and self._browser.is_connected()
 
     async def start(self) -> None:
         self._playwright = await pw.async_playwright().start()
@@ -90,6 +127,10 @@ class PlaywrightFetcher:
     async def _fetch_in(self, context: pw.BrowserContext, url: str) -> FetchResult:
         cfg = self._settings
         page = await context.new_page()
+        responses: list[pw.Response] = []
+        if cfg.deep_scan:
+            # Playwright decorates the handler, so it must be a plain function, not a builtin.
+            page.on("response", lambda response: responses.append(response))
         try:
             try:
                 response = await page.goto(
@@ -110,17 +151,67 @@ class PlaywrightFetcher:
             if cfg.settle_delay > 0:
                 await asyncio.sleep(cfg.settle_delay)
             html = await page.content()
+            extra = await self._deep_scan(page, responses) if cfg.deep_scan else ()
             status = response.status if response is not None else None
-            return FetchResult(url, status, html)
+            headers = dict(response.headers) if response is not None else {}
+            return FetchResult(
+                url,
+                status,
+                html,
+                extra_texts=extra,
+                headers=headers,
+                retry_after=_parse_retry_after(headers.get("retry-after")),
+            )
         finally:
             with contextlib.suppress(pw.Error):
                 await page.close()
 
+    async def _deep_scan(self, page: pw.Page, responses: list[pw.Response]) -> tuple[str, ...]:
+        """Markup of child frames and shadow roots plus scripts/JSON the page loaded."""
+        budget = self._settings.deep_scan_max_bytes
+        texts: list[str] = []
+
+        def take(text: str) -> None:
+            nonlocal budget
+            if budget <= 0 or not text:
+                return
+            clipped = text[:budget]
+            texts.append(clipped)
+            budget -= len(clipped)
+
+        for frame in page.frames:
+            if frame is page.main_frame:
+                continue
+            with contextlib.suppress(pw.Error):
+                take(await frame.content())
+        with contextlib.suppress(pw.Error):
+            take(str(await page.evaluate(_SHADOW_ROOTS_JS) or ""))
+        for response in responses:
+            if budget <= 0:
+                break
+            if not self._worth_scanning(response):
+                continue
+            try:
+                body = await response.body()
+            except pw.Error:
+                continue  # redirects, aborted or already discarded bodies
+            if len(body) > _PER_RESPONSE_LIMIT:
+                continue
+            take(body.decode("utf-8", errors="replace"))
+        return tuple(texts)
+
+    @staticmethod
+    def _worth_scanning(response: pw.Response) -> bool:
+        if response.request.resource_type not in _SCANNED_RESOURCE_TYPES:
+            return False
+        content_type = response.headers.get("content-type", "").lower()
+        return any(marker in content_type for marker in _SCANNED_CONTENT_TYPES)
+
     async def _ensure_context(self) -> pw.BrowserContext:
-        if self._context is not None and self._browser is not None and self._browser.is_connected():
+        if self._context is not None and self.is_connected:
             return self._context
         async with self._launch_lock:
-            if self._context is None or self._browser is None or not self._browser.is_connected():
+            if self._context is None or not self.is_connected:
                 await self._close_browser()
                 await self._launch()
             assert self._context is not None
@@ -166,6 +257,17 @@ class PlaywrightFetcher:
     def _brief(exc: BaseException) -> str:
         first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         return first_line[:200]
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Seconds from a ``Retry-After`` header; HTTP-date forms are ignored."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
 
 
 @dataclass(frozen=True, slots=True)
