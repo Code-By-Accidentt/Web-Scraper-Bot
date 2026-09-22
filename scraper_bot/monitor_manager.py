@@ -8,7 +8,12 @@ import logging
 from collections.abc import Callable
 
 from scraper_bot.models import SiteState
-from scraper_bot.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
+from scraper_bot.site_monitor import (
+    AutoPauseCallback,
+    MonitorStats,
+    PersistCallback,
+    SiteMonitor,
+)
 from scraper_bot.storage import LegacyStateImporter, SnapshotStore, StateStore
 from scraper_bot.urls import InvalidUrlError, SubUrlDeriver, normalize_url
 
@@ -90,6 +95,11 @@ class MonitorManager:
     def is_running(self, url: str) -> bool:
         task = self._tasks.get(url)
         return task is not None and not task.done()
+
+    def stats(self, url: str) -> MonitorStats | None:
+        """Runtime counters of the running monitor for ``url``, if any."""
+        monitor = self._monitors.get(url)
+        return monitor.stats if monitor is not None else None
 
     # ── commands ────────────────────────────────────────────────────────────
     async def add_site(self, raw_url: str) -> SiteState:

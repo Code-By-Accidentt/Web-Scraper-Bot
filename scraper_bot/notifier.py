@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Sequence
 
-from scraper_bot.models import ChangeReport, ConfirmedContract
+from scraper_bot.models import Address, ChangeReport, ConfirmedContract
 from scraper_bot.telegram_client import TelegramClient
 from scraper_bot.urls import url_to_filename
 
@@ -59,6 +59,67 @@ class Notifier:
             f"Pages:\n{listed}\n"
             f"Send /resume {site_url} to continue."
         )
+
+    # ── turbo mode ──────────────────────────────────────────────────────────
+    async def turbo_started(
+        self, site_url: str, pages: int, interval: float, minutes: float, stop_after: int
+    ) -> None:
+        ending = (
+            f"after {stop_after} confirmed contract(s) or in {minutes:.0f} min"
+            if stop_after
+            else f"in {minutes:.0f} min"
+        )
+        await self._send(
+            f"🚀 Turbo mode on {site_url}\n"
+            f"Rendering {pages} page(s) every {interval:.0f}s, stops {ending}."
+        )
+
+    async def unverified_address(
+        self, address: Address, page_url: str, recheck_interval: float
+    ) -> None:
+        await self._send(
+            f"⚠️ Unverified address on {page_url}\n"
+            f"Chain: {address.chain.value}\n"
+            f"{address.value}\n"
+            f"Not a contract on-chain yet; re-checking every {recheck_interval:.0f}s."
+        )
+
+    async def address_confirmed(self, contract: ConfirmedContract, page_url: str) -> None:
+        await self._send(
+            f"✅ Confirmed: {contract.address.value} is a contract on {contract.network}\n"
+            f"Page: {page_url}"
+        )
+
+    async def turbo_finished(
+        self,
+        site_url: str,
+        reason: str,
+        contracts: Sequence[ConfirmedContract],
+        seconds: float,
+        renders: int,
+    ) -> None:
+        found = "\n".join(f"• {c.address.value} ({c.network})" for c in contracts)
+        await self._send(
+            f"🎯 Turbo finished on {site_url}: {reason}\n"
+            f"Duration {seconds:.0f}s, {renders} renders, {len(contracts)} confirmed contract(s)."
+            + (f"\n{found}" if found else "")
+        )
+
+    # ── blocking ────────────────────────────────────────────────────────────
+    async def site_blocked(
+        self, site_url: str, page_url: str, reason: str, next_delay: float
+    ) -> None:
+        await self._send(
+            f"🚫 Possible IP block on {site_url}\n"
+            f"Page: {page_url}\n"
+            f"Reason: {reason}\n"
+            f"Slowing down: next check in {next_delay:.0f}s, the interval keeps doubling "
+            f"while this lasts and turbo mode (if any) was stopped. "
+            f"If it persists, the site may have banned this IP address."
+        )
+
+    async def site_recovered(self, site_url: str) -> None:
+        await self._send(f"✅ {site_url} answers normally again; normal interval restored.")
 
     @staticmethod
     def format_report(report: ChangeReport, max_examples: int) -> str:

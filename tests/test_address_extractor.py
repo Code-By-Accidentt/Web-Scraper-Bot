@@ -77,3 +77,11 @@ def test_extractor_can_be_limited_to_one_chain() -> None:
     assert AddressExtractor(chains=(Chain.ETHEREUM,)).extract(html) == [
         Address(Chain.ETHEREUM, USDC_ETH)
     ]
+
+
+def test_extract_many_deduplicates_across_texts() -> None:
+    texts = (f"<p>{USDC_ETH}</p>", f"var a = '{USDC_ETH.lower()}'; var b = '{USDC_SOL}';", "")
+    assert AddressExtractor().extract_many(texts) == [
+        Address(Chain.ETHEREUM, USDC_ETH),
+        Address(Chain.SOLANA, USDC_SOL),
+    ]

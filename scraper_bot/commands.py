@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from scraper_bot.models import SiteState
@@ -18,13 +20,27 @@ from scraper_bot.monitor_manager import (
     SiteNotPaused,
     SiteNotTracked,
 )
+from scraper_bot.status import format_duration
 from scraper_bot.telegram_client import TelegramClient
+from scraper_bot.turbo import (
+    ScheduledTurbo,
+    TurboAlreadyRunning,
+    TurboError,
+    TurboLimitReached,
+    TurboManager,
+    TurboNotRunning,
+)
 from scraper_bot.urls import InvalidUrlError
 
 log = logging.getLogger(__name__)
 
 Handler = Callable[[int, str], Awaitable[str]]
 
+TURBO_USAGE = (
+    "Usage: /turbo <url> [minutes] [at HH:MM | in 10m]\n"
+    "       /turbo stop <url>\n"
+    "       /turbo (status)"
+)
 HELP_TEXT = (
     "Available commands:\n"
     "/add <url> — start monitoring a site\n"
@@ -34,8 +50,59 @@ HELP_TEXT = (
     "/list — monitored sites with their status\n"
     "/nonotifi <url> — mute change alerts for a site\n"
     "/notify <url> — un-mute change alerts for a site\n"
+    "/turbo <url> [minutes] [at HH:MM | in 10m] — render every 2s until a contract appears\n"
+    "/turbo stop <url> — end turbo mode; /turbo alone shows turbo status\n"
+    "/status — bot health, last round per site, cache sizes\n"
     "/help — this message"
 )
+
+_DELAY_RE = re.compile(r"^(\d+)([mh])$", re.IGNORECASE)
+_CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+@dataclass(frozen=True, slots=True)
+class TurboRequest:
+    url: str
+    minutes: float | None
+    start_at: float | None
+
+
+def parse_turbo_request(tokens: Sequence[str], now: float) -> TurboRequest:
+    """``<url> [minutes] [at HH:MM | in 10m]``; raises ValueError with an explanation."""
+    url, rest = tokens[0], list(tokens[1:])
+    minutes: float | None = None
+    start_at: float | None = None
+    index = 0
+    while index < len(rest):
+        token = rest[index].lower()
+        if token.isdigit():
+            minutes = float(token)
+            index += 1
+        elif token == "at" and index + 1 < len(rest):
+            match = _CLOCK_RE.match(rest[index + 1])
+            if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+                raise ValueError("the start time must look like HH:MM (24h clock)")
+            start_at = _next_occurrence(int(match.group(1)), int(match.group(2)), now)
+            index += 2
+        elif token == "in" and index + 1 < len(rest):
+            match = _DELAY_RE.match(rest[index + 1])
+            if not match:
+                raise ValueError("the delay must look like 10m or 2h")
+            unit = 60 if match.group(2).lower() == "m" else 3600
+            start_at = now + int(match.group(1)) * unit
+            index += 2
+        else:
+            raise ValueError(f"unexpected argument {rest[index]!r}")
+    return TurboRequest(url, minutes, start_at)
+
+
+def _next_occurrence(hour: int, minute: int, now: float) -> float:
+    candidate = datetime.fromtimestamp(now).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if candidate.timestamp() <= now:
+        candidate += timedelta(days=1)
+    return candidate.timestamp()
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,14 +133,20 @@ class BotCommands:
         *,
         allowed_chat_ids: Sequence[int] = (),
         alert_chat_ids: Sequence[int] = (),
+        status_provider: Callable[[], str] | None = None,
+        turbo: TurboManager | None = None,
     ) -> None:
         self._manager = manager
         self._telegram = telegram
         self._allowed = frozenset(allowed_chat_ids)
         self._alerts_configured = bool(alert_chat_ids)
+        self._status_provider = status_provider
+        self._turbo = turbo
         self._handlers: dict[str, Handler] = {
             "start": self._start,
             "help": self._help,
+            "status": self._status,
+            "turbo": self._turbo_command,
             "add": self._add,
             "remove": self._remove,
             "pause": self._pause,
@@ -115,6 +188,8 @@ class BotCommands:
             return await handler(chat_id, command.argument)
         except MonitorError as exc:
             return self._describe(exc)
+        except TurboError as exc:
+            return self._describe_turbo(exc)
         except InvalidUrlError as exc:
             return f"❌ {exc}"
         except Exception:
@@ -127,6 +202,53 @@ class BotCommands:
 
     async def _help(self, _chat_id: int, _argument: str) -> str:
         return HELP_TEXT
+
+    async def _status(self, _chat_id: int, _argument: str) -> str:
+        if self._status_provider is None:
+            return "Status is not available."
+        return self._status_provider()
+
+    async def _turbo_command(self, _chat_id: int, argument: str) -> str:
+        if self._turbo is None:
+            return "Turbo mode is not available."
+        tokens = argument.split()
+        if not tokens:
+            return self._turbo_status()
+        if tokens[0].lower() == "stop":
+            if len(tokens) < 2:
+                return "Usage: /turbo stop <url>"
+            url = await self._turbo.stop(tokens[1])
+            return f"⏹️ Turbo stopped for {url}."
+        try:
+            request = parse_turbo_request(tokens, time.time())
+        except ValueError as exc:
+            return f"❌ {exc}\n{TURBO_USAGE}"
+        started = await self._turbo.start(request.url, request.minutes, request.start_at)
+        if isinstance(started, ScheduledTurbo):
+            when = datetime.fromtimestamp(started.start_at).strftime("%Y-%m-%d %H:%M")
+            return f"⏰ Turbo for {started.url} scheduled at {when} for {started.minutes:.0f} min."
+        limits = self._turbo.limits
+        return (
+            f"🚀 Turbo started for {started.url}: {len(started.pages)} page(s) every "
+            f"{limits.interval:.0f}s for {started.seconds_left / 60:.0f} min."
+        )
+
+    def _turbo_status(self) -> str:
+        assert self._turbo is not None
+        lines = []
+        for session in self._turbo.active():
+            stats = session.stats
+            lines.append(
+                f"🚀 {session.url}: {stats.cycles} cycles, {stats.renders} renders, "
+                f"{len(stats.found)} confirmed, {stats.unverified} unverified, "
+                f"{format_duration(session.seconds_left)} left"
+            )
+        for plan in self._turbo.scheduled():
+            when = datetime.fromtimestamp(plan.start_at).strftime("%Y-%m-%d %H:%M")
+            lines.append(f"⏰ {plan.url}: starts at {when} for {plan.minutes:.0f} min")
+        if not lines:
+            return f"No turbo session is running.\n{TURBO_USAGE}"
+        return "\n".join(lines)
 
     async def _add(self, _chat_id: int, argument: str) -> str:
         if not argument:
@@ -182,10 +304,26 @@ class BotCommands:
         else:
             state = "STOPPED"
         line = f"• {site.url} [alerts: {notifications}] [{state}]"
+        stats = self._manager.stats(site.url)
+        if stats is not None and stats.blocked:
+            line += f" ⚠️ BLOCKED? ({stats.block_reason})"
         if site.last_change is not None:
             when = datetime.fromtimestamp(site.last_change.at).strftime("%Y-%m-%d %H:%M")
             line += f" last change: {when}"
         return line
+
+    @staticmethod
+    def _describe_turbo(error: TurboError) -> str:
+        if isinstance(error, TurboAlreadyRunning):
+            return f"🚀 Turbo is already running (or scheduled) for {error.url}."
+        if isinstance(error, TurboLimitReached):
+            return (
+                f"❌ Turbo limit reached: at most {error.limit} site(s) at a time. "
+                f"Stop one with /turbo stop <url>."
+            )
+        if isinstance(error, TurboNotRunning):
+            return f"❌ No turbo session for {error.url}."
+        return f"❌ {error}"
 
     @staticmethod
     def _describe(error: MonitorError) -> str:

@@ -13,6 +13,9 @@ def test_minimal_environment_is_enough(tmp_path) -> None:
     assert cfg.evm_networks[0].name == "Ethereum"
     assert cfg.rejected_ttl == 6 * 3600
     assert cfg.sub_url_patterns[0] == "https://app.{domain}"
+    assert (cfg.network_idle_timeout, cfg.settle_delay, cfg.confirm_delay) == (4.0, 0.5, 2.0)
+    assert cfg.deep_scan is True and cfg.deep_scan_max_bytes == 10 * 1024 * 1024
+    assert cfg.flap_window == 24 * 3600 and cfg.flap_threshold == 2
 
 
 def test_token_is_required() -> None:
@@ -54,6 +57,12 @@ def test_lists_and_flags_are_parsed(tmp_path) -> None:
     assert cfg.require_erc20 is False
     assert cfg.allowed_chat_ids == (5,)
     assert "Ethereum" not in [network.name for network in cfg.evm_networks]
+
+
+@pytest.mark.parametrize("raw", ["[1, 2]", "(1;2)", "'1', \"2\"", "1 2", " 1,2, "])
+def test_lists_tolerate_brackets_quotes_and_odd_separators(tmp_path, raw: str) -> None:
+    cfg = make_settings(tmp_path, TELEGRAM_CHAT_IDS=raw)
+    assert cfg.chat_ids == (1, 2)
 
 
 def test_dotenv_file_is_read_but_environment_wins(tmp_path) -> None:

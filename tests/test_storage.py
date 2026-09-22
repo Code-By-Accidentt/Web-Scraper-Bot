@@ -7,7 +7,9 @@ from scraper_bot.models import (
     ChangeCounts,
     ConfirmedContract,
     LastChange,
+    NoiseEntry,
     SiteState,
+    Snapshot,
 )
 from scraper_bot.storage import AddressCache, LegacyStateImporter, SnapshotStore, StateStore
 from tests.conftest import node
@@ -73,17 +75,32 @@ def test_snapshot_roundtrip_delete_and_prune(tmp_path: Path) -> None:
     store = SnapshotStore(tmp_path / "snaps")
     signature = (node("a", "x", href="/y"), node("p", "text"))
     assert store.load("https://a.io") is None
-    store.save("https://a.io", signature)
-    store.save("https://b.io", signature)
-    assert store.load("https://a.io") == signature
+    store.save("https://a.io", Snapshot(signature))
+    store.save("https://b.io", Snapshot(signature))
+    assert store.load("https://a.io").signature == signature
 
     assert store.prune(["https://a.io"]) == 1
     assert store.load("https://b.io") is None
-    assert store.load("https://a.io") == signature
+    assert store.load("https://a.io").signature == signature
 
     store.delete("https://a.io")
     store.delete("https://a.io")  # idempotent
     assert store.load("https://a.io") is None
+
+
+def test_snapshot_keeps_noise_memory_and_reads_version_1_files(tmp_path: Path) -> None:
+    store = SnapshotStore(tmp_path / "snaps")
+    signature = (node("p", "text"),)
+    store.save("https://a.io", Snapshot(signature, {"k": NoiseEntry(3, 123.5)}))
+    loaded = store.load("https://a.io")
+    assert loaded is not None
+    assert loaded.noise == {"k": NoiseEntry(3, 123.5)}
+
+    legacy = store.path_for("https://old.io")
+    legacy.write_text(json.dumps({"version": 1, "nodes": [["p", [], "x"]]}), encoding="utf-8")
+    old = store.load("https://old.io")
+    assert old is not None
+    assert old.signature == (node("p", "x"),) and old.noise == {}
 
 
 def test_corrupt_snapshot_is_treated_as_missing(tmp_path: Path) -> None:

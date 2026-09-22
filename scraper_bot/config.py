@@ -7,6 +7,7 @@ process environment (plus an optional ``.env`` file) by :meth:`Settings.from_env
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,8 @@ DEFAULT_IGNORED_ATTRIBUTES: tuple[str, ...] = (
 
 DEFAULT_BLOCKED_RESOURCE_TYPES: tuple[str, ...] = ("image", "media", "font")
 
+_LIST_SEPARATOR_RE = re.compile(r"[,;\s]+")
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -84,6 +87,22 @@ class Settings:
     sub_url_patterns: tuple[str, ...]
     ignored_attributes: tuple[str, ...]
     max_change_examples: int
+    flap_window: float
+    flap_threshold: int
+
+    # Address discovery
+    deep_scan: bool
+    deep_scan_max_bytes: int
+
+    # Turbo mode and blocking
+    turbo_interval: float
+    turbo_default_minutes: float
+    turbo_max_minutes: float
+    turbo_stop_after: int
+    turbo_max_sites: int
+    turbo_max_pages: int
+    turbo_recheck_interval: float
+    block_max_backoff: float
 
     # Browser
     browser_channel: str
@@ -147,8 +166,8 @@ class Settings:
             poll_interval_max=poll_max,
             max_concurrent_pages=reader.integer("MAX_CONCURRENT_PAGES", 6, minimum=1),
             page_load_timeout=reader.number("PAGE_LOAD_TIMEOUT", 30.0, minimum=1.0),
-            network_idle_timeout=reader.number("NETWORK_IDLE_TIMEOUT", 6.0, minimum=0.0),
-            settle_delay=reader.number("SETTLE_DELAY", 1.0, minimum=0.0),
+            network_idle_timeout=reader.number("NETWORK_IDLE_TIMEOUT", 4.0, minimum=0.0),
+            settle_delay=reader.number("SETTLE_DELAY", 0.5, minimum=0.0),
             confirm_delay=reader.number("CONFIRM_DELAY", 2.0, minimum=0.0),
             contract_pause_threshold=reader.integer("CONTRACT_PAUSE_THRESHOLD", 5, minimum=1),
             sub_url_patterns=reader.text_list("SUB_URL_PATTERNS", DEFAULT_SUB_URL_PATTERNS),
@@ -157,6 +176,20 @@ class Settings:
                 for a in reader.text_list("IGNORED_ATTRIBUTES", DEFAULT_IGNORED_ATTRIBUTES)
             ),
             max_change_examples=reader.integer("MAX_CHANGE_EXAMPLES", 5, minimum=0),
+            flap_window=reader.number("FLAP_WINDOW_HOURS", 24.0, minimum=0.0) * 3600.0,
+            flap_threshold=reader.integer("FLAP_THRESHOLD", 2, minimum=1),
+            deep_scan=reader.flag("DEEP_SCAN", True),
+            deep_scan_max_bytes=int(
+                reader.number("DEEP_SCAN_MAX_MB", 10.0, minimum=0.0) * 1024 * 1024
+            ),
+            turbo_interval=reader.number("TURBO_INTERVAL", 2.0, minimum=1.0),
+            turbo_default_minutes=reader.number("TURBO_DEFAULT_MINUTES", 30.0, minimum=1.0),
+            turbo_max_minutes=reader.number("TURBO_MAX_MINUTES", 180.0, minimum=1.0),
+            turbo_stop_after=reader.integer("TURBO_STOP_AFTER", 1, minimum=0),
+            turbo_max_sites=reader.integer("TURBO_MAX_SITES", 1, minimum=1),
+            turbo_max_pages=reader.integer("TURBO_MAX_PAGES", 4, minimum=1),
+            turbo_recheck_interval=reader.number("TURBO_RECHECK_INTERVAL", 5.0, minimum=1.0),
+            block_max_backoff=reader.number("BLOCK_MAX_BACKOFF", 600.0, minimum=1.0),
             browser_channel=reader.text("BROWSER_CHANNEL", "chromium"),
             headless=reader.flag("HEADLESS", True),
             blocked_resource_types=reader.text_list(
@@ -221,10 +254,12 @@ class _EnvReader:
         return value
 
     def text_list(self, key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-        raw = self.text(key)
-        if not raw:
+        """Comma separated list; brackets, semicolons, quotes and stray spaces are tolerated."""
+        raw = self.text(key).strip("[]()")
+        if not raw.strip():
             return default
-        return tuple(item.strip() for item in raw.split(",") if item.strip())
+        items = (item.strip().strip("'\"") for item in _LIST_SEPARATOR_RE.split(raw))
+        return tuple(item for item in items if item)
 
     def int_list(self, key: str) -> tuple[int, ...]:
         items = self.text_list(key)

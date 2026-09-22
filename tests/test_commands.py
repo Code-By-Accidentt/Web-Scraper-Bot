@@ -5,11 +5,18 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.commands import BotCommands, TelegramListener, parse_command
+from scraper_bot.commands import (
+    BotCommands,
+    TelegramListener,
+    TurboRequest,
+    parse_command,
+    parse_turbo_request,
+)
 from scraper_bot.monitor_manager import MonitorManager
 from scraper_bot.storage import SnapshotStore, StateStore
+from scraper_bot.turbo import TurboLimits, TurboManager
 from scraper_bot.urls import SubUrlDeriver
-from tests.conftest import FakeTelegram, StubMonitor
+from tests.conftest import FakeProber, FakeTelegram, StubMonitor, StubTurboSession
 
 
 @pytest.mark.parametrize(
@@ -136,6 +143,15 @@ async def test_listener_dispatches_updates_and_advances_offset(tmp_path: Path) -
     assert telegram.offsets[:3] == [None, 12, 12]
 
 
+async def test_status_command_uses_the_provider(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    with_status = BotCommands(manager, telegram, status_provider=lambda: "STATUS TEXT")
+    without = BotCommands(manager, telegram)
+    assert await send(with_status, telegram, "/status") == "STATUS TEXT"
+    assert await send(without, telegram, "/status") == "Status is not available."
+    assert "/status" in await send(without, telegram, "/help")
+
+
 async def test_missing_alert_recipients_are_pointed_out(tmp_path: Path) -> None:
     manager, telegram, _ = make(tmp_path)
     without = BotCommands(manager, telegram, alert_chat_ids=())
@@ -149,3 +165,68 @@ async def test_missing_alert_recipients_are_pointed_out(tmp_path: Path) -> None:
         assert "TELEGRAM_CHAT_IDS" not in await send(configured, telegram, "/list")
     finally:
         await manager.shutdown()
+
+
+NOW = 1_700_000_000.0
+
+
+def test_parse_turbo_request() -> None:
+    assert parse_turbo_request(["x.io"], NOW) == TurboRequest("x.io", None, None)
+    assert parse_turbo_request(["x.io", "15"], NOW).minutes == 15
+    assert parse_turbo_request(["x.io", "in", "10m"], NOW).start_at == NOW + 600
+    assert parse_turbo_request(["x.io", "5", "in", "2h"], NOW).start_at == NOW + 7200
+    at = parse_turbo_request(["x.io", "at", "23:59"], NOW).start_at
+    assert at is not None and NOW < at <= NOW + 86_400
+    for bad in (["x.io", "in", "soon"], ["x.io", "at", "25:00"], ["x.io", "bogus"]):
+        with pytest.raises(ValueError):
+            parse_turbo_request(bad, NOW)
+
+
+def make_turbo() -> TurboManager:
+    limits = TurboLimits(
+        interval=2,
+        default_minutes=30,
+        max_minutes=180,
+        stop_after=1,
+        max_sites=1,
+        max_pages=4,
+        recheck_interval=5,
+    )
+    return TurboManager(
+        limits=limits,
+        deriver=SubUrlDeriver(("https://app.{domain}",)),
+        prober=FakeProber({"https://app.example.com": 404}),
+        session_factory=StubTurboSession,
+    )
+
+
+async def test_turbo_commands(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    turbo = make_turbo()
+    commands = BotCommands(manager, telegram, turbo=turbo)
+    try:
+        assert "No turbo session" in await send(commands, telegram, "/turbo")
+        assert await send(commands, telegram, "/turbo example.com 10") == (
+            "🚀 Turbo started for https://example.com: 1 page(s) every 2s for 10 min."
+        )
+        assert "https://example.com: 0 cycles" in await send(commands, telegram, "/turbo")
+        assert "already running" in await send(commands, telegram, "/turbo example.com")
+        assert "Turbo limit reached" in await send(commands, telegram, "/turbo other.io")
+        assert await send(commands, telegram, "/turbo stop example.com") == (
+            "⏹️ Turbo stopped for https://example.com."
+        )
+        assert "No turbo session for" in await send(commands, telegram, "/turbo stop example.com")
+        assert (await send(commands, telegram, "/turbo example.com in 1h")).startswith(
+            "⏰ Turbo for https://example.com scheduled at "
+        )
+        assert "starts at" in await send(commands, telegram, "/turbo")
+        assert (await send(commands, telegram, "/turbo x.io bogus")).startswith("❌")
+        assert await send(commands, telegram, "/turbo stop") == "Usage: /turbo stop <url>"
+        assert "/turbo" in await send(commands, telegram, "/help")
+    finally:
+        await turbo.shutdown()
+
+
+async def test_turbo_is_optional(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    assert await send(commands, telegram, "/turbo") == "Turbo mode is not available."
