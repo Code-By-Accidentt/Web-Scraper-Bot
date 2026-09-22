@@ -191,3 +191,15 @@ def test_missing_legacy_files_are_harmless(tmp_path: Path) -> None:
     assert not importer.has_data()
     assert importer.sites() == {}
     assert importer.known_addresses() == []
+
+
+def test_snapshot_with_malformed_noise_is_treated_as_missing(tmp_path: Path) -> None:
+    store = SnapshotStore(tmp_path)
+    store.path_for("https://a.io").write_text(
+        json.dumps({"version": 2, "nodes": [], "noise": []}), encoding="utf-8"
+    )
+    assert store.load("https://a.io") is None
+    store.path_for("https://b.io").write_text(
+        json.dumps({"version": 2, "nodes": [], "noise": {"k": "bad"}}), encoding="utf-8"
+    )
+    assert store.load("https://b.io") is None

@@ -153,12 +153,17 @@ class SnapshotStore:
                 Node(str(tag), tuple((str(k), str(v)) for k, v in attrs), str(text))
                 for tag, attrs, text in data["nodes"]
             )
+            raw_noise = data.get("noise")
+            if raw_noise is None:
+                raw_noise = {}
+            if not isinstance(raw_noise, dict):
+                raise TypeError("noise must be an object")
             noise: NoiseMemory = {
                 str(key): NoiseEntry(int(count), float(last_seen))
-                for key, (count, last_seen) in data.get("noise", {}).items()
+                for key, (count, last_seen) in raw_noise.items()
             }
             return Snapshot(signature, noise)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("snapshot %s is unreadable (%s); it will be rebuilt", path.name, exc)
             return None
 

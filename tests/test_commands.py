@@ -221,6 +221,8 @@ async def test_turbo_commands(tmp_path: Path) -> None:
         )
         assert "starts at" in await send(commands, telegram, "/turbo")
         assert (await send(commands, telegram, "/turbo x.io bogus")).startswith("❌")
+        await send(commands, telegram, "/turbo stop example.com")
+        assert "for 1 min." in await send(commands, telegram, "/turbo example.com 0")
         assert await send(commands, telegram, "/turbo stop") == "Usage: /turbo stop <url>"
         assert "/turbo" in await send(commands, telegram, "/help")
     finally:

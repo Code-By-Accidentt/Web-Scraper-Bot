@@ -96,7 +96,7 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `FLAP_WINDOW_HOURS` / `FLAP_THRESHOLD` | 24 / 2 | Silence an element after it alerted `FLAP_THRESHOLD` times within the window (0 hours = off) |
 | `DEEP_SCAN` / `DEEP_SCAN_MAX_MB` | true / 10 | Also search iframes, shadow DOM and the scripts/JSON the page loaded; byte budget per render |
 | `TURBO_INTERVAL` / `TURBO_DEFAULT_MINUTES` / `TURBO_MAX_MINUTES` | 2 / 30 / 180 | Seconds between turbo renders, default and maximum session length |
-| `TURBO_STOP_AFTER` / `TURBO_MAX_SITES` / `TURBO_MAX_PAGES` / `TURBO_RECHECK_INTERVAL` | 1 / 1 / 4 / 5 | Confirmed contracts that end a session (0 = timer only), concurrent turbo sites, pages per cycle, seconds between on-chain re-checks of unverified addresses |
+| `TURBO_STOP_AFTER` / `TURBO_MAX_SITES` / `TURBO_MAX_PAGES` / `TURBO_RECHECK_INTERVAL` | 1 / 1 / 4 / 5 | Confirmed contracts that end a session (0 = timer only), concurrent turbo sites, pages rendered per cycle (root included), seconds between on-chain re-checks of unverified addresses |
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot |
 | `CONTRACT_PAUSE_THRESHOLD` | 5 | New contracts on one page that trigger the auto-pause |
 | `SUB_URL_PATTERNS` | see `.env.example` | Sub-pages derived from every root URL (`{domain}` = host without `www.`) |
@@ -146,7 +146,7 @@ Every setting is an environment variable. A `.env` file in the working directory
 
 ## 🚀 Turbo mode
 
-`/turbo https://launch.example` renders the root page and up to `TURBO_MAX_PAGES` live sub-pages every `TURBO_INTERVAL` seconds (full renders with deep scan, no change alerts) for `TURBO_DEFAULT_MINUTES` minutes, or `/turbo <url> 15` for 15 minutes. `/turbo <url> at 15:30` or `/turbo <url> in 10m` arms it for a launch time. Addresses that were already on the pages when the session started are watched silently; every address that appears later is announced at once as *unverified* and re-checked on-chain every `TURBO_RECHECK_INTERVAL` seconds, ignoring the regular negative cache, so an address published before its contract is deployed is confirmed as soon as the deployment lands. The session ends after `TURBO_STOP_AFTER` confirmed contracts, when the time is up, on `/turbo stop <url>`, or when the site starts refusing us; the closing message lists what was found. At most `TURBO_MAX_SITES` sites can be in turbo at once and sessions do not survive a restart.
+`/turbo https://launch.example` renders up to `TURBO_MAX_PAGES` pages per cycle (the root page plus its live sub-pages) every `TURBO_INTERVAL` seconds (full renders with deep scan, no change alerts) for `TURBO_DEFAULT_MINUTES` minutes, or `/turbo <url> 15` for 15 minutes. `/turbo <url> at 15:30` or `/turbo <url> in 10m` arms it for a launch time. Addresses that were already on the pages when the session started are watched silently; every address that appears later is announced at once as *unverified* and re-checked on-chain every `TURBO_RECHECK_INTERVAL` seconds, ignoring the regular negative cache, so an address published before its contract is deployed is confirmed as soon as the deployment lands. The session ends after `TURBO_STOP_AFTER` confirmed contracts, when the time is up, on `/turbo stop <url>`, or when the site starts refusing us; the closing message lists what was found. At most `TURBO_MAX_SITES` sites can be in turbo at once and sessions do not survive a restart.
 
 ---
 

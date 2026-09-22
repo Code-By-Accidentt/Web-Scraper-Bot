@@ -56,7 +56,7 @@ class TurboLimits:
     max_minutes: float
     stop_after: int  # confirmed contracts that end the session; 0 = never
     max_sites: int  # concurrent (running or scheduled) sessions
-    max_pages: int  # tabs rendered per cycle
+    max_pages: int  # pages rendered per cycle, the root page included
     recheck_interval: float  # seconds between on-chain re-checks of unverified addresses
     max_watch: int = 50  # unverified addresses tracked per session
 
@@ -271,6 +271,7 @@ class TurboManager:
         self._sessions: dict[str, TurboSession] = {}
         self._tasks: dict[str, asyncio.Task[TurboStats]] = {}
         self._scheduled: dict[str, tuple[ScheduledTurbo, asyncio.Task[None]]] = {}
+        self._launching: set[str] = set()
 
     @property
     def limits(self) -> TurboLimits:
@@ -292,9 +293,11 @@ class TurboManager:
         url = normalize_url(raw_url)
         if self._is_busy(url):
             raise TurboAlreadyRunning(url)
-        if len(self.active()) + len(self._scheduled) >= self._limits.max_sites:
+        if self._reserved_count() >= self._limits.max_sites:
             raise TurboLimitReached(url, self._limits.max_sites)
-        minutes = min(max(minutes or self._limits.default_minutes, 1.0), self._limits.max_minutes)
+        if minutes is None:
+            minutes = self._limits.default_minutes
+        minutes = min(max(minutes, 1.0), self._limits.max_minutes)
         now = self._clock()
         if start_at is not None and start_at > now + 1:
             plan = ScheduledTurbo(url, start_at, minutes)
@@ -327,7 +330,15 @@ class TurboManager:
     # ── internals ───────────────────────────────────────────────────────────
     def _is_busy(self, url: str) -> bool:
         task = self._tasks.get(url)
-        return url in self._scheduled or (task is not None and not task.done())
+        return (
+            url in self._scheduled
+            or url in self._launching
+            or (task is not None and not task.done())
+        )
+
+    def _reserved_count(self) -> int:
+        """Sessions that occupy a slot: running, waiting for their start time, or launching."""
+        return len(self.active()) + len(self._scheduled) + len(self._launching)
 
     async def _start_later(self, plan: ScheduledTurbo) -> None:
         try:
@@ -335,17 +346,24 @@ class TurboManager:
         except asyncio.CancelledError:
             self._scheduled.pop(plan.url, None)
             raise
+        # No await between dropping the timer entry and reserving the launch slot.
         self._scheduled.pop(plan.url, None)
         await self._launch(plan.url, plan.minutes * 60)
 
     async def _launch(self, url: str, duration: float) -> TurboSession:
-        pages = await self._pick_pages(url)
-        session = self._factory(url, pages, duration)
-        task = asyncio.create_task(session.run(), name=f"turbo:{url}")
-        task.add_done_callback(lambda done, u=url: self._on_done(u, done))
-        self._sessions[url] = session
-        self._tasks[url] = task
-        return session
+        # Probing the sub-pages takes a moment; keep the URL reserved meanwhile so a
+        # concurrent /turbo can neither duplicate it nor take its slot.
+        self._launching.add(url)
+        try:
+            pages = await self._pick_pages(url)
+            session = self._factory(url, pages, duration)
+            task = asyncio.create_task(session.run(), name=f"turbo:{url}")
+            task.add_done_callback(lambda done, u=url: self._on_done(u, done))
+            self._sessions[url] = session
+            self._tasks[url] = task
+            return session
+        finally:
+            self._launching.discard(url)
 
     async def _pick_pages(self, url: str) -> list[str]:
         probes = await asyncio.gather(*(self._prober.probe(p) for p in self._deriver.derive(url)))

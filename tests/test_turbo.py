@@ -235,3 +235,74 @@ async def test_manager_schedules_and_cancels_sessions() -> None:
         assert manager.scheduled() == []
     finally:
         await manager.shutdown()
+
+
+class SlowProber(FakeProber):
+    """Probe that takes a moment, opening the launch window a concurrent /turbo could abuse."""
+
+    async def probe(self, url: str):
+        await asyncio.sleep(0.05)
+        return await super().probe(url)
+
+
+def make_slow_manager(**overrides) -> TurboManager:
+    limits = replace(LIMITS, interval=2, **overrides)
+    return TurboManager(
+        limits=limits,
+        deriver=SubUrlDeriver(("https://app.{domain}",)),
+        prober=SlowProber({"https://app.example.com": 404}),
+        session_factory=StubTurboSession,
+        sleep=lambda seconds: asyncio.sleep(seconds / 1000),
+    )
+
+
+async def test_concurrent_starts_during_launch_are_rejected() -> None:
+    manager = make_slow_manager()
+    try:
+        results = await asyncio.gather(
+            manager.start(ROOT), manager.start(ROOT), return_exceptions=True
+        )
+        assert sum(isinstance(r, StubTurboSession) for r in results) == 1
+        assert sum(isinstance(r, TurboAlreadyRunning) for r in results) == 1
+        assert len(manager.active()) == 1
+    finally:
+        await manager.shutdown()
+
+
+async def test_launch_in_progress_occupies_the_site_slot() -> None:
+    manager = make_slow_manager()
+    try:
+        first = asyncio.create_task(manager.start(ROOT))
+        await asyncio.sleep(0.01)  # first start is probing sub-pages now
+        with pytest.raises(TurboLimitReached):
+            await manager.start("https://other.io")
+        assert isinstance(await first, StubTurboSession)
+    finally:
+        await manager.shutdown()
+
+
+async def test_scheduled_launch_keeps_its_reservation() -> None:
+    manager = make_slow_manager()
+    try:
+        plan = await manager.start(ROOT, 5, start_at=time.time() + 5)
+        assert isinstance(plan, ScheduledTurbo)
+        await asyncio.sleep(0.02)  # timer fired, launch is probing sub-pages
+        assert manager.scheduled() == [] and manager.active() == []
+        with pytest.raises(TurboAlreadyRunning):
+            await manager.start(ROOT)
+        for _ in range(100):
+            if manager.active():
+                break
+            await asyncio.sleep(0.01)
+        assert [s.url for s in manager.active()] == [ROOT]
+    finally:
+        await manager.shutdown()
+
+
+async def test_zero_minutes_is_clamped_to_the_minimum() -> None:
+    manager = make_manager()
+    try:
+        session = await manager.start(ROOT, 0)
+        assert session.duration == 60
+    finally:
+        await manager.shutdown()
