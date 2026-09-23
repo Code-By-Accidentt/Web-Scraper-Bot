@@ -11,7 +11,7 @@ Telegram-controlled watcher that renders websites in a headless browser, reports
 * **Real rendering, fast** – one shared Chromium (Playwright), pages rendered in parallel tabs, waits for network idle instead of sleeping.
 * **Root URL + sub-pages** – every site is watched together with a configurable set of derived pages (`app.<domain>`, `docs.<domain>`, `/dashboard`, …); a sub-page is announced once when it first appears.
 * **Change detection that does not lie** – structural diff of the rendered DOM (text + attributes), every change confirmed by a second render, everything that differs between the two renders (timers, counters, banners) is ignored. Alerts say *what* changed, not only how much.
-* **Contract discovery** – `0x…` and Solana addresses are extracted from the full rendered HTML (text, attributes, comments, meta, inline scripts and JSON) and, with deep scan, from iframes, shadow DOM and every script or JSON answer the page loaded. Candidates are validated over JSON-RPC (bytecode + ERC-20 probe on 8 EVM networks in parallel, program / SPL-mint check on Solana) and cached.
+* **Contract discovery** – `0x…`, Solana and Sui addresses (coin types) are extracted from the full rendered HTML (text, attributes, comments, meta, inline scripts and JSON) and, with deep scan, from iframes, shadow DOM and every script or JSON answer the page loaded. Candidates are validated over JSON-RPC (bytecode + ERC-20 probe on 8 EVM networks in parallel, program / SPL-mint check on Solana) and cached.
 * **Noise control** – an element that keeps changing round after round (counters, rotating banners) is silenced after two alerts for as long as it keeps flapping.
 * **Turbo mode** – `/turbo <url>` renders a site every 2 s (optionally from a scheduled time) and announces every new address immediately, even before the chain confirms it; the session ends by itself after the first confirmed contract or when the time is up.
 * **Unverified mode** – `/unverified <url> on` announces every new address on a site at once, wallets and all, then re-checks it on-chain for a day and confirms it the moment the contract exists; alerts are capped per hour.
@@ -42,14 +42,17 @@ scraper_bot/
   preferences.py            # runtime settings registry: validation, persistence, /settings
   timefmt.py                # duration formatting
   address_extractor.py      # regex + syntactic validation (EIP-55, base58)
-  contract_validators.py    # EVM / Solana RPC checks + caching facade
+  contract_validators.py    # EVM / Solana / Sui RPC checks + caching facade
+  enrichment.py             # token details: on-chain metadata, DexScreener, explorer/DEX links
   rpc.py                    # tiny JSON-RPC client
+  sui.py                    # Sui RPC helpers: coin metadata, packages, coin discovery
   page_checker.py           # per-page pipeline: render -> contracts -> diff
   site_monitor.py           # loop for one root site and its sub-pages
   monitor_manager.py        # add / remove / pause / resume, task lifecycle
   commands.py               # Telegram command parsing + long-polling listener
   status.py                 # /status report (uptime, browser, rounds, caches)
   notifier.py               # alert formatting
+  markup.py                 # Telegram HTML helpers: code, pre, links, escaping
   storage.py                # state.json, snapshots, address caches
   telegram_client.py        # Bot API client (httpx)
 tests/                      # pytest suite: no network, no browser required
@@ -109,9 +112,10 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `SUB_URL_PATTERNS` | see `.env.example` | Sub-pages derived from every root URL (`{domain}` = host without `www.`) |
 | `IGNORED_ATTRIBUTES` | nonce, csrf-token, … | HTML attributes that are never compared |
 | `MAX_CHANGE_EXAMPLES` | 5 | Examples per category in a change alert (0 = counts only) |
+| `ENRICH_TIMEOUT` | 3 | Seconds a contract alert may wait for token details (name, supply, DEX pair via DexScreener); 0 = links only |
 | `BROWSER_CHANNEL` | chromium | `chromium` (bundled) or an installed `chrome` / `msedge` |
 | `BLOCKED_RESOURCE_TYPES` | image,media,font | Resources the browser does not download |
-| `ETH_RPC_URL`, `BASE_RPC_URL`, `ARB_RPC_URL`, `OPT_RPC_URL`, `BSC_RPC_URL`, `FANTOM_RPC_URL`, `SONIC_RPC_URL`, `AVAX_RPC_URL`, `SOLANA_RPC_URL` | public nodes | RPC endpoints; set an EVM one to an empty string to skip that network |
+| `ETH_RPC_URL`, `BASE_RPC_URL`, `ARB_RPC_URL`, `OPT_RPC_URL`, `BSC_RPC_URL`, `FANTOM_RPC_URL`, `SONIC_RPC_URL`, `AVAX_RPC_URL`, `SOLANA_RPC_URL`, `SUI_RPC_URL` | public nodes | RPC endpoints; set an EVM one to an empty string to skip that network |
 | `REQUIRE_ERC20` | true | Count an EVM contract only if it answers `totalSupply` / `symbol` / `decimals` |
 | `RPC_TIMEOUT` / `MAX_CONCURRENT_RPC` | 8 / 8 | RPC timeout in seconds, concurrent address checks |
 | `REJECTED_TTL_HOURS` | 6 | Hours before an address that was *not* a contract is checked again (0 = never) |
@@ -119,7 +123,7 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `DATA_DIR` / `LOG_LEVEL` / `LOG_FILE` | data / INFO / – | Storage directory, verbosity, optional rotating log file |
 | `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes (used by `rebooter.py`) |
 
-Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
+Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, token details timeout, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
 
 ---
 
@@ -155,6 +159,10 @@ Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQU
 6. Elements that already alerted `FLAP_THRESHOLD` times within `FLAP_WINDOW_HOURS` are dropped from the diff (the memory lives in the page's snapshot file and expires on its own). A non-empty remaining diff is sent as an alert with counts and examples: `-` removed, `+` added, `~` attribute changes.
 7. Contracts found on a page: fewer than the threshold → one message each; threshold or more → a `.txt` document and the site is auto-paused until `/resume`.
 8. Answers that look like a block (HTTP 401/403/407/429/503, a WAF challenge title such as "Just a moment…", a `cf-mitigated: challenge` header, connection resets) are never diffed. The site's interval doubles on every such round (bounded by `BLOCK_MAX_BACKOFF` and honouring `Retry-After`), one warning is sent, and a recovery notice follows when the root page answers normally again. The bot never tries to get around a block: slowing down is the only sane reaction.
+
+When a contract is confirmed, the alert also carries the token's name, symbol, decimals and supply (read from the chain: ERC-20 calls, the SPL mint plus its Metaplex or Token-2022 metadata, or the Sui coin metadata), its most liquid DEX pair from DexScreener (price, liquidity, FDV, listing age) or *No DEX pair listed yet*, and links to the explorer, DexScreener and a swap page. These lookups are best effort and bounded by `ENRICH_TIMEOUT`; when a source is slow or down the alert goes out without that part. An alert names exactly one token: every link carries the token's own identifier and never a pair address, so a bot that parses the chat for addresses cannot pick up anything else.
+
+Sui tokens are recognised by their coin type (`0x<package>::module::NAME`); a bare 64-hex id counts as a Sui candidate only on pages that mention Sui, because Ethereum transaction hashes look the same. A coin type is confirmed when the chain holds metadata for it; a bare id must be a package that defines a coin (any package with `REQUIRE_ERC20=false`). When a package was published instead of the coin type, the alert adds the coin type it found.
 
 ## 🚀 Turbo mode
 

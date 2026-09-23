@@ -6,7 +6,8 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 
-from scraper_bot.markup import code, escape, pre
+from scraper_bot.enrichment import TokenEnricher, TokenInfo, format_amount, format_usd, token_links
+from scraper_bot.markup import code, escape, link, pre
 from scraper_bot.models import Address, ChangeReport, ConfirmedContract
 from scraper_bot.telegram_client import TelegramClient
 from scraper_bot.timefmt import format_duration
@@ -25,12 +26,14 @@ class Notifier:
         *,
         max_examples: int | Callable[[], int] = 5,
         problem_cooldown: float = 600.0,
+        enricher: TokenEnricher | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._telegram = telegram
         self._chat_ids = tuple(chat_ids)
         self._max_examples = max_examples if callable(max_examples) else (lambda: max_examples)
         self._problem_cooldown = problem_cooldown
+        self._enricher = enricher
         self._clock = clock
         self._problems: dict[str, float] = {}
 
@@ -68,7 +71,7 @@ class Notifier:
         await self._send(
             f"🔔 Contract found on {escape(page_url)}\n"
             f"Network: {escape(contract.network)}\n"
-            f"{code(contract.address.value)}"
+            f"{code(contract.address.value)}" + await self._token_details(contract)
         )
 
     async def contracts_batch(
@@ -116,6 +119,7 @@ class Notifier:
         await self._send(
             f"✅ Confirmed: {code(contract.address.value)} is a contract on "
             f"{escape(contract.network)}\nPage: {escape(page_url)}"
+            + await self._token_details(contract)
         )
 
     async def unverified_digest(self, site_url: str, count: int, watch_seconds: float) -> None:
@@ -197,8 +201,56 @@ class Notifier:
         lines.append(f"\n➡️ {escape(report.url)}")
         return "\n".join(lines)
 
+    async def _token_details(self, contract: ConfirmedContract) -> str:
+        """Extra lines: what the token is, where it trades, where to look it up."""
+        info = TokenInfo()
+        if self._enricher is not None:
+            try:
+                info = await self._enricher.enrich(contract)
+            except Exception:  # details must never hold back the alert
+                log.warning("token details failed for %s", contract.address.value, exc_info=True)
+        lines = describe_token(info, self._clock())
+        links = token_links(contract, info.coin_type)
+        if links:
+            lines.append("Links: " + " · ".join(link(label, url) for label, url in links))
+        return "".join(f"\n{line}" for line in lines)
+
     async def _send(self, text: str) -> None:
         if not self._chat_ids:
             log.warning("no TELEGRAM_CHAT_IDS configured; dropping alert: %s", text.splitlines()[0])
             return
         await self._telegram.broadcast(self._chat_ids, text)
+
+
+def describe_token(info: TokenInfo, now: float) -> list[str]:
+    """Lines for a token alert; unknown parts are simply left out."""
+    lines: list[str] = []
+    if info.coin_type:
+        lines.append(f"Coin type: {code(info.coin_type)}")
+    identity: list[str] = []
+    if info.name and info.symbol:
+        identity.append(f"{escape(info.name)} ({escape(info.symbol)})")
+    elif info.name or info.symbol:
+        identity.append(escape(info.name or info.symbol))
+    if info.decimals is not None:
+        identity.append(f"{info.decimals} decimals")
+    if info.supply is not None:
+        identity.append(f"supply {format_amount(info.supply)}")
+    if identity:
+        lines.append("Token: " + " · ".join(identity))
+    if info.pair_url:
+        # Plain text on purpose: the pair page URL holds the pair's own address, and an
+        # alert must name exactly one token.
+        market = [escape(f"{info.dex or 'DEX'} {info.pair or ''}".strip())]
+        if info.price_usd is not None:
+            market.append(f"price {format_usd(info.price_usd)}")
+        if info.liquidity_usd is not None:
+            market.append(f"liquidity {format_usd(info.liquidity_usd)}")
+        if info.fdv_usd is not None:
+            market.append(f"FDV {format_usd(info.fdv_usd)}")
+        if info.pair_created_at is not None:
+            market.append(f"listed {format_duration(now - info.pair_created_at)} ago")
+        lines.append("Trading on " + " · ".join(market))
+    elif info.market_checked:
+        lines.append("No DEX pair listed yet.")
+    return lines

@@ -217,3 +217,20 @@ def test_rejected_ttl_can_be_a_live_provider(tmp_path: Path) -> None:
     assert cache.is_rejected(SOL)
     ttl["value"] = 10.0  # shortened at runtime through /set
     assert not cache.is_rejected(SOL)
+
+
+def test_legacy_wallet_lines_of_every_chain_are_recognised(tmp_path: Path) -> None:
+    from scraper_bot.storage import LegacyStateImporter
+
+    sui = "0x" + "ab" * 32
+    (tmp_path / LegacyStateImporter.WALLETS_FILE).write_text(
+        f"{USDC_ETH.lower()}\n{USDC_SOL}\n{sui}\n{sui}::usdc::USDC\nnot-an-address\n",
+        encoding="utf-8",
+    )
+    found = [(a.chain, a.value) for a in LegacyStateImporter(tmp_path).known_addresses()]
+    assert found == [
+        (Chain.ETHEREUM, USDC_ETH),
+        (Chain.SOLANA, USDC_SOL),
+        (Chain.SUI, sui),
+        (Chain.SUI, f"{sui}::usdc::USDC"),
+    ]

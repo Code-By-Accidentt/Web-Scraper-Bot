@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scraper_bot.address_extractor import canonical_address
+from scraper_bot.address_extractor import canonical_address, detect_chain
 from scraper_bot.models import (
     Address,
     Chain,
@@ -116,8 +116,8 @@ class LegacyStateImporter:
             raw = line.strip()
             if not raw:
                 continue
-            chain = Chain.ETHEREUM if raw.lower().startswith("0x") else Chain.SOLANA
-            address = canonical_address(chain, raw)
+            chain = detect_chain(raw)
+            address = canonical_address(chain, raw) if chain else None
             if address is not None:
                 addresses.append(address)
         return addresses

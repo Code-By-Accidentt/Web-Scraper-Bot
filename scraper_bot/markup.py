@@ -10,7 +10,7 @@ from __future__ import annotations
 import html
 import re
 
-_TAG_RE = re.compile(r"</?(?:code|pre|b|i|u)>")
+_TAG_RE = re.compile(r"</?(?:code|pre|b|i|u)>|<a href=\"[^\"]*\">|</a>")
 
 
 def escape(value: object) -> str:
@@ -29,6 +29,11 @@ def pre(value: object) -> str:
 
 def bold(value: object) -> str:
     return f"<b>{escape(value)}</b>"
+
+
+def link(text: object, url: str) -> str:
+    """Clickable text; previews are disabled on every message, so links stay compact."""
+    return f'<a href="{html.escape(url, quote=True)}">{escape(text)}</a>'
 
 
 def strip_markup(text: str) -> str:

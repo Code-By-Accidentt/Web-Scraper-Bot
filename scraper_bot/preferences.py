@@ -39,6 +39,7 @@ class Tuning(Protocol):
     unverified_watch: float
     unverified_max_per_hour: int
     max_change_examples: int
+    enrich_timeout: float
     flap_window: float
     flap_threshold: int
     turbo_interval: float
@@ -281,6 +282,19 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "0 sends counts only.",
         0,
         20,
+    ),
+    PreferenceSpec(
+        "enrich_timeout",
+        "enrich_timeout",
+        "alerts",
+        "float",
+        "Time budget for token details",
+        "How long a contract alert may wait for the token's name, supply and DEX market "
+        "data (on-chain calls and DexScreener) before it is sent without them. 0 turns the "
+        "lookups off; the explorer and DEX links stay.",
+        0,
+        30,
+        "s",
     ),
     PreferenceSpec(
         "flap_window_hours",

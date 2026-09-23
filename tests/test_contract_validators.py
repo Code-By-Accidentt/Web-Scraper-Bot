@@ -16,6 +16,7 @@ from scraper_bot.contract_validators import (
     EvmContractValidator,
     RpcUnavailable,
     SolanaContractValidator,
+    SuiCoinValidator,
 )
 from scraper_bot.models import Address, Chain, ConfirmedContract, ValidationStatus
 from scraper_bot.storage import AddressCache
@@ -314,3 +315,103 @@ async def test_rpc_failures_are_reported_through_the_notifier(tmp_path: Path) ->
     assert len(notifier.problems) == 1
     key, title, detail, hint = notifier.problems[0]
     assert key == "rpc" and "failing" in title and "Beta" in detail and "60 s" in (hint or "")
+
+
+# ── SuiCoinValidator ────────────────────────────────────────────────────────
+SUI_PKG = "0x" + "ab" * 32
+SUI_COIN = f"{SUI_PKG}::usdc::USDC"
+SUI_STRUCT = f"{SUI_PKG}::helpers::Config"
+SUI_WALLET = "0x" + "cd" * 32
+SUI_OBJECT = "0x" + "ef" * 32
+
+
+def sui_node(
+    *,
+    coins: dict[str, dict[str, Any]],
+    packages: dict[str, dict[str, list[str]]],
+    objects: set[str] = frozenset(),
+) -> Responder:
+    def responder(method: str, params: list[Any]) -> Any:
+        target = params[0]
+        if method == "suix_getCoinMetadata":
+            return coins.get(target)
+        if method == "sui_getObject":
+            if target in packages:
+                return {"data": {"objectId": target, "type": "package"}}
+            if target in objects:
+                return {"data": {"objectId": target, "type": "0x2::coin::Coin<0x2::sui::SUI>"}}
+            return {"error": {"code": "notExists", "object_id": target}}
+        if method == "sui_getNormalizedMoveModulesByPackage":
+            modules = packages.get(target, {})
+            return {m: {"structs": {s: {} for s in structs}} for m, structs in modules.items()}
+        raise RpcFailure("unknown method")
+
+    return responder
+
+
+async def test_sui_coin_types_and_packages() -> None:
+    rpc = FakeRpc()
+    rpc.route(
+        "sui.rpc",
+        sui_node(
+            coins={SUI_COIN: {"name": "USDC", "symbol": "USDC", "decimals": 6}},
+            packages={SUI_PKG: {"helpers": ["Config"], "usdc": ["USDC"]}},
+            objects={SUI_OBJECT},
+        ),
+    )
+    async with rpc.client() as http:
+        strict = SuiCoinValidator(
+            http, "https://sui.rpc", timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
+        assert await strict.is_coin_or_package(SUI_COIN)
+        assert await strict.is_coin_or_package(SUI_PKG)  # the package defines a coin
+        assert not await strict.is_coin_or_package(SUI_STRUCT)  # a type, not a coin
+        assert not await strict.is_coin_or_package(SUI_WALLET)
+        assert not await strict.is_coin_or_package(SUI_OBJECT)
+        lenient = SuiCoinValidator(
+            http, "https://sui.rpc", timeout=5, tuning=FakeTuning(require_erc20=False)
+        )
+        assert await lenient.is_coin_or_package(SUI_STRUCT)  # any type of a real package
+        assert not await lenient.is_coin_or_package(SUI_WALLET)
+
+        rpc.route("sui.rpc", sui_node(coins={}, packages={SUI_PKG: {"helpers": ["Config"]}}))
+        assert not await strict.is_coin_or_package(SUI_PKG)  # no coin inside
+        assert await lenient.is_coin_or_package(SUI_PKG)
+
+
+async def test_sui_transport_error_is_unavailable() -> None:
+    rpc = FakeRpc()  # nothing routed: every call fails to connect
+    async with rpc.client() as http:
+        validator = SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning())
+        with pytest.raises(RpcUnavailable):
+            await validator.is_coin_or_package(SUI_COIN)
+        with pytest.raises(RpcUnavailable):
+            await validator.is_coin_or_package(SUI_PKG)
+
+
+async def test_facade_routes_sui_addresses(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    rpc.route(
+        "sui.rpc",
+        sui_node(coins={SUI_COIN: {"decimals": 6}}, packages={SUI_PKG: {"usdc": ["USDC"]}}),
+    )
+    clock = FakeClock()
+    async with rpc.client() as http:
+        cache = AddressCache(
+            tmp_path / "known.tsv", tmp_path / "rejected.tsv", rejected_ttl=1000, clock=clock
+        )
+        cache.load()
+        validator = ContractValidator(
+            EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning()),
+            SolanaContractValidator(http, "https://sol.rpc", timeout=5),
+            cache,
+            max_concurrent=4,
+            retry_delay=60,
+            clock=clock,
+            sui=SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning()),
+        )
+        confirmed = await validator.validate(Address(Chain.SUI, SUI_COIN))
+        assert confirmed.status is ValidationStatus.CONFIRMED and confirmed.network == "Sui"
+        rejected = await validator.validate(Address(Chain.SUI, SUI_WALLET))
+        assert rejected.status is ValidationStatus.REJECTED
+        assert rpc.count("sol.rpc") == 0 and rpc.count("alpha.rpc") == 0
