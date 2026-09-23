@@ -7,8 +7,10 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol
 
+from scraper_bot.markup import escape
 from scraper_bot.monitor_manager import MonitorManager
 from scraper_bot.storage import AddressCache
+from scraper_bot.timefmt import format_duration
 from scraper_bot.turbo import TurboManager
 
 
@@ -49,17 +51,20 @@ class StatusReporter:
             f"Sites: {len(sites)} total, {running} running, {paused} paused",
         ]
         for site in sites:
-            lines.append(f"• {site.url}: {self._describe(site.url, site.paused, now)}")
+            lines.append(f"• {escape(site.url)}: {self._describe(site.url, site.paused, now)}")
         if self._turbo is not None:
             for session in self._turbo.active():
                 stats = session.stats
                 lines.append(
-                    f"🚀 Turbo {session.url}: {stats.cycles} cycles, {len(stats.found)} confirmed, "
+                    f"🚀 Turbo {escape(session.url)}: {stats.cycles} cycles, "
+                    f"{len(stats.found)} confirmed, "
                     f"{stats.unverified} unverified, {format_duration(session.seconds_left)} left"
                 )
             for plan in self._turbo.scheduled():
                 when = datetime.fromtimestamp(plan.start_at).strftime("%H:%M")
-                lines.append(f"⏰ Turbo {plan.url}: scheduled at {when} for {plan.minutes:.0f} min")
+                lines.append(
+                    f"⏰ Turbo {escape(plan.url)}: scheduled at {when} for {plan.minutes:.0f} min"
+                )
         lines.append(
             f"Address cache: {self._cache.known_count} known contract(s), "
             f"{self._cache.rejected_count} rejected"
@@ -84,20 +89,7 @@ class StatusReporter:
         if stats.blocked:
             since = datetime.fromtimestamp(stats.blocked_since or now).strftime("%H:%M")
             text += (
-                f"; ⚠️ BLOCKED? {stats.block_reason} since {since}, interval x{2**stats.block_level}"
+                f"; ⚠️ BLOCKED? {escape(stats.block_reason)} since {since}, "
+                f"interval x{2**stats.block_level}"
             )
         return text
-
-
-def format_duration(seconds: float) -> str:
-    seconds = max(int(seconds), 0)
-    days, rest = divmod(seconds, 86_400)
-    hours, rest = divmod(rest, 3_600)
-    minutes, secs = divmod(rest, 60)
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"

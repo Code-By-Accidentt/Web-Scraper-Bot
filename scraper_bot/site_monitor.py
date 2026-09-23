@@ -20,6 +20,8 @@ from scraper_bot.models import (
 )
 from scraper_bot.notifier import Notifier
 from scraper_bot.page_checker import PageChecker
+from scraper_bot.preferences import Tuning
+from scraper_bot.unverified import UnverifiedWatcher
 from scraper_bot.urls import SubUrlDeriver
 
 log = logging.getLogger(__name__)
@@ -55,8 +57,10 @@ class SiteMonitor:
 
     Every round probes the derived sub-pages, checks each live page concurrently
     (bounded by the shared browser), announces newly discovered pages, reports
-    confirmed changes and contracts, and auto-pauses the site when one page
-    yields ``contract_threshold`` or more new contracts at once.
+    confirmed changes and contracts, feeds the optional unverified-mode watcher,
+    and auto-pauses the site when one page yields ``contract_pause_threshold`` or
+    more new contracts at once. Timing knobs are read from ``tuning`` on every
+    round, so changes made through /set apply immediately.
     """
 
     def __init__(
@@ -69,9 +73,8 @@ class SiteMonitor:
         notifier: Notifier,
         persist: PersistCallback,
         on_auto_pause: AutoPauseCallback,
-        poll_interval: tuple[float, float],
-        contract_threshold: int,
-        max_backoff: float = 600.0,
+        tuning: Tuning,
+        watcher: UnverifiedWatcher | None = None,
         rng: random.Random | None = None,
     ) -> None:
         self._site = site
@@ -81,9 +84,8 @@ class SiteMonitor:
         self._notifier = notifier
         self._persist = persist
         self._on_auto_pause = on_auto_pause
-        self._poll_interval = poll_interval
-        self._threshold = contract_threshold
-        self._max_backoff = max_backoff
+        self._tuning = tuning
+        self._watcher = watcher
         self._rng = rng or random.Random()
         self._stop = asyncio.Event()
         self._stats = MonitorStats()
@@ -132,6 +134,15 @@ class SiteMonitor:
                 log.error(
                     "[%s] check of %s failed: %r", self._site.url, url, result, exc_info=result
                 )
+                await self._notifier.problem(
+                    f"check:{self._site.url}",
+                    f"Page check failed on {url}",
+                    f"{type(result).__name__}: {result}",
+                    hint="The page is retried on the next round; if this keeps coming, "
+                    "look at the bot log.",
+                )
+        if self._watcher is not None:
+            await self._watcher.recheck()
         self._stats.rounds += 1
         self._stats.last_round_at = time.time()
         self._stats.last_round_seconds = time.perf_counter() - started
@@ -141,8 +152,9 @@ class SiteMonitor:
 
     def next_delay(self) -> float:
         """Seconds until the next round: the random interval, doubled per block level."""
-        base = self._rng.uniform(*self._poll_interval)
-        delay = min(base * (2**self._stats.block_level), max(self._max_backoff, base))
+        base = self._rng.uniform(self._tuning.poll_interval_min, self._tuning.poll_interval_max)
+        cap = max(self._tuning.block_max_backoff, base)
+        delay = min(base * (2**self._stats.block_level), cap)
         if self._stats.retry_after:
             delay = max(delay, self._stats.retry_after)
         return delay
@@ -173,6 +185,8 @@ class SiteMonitor:
 
         if outcome.contracts:
             await self._handle_contracts(outcome.url, outcome.contracts)
+        if self._watcher is not None and outcome.candidates:
+            await self._watcher.observe(outcome.candidates, outcome.url)
 
         if outcome.status is PageStatus.CHANGED and outcome.report is not None:
             site.last_change = LastChange(time.time(), outcome.url, outcome.report.counts)
@@ -198,7 +212,7 @@ class SiteMonitor:
         self, page_url: str, contracts: Sequence[ConfirmedContract]
     ) -> None:
         site = self._site
-        if len(contracts) < self._threshold:
+        if len(contracts) < self._tuning.contract_pause_threshold:
             for contract in contracts:
                 await self._notifier.contract_found(contract, page_url)
             return

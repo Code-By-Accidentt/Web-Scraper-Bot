@@ -104,6 +104,11 @@ class Settings:
     turbo_recheck_interval: float
     block_max_backoff: float
 
+    # Unverified mode (/unverified <url> on)
+    unverified_recheck: float
+    unverified_watch: float
+    unverified_max_per_hour: int
+
     # Browser
     browser_channel: str
     headless: bool
@@ -190,6 +195,9 @@ class Settings:
             turbo_max_pages=reader.integer("TURBO_MAX_PAGES", 4, minimum=1),
             turbo_recheck_interval=reader.number("TURBO_RECHECK_INTERVAL", 5.0, minimum=1.0),
             block_max_backoff=reader.number("BLOCK_MAX_BACKOFF", 600.0, minimum=1.0),
+            unverified_recheck=reader.number("UNVERIFIED_RECHECK_MINUTES", 5.0, minimum=1.0) * 60,
+            unverified_watch=reader.number("UNVERIFIED_WATCH_HOURS", 24.0, minimum=1.0) * 3600,
+            unverified_max_per_hour=reader.integer("UNVERIFIED_MAX_PER_HOUR", 10, minimum=1),
             browser_channel=reader.text("BROWSER_CHANNEL", "chromium"),
             headless=reader.flag("HEADLESS", True),
             blocked_resource_types=reader.text_list(

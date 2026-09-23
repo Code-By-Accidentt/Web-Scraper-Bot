@@ -14,7 +14,7 @@ from scraper_bot.models import (
 )
 from scraper_bot.site_monitor import SiteMonitor
 from scraper_bot.urls import SubUrlDeriver
-from tests.conftest import FakeChecker, FakeNotifier, FakeProber, node
+from tests.conftest import FakeChecker, FakeNotifier, FakeProber, FakeTuning, node
 
 ROOT = "https://example.com"
 APP = "https://app.example.com"
@@ -35,6 +35,8 @@ class Harness:
         self.notifier = FakeNotifier()
         self.persist_calls = 0
         self.auto_pauses: list[tuple[str, str]] = []
+        self.tuning = FakeTuning(contract_pause_threshold=threshold)
+        self.tuning = FakeTuning(contract_pause_threshold=threshold)
 
         def persist() -> None:
             self.persist_calls += 1
@@ -50,8 +52,7 @@ class Harness:
             notifier=self.notifier,  # type: ignore[arg-type]
             persist=persist,
             on_auto_pause=on_auto_pause,
-            poll_interval=(0.01, 0.02),
-            contract_threshold=threshold,
+            tuning=self.tuning,
             rng=random.Random(1),
         )
 
@@ -139,6 +140,10 @@ async def test_failing_check_does_not_break_the_round() -> None:
     h.checker.check = broken  # type: ignore[method-assign]
     outcomes = await h.monitor.run_once()
     assert [o.url for o in outcomes] == [ROOT]
+    assert len(h.notifier.problems) == 1
+    key, title, detail, hint = h.notifier.problems[0]
+    assert key == f"check:{ROOT}" and title == f"Page check failed on {DOCS}"
+    assert detail == "RuntimeError: boom" and hint
 
 
 async def test_run_loops_until_stopped() -> None:
@@ -182,7 +187,7 @@ async def test_retry_after_and_max_backoff_bound_the_delay() -> None:
     assert h.monitor.next_delay() == 5.0
 
     capped = Harness(statuses={APP: 404, DOCS: 404})
-    capped.monitor._max_backoff = 0.03
+    capped.tuning.block_max_backoff = 0.03
     for _ in range(6):
         capped.outcome(ROOT, PageStatus.UNAVAILABLE, block=BlockSignal("HTTP 403"))
         await capped.monitor.run_once()

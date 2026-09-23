@@ -209,12 +209,12 @@ class AddressCache:
         known_path: Path,
         rejected_path: Path,
         *,
-        rejected_ttl: float,
+        rejected_ttl: float | Callable[[], float],
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._known_path = known_path
         self._rejected_path = rejected_path
-        self._ttl = rejected_ttl
+        self._ttl = rejected_ttl if callable(rejected_ttl) else (lambda: float(rejected_ttl))
         self._clock = clock
         self._known: dict[Address, str] = {}
         self._rejected: dict[Address, float] = {}
@@ -289,7 +289,8 @@ class AddressCache:
 
     # ── internals ───────────────────────────────────────────────────────────
     def _expired(self, rejected_at: float, now: float) -> bool:
-        return self._ttl > 0 and now - rejected_at >= self._ttl
+        ttl = self._ttl()
+        return ttl > 0 and now - rejected_at >= ttl
 
     def _rewrite_rejected(self) -> None:
         lines = [

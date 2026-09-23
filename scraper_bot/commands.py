@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from scraper_bot.markup import code, escape
 from scraper_bot.models import SiteState
 from scraper_bot.monitor_manager import (
     MonitorError,
@@ -20,8 +21,9 @@ from scraper_bot.monitor_manager import (
     SiteNotPaused,
     SiteNotTracked,
 )
-from scraper_bot.status import format_duration
+from scraper_bot.preferences import ConfirmationRequired, PreferenceError, Preferences
 from scraper_bot.telegram_client import TelegramClient
+from scraper_bot.timefmt import format_duration
 from scraper_bot.turbo import (
     ScheduledTurbo,
     TurboAlreadyRunning,
@@ -36,28 +38,44 @@ log = logging.getLogger(__name__)
 
 Handler = Callable[[int, str], Awaitable[str]]
 
-TURBO_USAGE = (
-    "Usage: /turbo <url> [minutes] [at HH:MM | in 10m]\n"
-    "       /turbo stop <url>\n"
-    "       /turbo (status)"
+COMMAND_HELP: tuple[tuple[str, str], ...] = (
+    ("/add <url>", "start monitoring a site"),
+    ("/remove <url>", "stop monitoring a site"),
+    ("/pause <url>", "pause monitoring"),
+    ("/resume <url>", "resume monitoring"),
+    ("/list", "monitored sites with their status"),
+    ("/nonotifi <url>", "mute change alerts for a site"),
+    ("/notify <url>", "un-mute change alerts for a site"),
+    ("/turbo <url> [minutes] [at HH:MM | in 10m]", "render every 2s until a contract appears"),
+    ("/turbo stop <url>", "end turbo mode; /turbo alone shows turbo status"),
+    ("/unverified <url> on|off", "announce every new address at once, confirm later"),
+    ("/settings [key]", "live settings with explanations; /set <key> <value> changes one"),
+    ("/status", "bot health, last round per site, cache sizes"),
+    ("/help", "this message"),
 )
-HELP_TEXT = (
-    "Available commands:\n"
-    "/add <url> — start monitoring a site\n"
-    "/remove <url> — stop monitoring a site\n"
-    "/pause <url> — pause monitoring\n"
-    "/resume <url> — resume monitoring\n"
-    "/list — monitored sites with their status\n"
-    "/nonotifi <url> — mute change alerts for a site\n"
-    "/notify <url> — un-mute change alerts for a site\n"
-    "/turbo <url> [minutes] [at HH:MM | in 10m] — render every 2s until a contract appears\n"
-    "/turbo stop <url> — end turbo mode; /turbo alone shows turbo status\n"
-    "/status — bot health, last round per site, cache sizes\n"
-    "/help — this message"
+HELP_TEXT = "Available commands:\n" + "\n".join(
+    f"{code(usage)} — {escape(description)}" for usage, description in COMMAND_HELP
+)
+TURBO_USAGE = "Usage:\n" + "\n".join(
+    code(line)
+    for line in ("/turbo <url> [minutes] [at HH:MM | in 10m]", "/turbo stop <url>", "/turbo")
+)
+SETTINGS_USAGE = "Usage:\n" + "\n".join(
+    f"{code(usage)} — {escape(description)}"
+    for usage, description in (
+        ("/settings", "all settings with live values"),
+        ("/settings <key>", "what a setting does, its range and default"),
+        ("/set <key> <value>", "change it (add 'confirm' for risky values)"),
+        ("/settings reset <key|all>", "back to the .env value"),
+    )
 )
 
 _DELAY_RE = re.compile(r"^(\d+)([mh])$", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def usage(command: str) -> str:
+    return f"Usage: {code(command)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +142,7 @@ def parse_command(text: str) -> ParsedCommand | None:
 
 
 class BotCommands:
-    """Maps commands to :class:`MonitorManager` calls and phrases the replies."""
+    """Maps commands to :class:`MonitorManager` calls and phrases the replies (HTML)."""
 
     def __init__(
         self,
@@ -135,18 +153,26 @@ class BotCommands:
         alert_chat_ids: Sequence[int] = (),
         status_provider: Callable[[], str] | None = None,
         turbo: TurboManager | None = None,
+        preferences: Preferences | None = None,
     ) -> None:
         self._manager = manager
         self._telegram = telegram
         self._allowed = frozenset(allowed_chat_ids)
         self._alerts_configured = bool(alert_chat_ids)
+        # Settings may be changed from the command allowlist, or from the alert chats
+        # when no allowlist is configured; never from arbitrary chats.
+        self._admins = frozenset(allowed_chat_ids) or frozenset(alert_chat_ids)
         self._status_provider = status_provider
         self._turbo = turbo
+        self._preferences = preferences
         self._handlers: dict[str, Handler] = {
             "start": self._start,
             "help": self._help,
             "status": self._status,
             "turbo": self._turbo_command,
+            "settings": self._settings,
+            "set": self._set,
+            "unverified": self._unverified,
             "add": self._add,
             "remove": self._remove,
             "pause": self._pause,
@@ -176,29 +202,35 @@ class BotCommands:
         if not self._alerts_configured and command.name in {"add", "list", "resume"}:
             reply += (
                 f"\n\n⚠️ TELEGRAM_CHAT_IDS is empty, so alerts are dropped. "
-                f"Put your chat id ({chat_id}) into .env and restart the bot."
+                f"Put your chat id {code(chat_id)} into .env and restart the bot."
             )
         await self._telegram.send_message(chat_id, reply)
 
     async def execute(self, chat_id: int, command: ParsedCommand) -> str:
         handler = self._handlers.get(command.name)
         if handler is None:
-            return f"Unknown command /{command.name}. Send /help for the list."
+            return f"Unknown command {code('/' + command.name)}. Send {code('/help')} for the list."
         try:
             return await handler(chat_id, command.argument)
         except MonitorError as exc:
             return self._describe(exc)
         except TurboError as exc:
             return self._describe_turbo(exc)
-        except InvalidUrlError as exc:
-            return f"❌ {exc}"
-        except Exception:
+        except ConfirmationRequired as exc:
+            return self._describe_confirmation(exc)
+        except (PreferenceError, InvalidUrlError) as exc:
+            return f"❌ {escape(exc)}"
+        except Exception as exc:
             log.exception("command /%s %s failed", command.name, command.argument)
-            return "⚠️ Internal error while running the command; see the bot log."
+            detail = f"{type(exc).__name__}: {exc}"[:300]
+            return (
+                f"⚠️ Internal error while running {code('/' + command.name)}: {code(detail)}\n"
+                f"The bot keeps running; details are in the log."
+            )
 
     # ── handlers ────────────────────────────────────────────────────────────
     async def _start(self, chat_id: int, _argument: str) -> str:
-        return f"👋 Your chat id is {chat_id}.\n\n{HELP_TEXT}"
+        return f"👋 Your chat id is {code(chat_id)}.\n\n{HELP_TEXT}"
 
     async def _help(self, _chat_id: int, _argument: str) -> str:
         return HELP_TEXT
@@ -216,21 +248,116 @@ class BotCommands:
             return self._turbo_status()
         if tokens[0].lower() == "stop":
             if len(tokens) < 2:
-                return "Usage: /turbo stop <url>"
+                return usage("/turbo stop <url>")
             url = await self._turbo.stop(tokens[1])
-            return f"⏹️ Turbo stopped for {url}."
+            return f"⏹️ Turbo stopped for {escape(url)}."
         try:
             request = parse_turbo_request(tokens, time.time())
         except ValueError as exc:
-            return f"❌ {exc}\n{TURBO_USAGE}"
+            return f"❌ {escape(exc)}\n{TURBO_USAGE}"
         started = await self._turbo.start(request.url, request.minutes, request.start_at)
         if isinstance(started, ScheduledTurbo):
             when = datetime.fromtimestamp(started.start_at).strftime("%Y-%m-%d %H:%M")
-            return f"⏰ Turbo for {started.url} scheduled at {when} for {started.minutes:.0f} min."
+            return (
+                f"⏰ Turbo for {escape(started.url)} scheduled at {when} for "
+                f"{started.minutes:.0f} min. Cancel with {code(f'/turbo stop {started.url}')}"
+            )
         limits = self._turbo.limits
         return (
-            f"🚀 Turbo started for {started.url}: {len(started.pages)} page(s) every "
+            f"🚀 Turbo started for {escape(started.url)}: {len(started.pages)} page(s) every "
             f"{limits.interval:.0f}s for {started.seconds_left / 60:.0f} min."
+        )
+
+    # ── settings ────────────────────────────────────────────────────────────
+    def _admin_only(self, chat_id: int) -> str | None:
+        if not self._admins:
+            return (
+                "🔒 Settings can only be changed from chats listed in "
+                "TELEGRAM_ALLOWED_CHAT_IDS or TELEGRAM_CHAT_IDS; both are empty."
+            )
+        if chat_id not in self._admins:
+            return (
+                "🔒 Only chats listed in TELEGRAM_ALLOWED_CHAT_IDS (or TELEGRAM_CHAT_IDS) "
+                "can change settings."
+            )
+        return None
+
+    async def _settings(self, chat_id: int, argument: str) -> str:
+        if self._preferences is None:
+            return "Settings are not available."
+        tokens = argument.split()
+        if not tokens:
+            return self._preferences.overview()
+        if tokens[0].lower() == "reset":
+            denied = self._admin_only(chat_id)
+            if denied:
+                return denied
+            target = tokens[1] if len(tokens) > 1 else "all"
+            changes = self._preferences.reset(None if target.lower() == "all" else target)
+            if not changes:
+                return "Nothing to reset: every setting already has its .env value."
+            prefs = self._preferences
+            lines = ["♻️ Restored .env values:"]
+            lines.extend(
+                f"• {code(c.spec.key)}: {escape(prefs.format_value(c.spec, c.old))} → "
+                f"{escape(prefs.format_value(c.spec, c.new))}"
+                for c in changes
+            )
+            return "\n".join(lines)
+        return self._preferences.describe(tokens[0])
+
+    async def _set(self, chat_id: int, argument: str) -> str:
+        if self._preferences is None:
+            return "Settings are not available."
+        denied = self._admin_only(chat_id)
+        if denied:
+            return denied
+        tokens = argument.split()
+        if len(tokens) < 2:
+            return SETTINGS_USAGE
+        confirmed = len(tokens) > 2 and tokens[2].lower() == "confirm"
+        change = self._preferences.set(tokens[0], tokens[1], confirmed=confirmed)
+        prefs = self._preferences
+        return (
+            f"✅ {code(change.spec.key)}: {escape(prefs.format_value(change.spec, change.old))} → "
+            f"{escape(prefs.format_value(change.spec, change.new))} (applies immediately)"
+        )
+
+    def _describe_confirmation(self, exc: ConfirmationRequired) -> str:
+        value = "on" if exc.value is True else "off" if exc.value is False else f"{exc.value:g}"
+        return (
+            f"⚠️ {escape(exc.warning)}\n"
+            f"To apply anyway, repeat: {code(f'/set {exc.spec.key} {value} confirm')}"
+        )
+
+    async def _unverified(self, chat_id: int, argument: str) -> str:
+        tokens = argument.split()
+        if not tokens:
+            sites = [s for s in self._manager.sites() if s.unverified_enabled]
+            if not sites:
+                return (
+                    f"Unverified mode is off for every site.\n{usage('/unverified <url> on|off')}\n"
+                    "It announces every new address on the site at once and re-checks it "
+                    "on-chain until it is confirmed."
+                )
+            return "Unverified mode is on for:\n" + "\n".join(f"• {escape(s.url)}" for s in sites)
+        denied = self._admin_only(chat_id)
+        if denied:
+            return denied
+        if len(tokens) < 2 or tokens[1].lower() not in {"on", "off"}:
+            return usage("/unverified <url> on|off")
+        enabled = tokens[1].lower() == "on"
+        site = self._manager.set_unverified(tokens[0], enabled)
+        if enabled:
+            return (
+                f"⚠️ Unverified mode ON for {escape(site.url)}: every new address is announced "
+                f"at once (wallets and example addresses included) and re-checked on-chain until "
+                f"it is confirmed. Alerts are capped per hour. Turn off with "
+                f"{code(f'/unverified {site.url} off')}"
+            )
+        return (
+            f"✅ Unverified mode OFF for {escape(site.url)}; "
+            "only confirmed contracts are announced."
         )
 
     def _turbo_status(self) -> str:
@@ -239,57 +366,61 @@ class BotCommands:
         for session in self._turbo.active():
             stats = session.stats
             lines.append(
-                f"🚀 {session.url}: {stats.cycles} cycles, {stats.renders} renders, "
+                f"🚀 {escape(session.url)}: {stats.cycles} cycles, {stats.renders} renders, "
                 f"{len(stats.found)} confirmed, {stats.unverified} unverified, "
-                f"{format_duration(session.seconds_left)} left"
+                f"{format_duration(session.seconds_left)} left; "
+                f"stop with {code(f'/turbo stop {session.url}')}"
             )
         for plan in self._turbo.scheduled():
             when = datetime.fromtimestamp(plan.start_at).strftime("%Y-%m-%d %H:%M")
-            lines.append(f"⏰ {plan.url}: starts at {when} for {plan.minutes:.0f} min")
+            lines.append(
+                f"⏰ {escape(plan.url)}: starts at {when} for {plan.minutes:.0f} min; "
+                f"cancel with {code(f'/turbo stop {plan.url}')}"
+            )
         if not lines:
             return f"No turbo session is running.\n{TURBO_USAGE}"
         return "\n".join(lines)
 
     async def _add(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /add <url>"
+            return usage("/add <url>")
         site = await self._manager.add_site(argument)
-        return f"✅ {site.url} added to monitoring."
+        return f"✅ {escape(site.url)} added to monitoring."
 
     async def _remove(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /remove <url>"
+            return usage("/remove <url>")
         site = await self._manager.remove_site(argument)
-        return f"✅ {site.url} removed from monitoring."
+        return f"✅ {escape(site.url)} removed from monitoring."
 
     async def _pause(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /pause <url>"
+            return usage("/pause <url>")
         site = await self._manager.pause_site(argument)
-        return f"⏸️ {site.url} paused."
+        return f"⏸️ {escape(site.url)} paused. Resume with {code(f'/resume {site.url}')}"
 
     async def _resume(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /resume <url>"
+            return usage("/resume <url>")
         site = await self._manager.resume_site(argument)
-        return f"▶️ {site.url} resumed."
+        return f"▶️ {escape(site.url)} resumed."
 
     async def _notify(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /notify <url>"
+            return usage("/notify <url>")
         site = self._manager.set_notifications(argument, True)
-        return f"🔔 Change alerts enabled for {site.url}."
+        return f"🔔 Change alerts enabled for {escape(site.url)}."
 
     async def _nonotifi(self, _chat_id: int, argument: str) -> str:
         if not argument:
-            return "Usage: /nonotifi <url>"
+            return usage("/nonotifi <url>")
         site = self._manager.set_notifications(argument, False)
-        return f"🔇 Change alerts disabled for {site.url}."
+        return f"🔇 Change alerts disabled for {escape(site.url)}."
 
     async def _list(self, _chat_id: int, _argument: str) -> str:
         sites = self._manager.sites()
         if not sites:
-            return "‼️ No site is monitored. Add one with /add <url>."
+            return f"‼️ No site is monitored. Add one with {code('/add <url>')}."
         lines = [f"➡️ Monitored sites ({len(sites)}):"]
         lines.extend(self._describe_site(site) for site in sites)
         return "\n".join(lines)
@@ -303,10 +434,12 @@ class BotCommands:
             state = "RUNNING"
         else:
             state = "STOPPED"
-        line = f"• {site.url} [alerts: {notifications}] [{state}]"
+        line = f"• {escape(site.url)} [alerts: {notifications}] [{state}]"
+        if site.unverified_enabled:
+            line += " [unverified]"
         stats = self._manager.stats(site.url)
         if stats is not None and stats.blocked:
-            line += f" ⚠️ BLOCKED? ({stats.block_reason})"
+            line += f" ⚠️ BLOCKED? ({escape(stats.block_reason)})"
         if site.last_change is not None:
             when = datetime.fromtimestamp(site.last_change.at).strftime("%Y-%m-%d %H:%M")
             line += f" last change: {when}"
@@ -315,27 +448,27 @@ class BotCommands:
     @staticmethod
     def _describe_turbo(error: TurboError) -> str:
         if isinstance(error, TurboAlreadyRunning):
-            return f"🚀 Turbo is already running (or scheduled) for {error.url}."
+            return f"🚀 Turbo is already running (or scheduled) for {escape(error.url)}."
         if isinstance(error, TurboLimitReached):
             return (
                 f"❌ Turbo limit reached: at most {error.limit} site(s) at a time. "
-                f"Stop one with /turbo stop <url>."
+                f"Stop one with {code('/turbo stop <url>')}."
             )
         if isinstance(error, TurboNotRunning):
-            return f"❌ No turbo session for {error.url}."
-        return f"❌ {error}"
+            return f"❌ No turbo session for {escape(error.url)}."
+        return f"❌ {escape(error)}"
 
     @staticmethod
     def _describe(error: MonitorError) -> str:
         if isinstance(error, SiteAlreadyTracked):
-            return f"‼️ {error.url} is already monitored."
+            return f"‼️ {escape(error.url)} is already monitored."
         if isinstance(error, SiteNotTracked):
-            return f"❌ {error.url} is not monitored."
+            return f"❌ {escape(error.url)} is not monitored. See {code('/list')}."
         if isinstance(error, SiteAlreadyPaused):
-            return f"⏸️ {error.url} is already paused."
+            return f"⏸️ {escape(error.url)} is already paused."
         if isinstance(error, SiteNotPaused):
-            return f"▶️ {error.url} is not paused."
-        return f"❌ {error}"
+            return f"▶️ {escape(error.url)} is not paused."
+        return f"❌ {escape(error)}"
 
 
 class TelegramListener:

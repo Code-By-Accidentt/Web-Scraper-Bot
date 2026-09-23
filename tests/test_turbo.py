@@ -24,6 +24,7 @@ from tests.conftest import (
     FakeFetcher,
     FakeNotifier,
     FakeProber,
+    FakeTuning,
     FakeValidator,
     StubTurboSession,
 )
@@ -169,10 +170,16 @@ async def test_watch_list_is_capped(tmp_path) -> None:
 
 
 # ── TurboManager ────────────────────────────────────────────────────────────
+def manager_tuning(**overrides) -> FakeTuning:
+    tuning = FakeTuning(turbo_interval=2, turbo_recheck_interval=5)
+    for key, value in overrides.items():
+        setattr(tuning, f"turbo_{key}", value)
+    return tuning
+
+
 def make_manager(*, sleep=asyncio.sleep, **overrides) -> TurboManager:
-    limits = replace(LIMITS, interval=2, **overrides)
     return TurboManager(
-        limits=limits,
+        tuning=manager_tuning(**overrides),
         deriver=SubUrlDeriver(("https://app.{domain}", "https://{domain}/docs")),
         prober=FakeProber({"https://app.example.com": 404}),
         session_factory=StubTurboSession,
@@ -246,9 +253,8 @@ class SlowProber(FakeProber):
 
 
 def make_slow_manager(**overrides) -> TurboManager:
-    limits = replace(LIMITS, interval=2, **overrides)
     return TurboManager(
-        limits=limits,
+        tuning=manager_tuning(**overrides),
         deriver=SubUrlDeriver(("https://app.{domain}",)),
         prober=SlowProber({"https://app.example.com": 404}),
         session_factory=StubTurboSession,
