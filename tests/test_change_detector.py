@@ -1,4 +1,5 @@
 from scraper_bot.change_detector import ChangeDetector
+from scraper_bot.models import ChangeCounts
 from tests.conftest import node
 
 URL = "https://example.com"
@@ -8,7 +9,7 @@ def test_identical_signatures_produce_empty_report() -> None:
     sig = (node("h1", "Title"), node("p", "Body"))
     report = ChangeDetector().compare(sig, sig, URL)
     assert report.is_empty
-    assert report.counts.total == 0
+    assert report.counts == ChangeCounts()
     assert not ChangeDetector.differs(sig, sig)
 
 

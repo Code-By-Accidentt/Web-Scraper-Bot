@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from scraper_bot.address_extractor import AddressExtractor
 from scraper_bot.blocking import BlockDetector
@@ -25,6 +26,8 @@ from scraper_bot.preferences import Tuning
 from scraper_bot.storage import SnapshotStore
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class PageChecker:
@@ -102,8 +105,8 @@ class PageChecker:
                 candidates=candidates,
             )
         more = self._candidates(second)
-        candidates = self._merge_addresses(candidates, more)
-        contracts = self._merge(contracts, await self._confirm(more))
+        candidates = self._unique(candidates, more, key=lambda address: address)
+        contracts = self._unique(contracts, await self._confirm(more), key=lambda c: c.address)
         confirmed = self._normalizer.signature(second.html)
         if self._detector.is_unstable(current, confirmed):
             reason = f"renders differ in size ({len(current)} vs {len(confirmed)} nodes)"
@@ -133,15 +136,9 @@ class PageChecker:
         return tuple(r.contract for r in results if r.contract is not None)
 
     @staticmethod
-    def _merge(
-        first: tuple[ConfirmedContract, ...], second: tuple[ConfirmedContract, ...]
-    ) -> tuple[ConfirmedContract, ...]:
-        seen = {contract.address for contract in first}
-        return first + tuple(c for c in second if c.address not in seen)
-
-    @staticmethod
-    def _merge_addresses(
-        first: tuple[Address, ...], second: tuple[Address, ...]
-    ) -> tuple[Address, ...]:
-        seen = set(first)
-        return first + tuple(a for a in second if a not in seen)
+    def _unique(
+        first: tuple[T, ...], second: tuple[T, ...], *, key: Callable[[T], object]
+    ) -> tuple[T, ...]:
+        """``first`` followed by the items of ``second`` whose key is new."""
+        seen = {key(item) for item in first}
+        return first + tuple(item for item in second if key(item) not in seen)

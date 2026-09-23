@@ -43,9 +43,7 @@ async def total_supply(client: JsonRpcClient, coin_type: str) -> int | None:
         return None
 
 
-async def coin_type_candidates(
-    client: JsonRpcClient, package: str, limit: int = MAX_COIN_CANDIDATES
-) -> list[str]:
+async def coin_type_candidates(client: JsonRpcClient, package: str) -> list[str]:
     """Struct types of ``package`` that could be coins, likeliest first."""
     modules = await client.call("sui_getNormalizedMoveModulesByPackage", [package])
     if not isinstance(modules, dict):
@@ -57,7 +55,7 @@ async def coin_type_candidates(
             pairs.extend((str(module_name), str(struct)) for struct in structs)
     # By convention a coin's witness struct is the module name in upper case.
     pairs.sort(key=lambda pair: pair[1].upper() != pair[0].upper())
-    return [f"{package}::{module}::{struct}" for module, struct in pairs[:limit]]
+    return [f"{package}::{module}::{struct}" for module, struct in pairs[:MAX_COIN_CANDIDATES]]
 
 
 async def find_coin(client: JsonRpcClient, package: str) -> tuple[str, dict[str, Any]] | None:

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from datetime import datetime
 from typing import Protocol
 
 from scraper_bot.markup import escape
+from scraper_bot.models import SiteState
 from scraper_bot.monitor_manager import MonitorManager
 from scraper_bot.storage import AddressCache
-from scraper_bot.timefmt import format_duration
+from scraper_bot.timefmt import format_clock, format_duration
 from scraper_bot.turbo import TurboManager
 
 
@@ -51,7 +51,7 @@ class StatusReporter:
             f"Sites: {len(sites)} total, {running} running, {paused} paused",
         ]
         for site in sites:
-            lines.append(f"• {escape(site.url)}: {self._describe(site.url, site.paused, now)}")
+            lines.append(f"• {escape(site.url)}: {self._describe(site, now)}")
         if self._turbo is not None:
             for session in self._turbo.active():
                 stats = session.stats
@@ -61,9 +61,9 @@ class StatusReporter:
                     f"{stats.unverified} unverified, {format_duration(session.seconds_left)} left"
                 )
             for plan in self._turbo.scheduled():
-                when = datetime.fromtimestamp(plan.start_at).strftime("%H:%M")
                 lines.append(
-                    f"⏰ Turbo {escape(plan.url)}: scheduled at {when} for {plan.minutes:.0f} min"
+                    f"⏰ Turbo {escape(plan.url)}: scheduled at "
+                    f"{format_clock(plan.start_at, date=False)} for {plan.minutes:.0f} min"
                 )
         lines.append(
             f"Address cache: {self._cache.known_count} known contract(s), "
@@ -71,10 +71,10 @@ class StatusReporter:
         )
         return "\n".join(lines)
 
-    def _describe(self, url: str, paused: bool, now: float) -> str:
-        if paused:
+    def _describe(self, site: SiteState, now: float) -> str:
+        if site.paused:
             return "paused"
-        stats = self._manager.stats(url)
+        stats = self._manager.stats(site.url)
         if stats is None or stats.last_round_at is None:
             return "starting"
         text = (
@@ -82,12 +82,10 @@ class StatusReporter:
             f"({stats.last_round_seconds:.1f}s, {stats.last_pages} page(s), "
             f"{stats.rounds} rounds)"
         )
-        site = next((s for s in self._manager.sites() if s.url == url), None)
-        if site is not None and site.last_change is not None:
-            when = datetime.fromtimestamp(site.last_change.at).strftime("%Y-%m-%d %H:%M")
-            text += f"; last change {when}"
+        if site.last_change is not None:
+            text += f"; last change {format_clock(site.last_change.at)}"
         if stats.blocked:
-            since = datetime.fromtimestamp(stats.blocked_since or now).strftime("%H:%M")
+            since = format_clock(stats.blocked_since or now, date=False)
             text += (
                 f"; ⚠️ BLOCKED? {escape(stats.block_reason)} since {since}, "
                 f"interval x{2**stats.block_level}"

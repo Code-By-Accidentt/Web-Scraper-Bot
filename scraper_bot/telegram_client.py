@@ -13,6 +13,7 @@ from scraper_bot.markup import strip_markup
 
 log = logging.getLogger(__name__)
 
+_API_BASE = "https://api.telegram.org"
 _NO_PREVIEW = '{"is_disabled": true}'
 
 
@@ -30,24 +31,22 @@ class TelegramClient:
 
     MAX_MESSAGE_LENGTH = 4096
 
-    def __init__(
-        self, token: str, http: httpx.AsyncClient, *, api_base: str = "https://api.telegram.org"
-    ) -> None:
+    def __init__(self, token: str, http: httpx.AsyncClient) -> None:
         self._token = token
-        self._base = f"{api_base}/bot{token}"
+        self._base = f"{_API_BASE}/bot{token}"
         self._http = http
         self._last_error: str | None = None
 
     # ── outgoing ────────────────────────────────────────────────────────────
-    async def send_message(self, chat_id: int, text: str, *, html: bool = True) -> bool:
+    async def send_message(self, chat_id: int, text: str) -> bool:
         """Send ``text`` (split into API-sized chunks); True when every chunk went out."""
         ok = True
         for chunk in self._chunks(text):
-            ok = await self._send_chunk(chat_id, chunk, html) and ok
+            ok = await self._send_chunk(chat_id, chunk) and ok
         return ok
 
-    async def broadcast(self, chat_ids: Iterable[int], text: str, *, html: bool = True) -> None:
-        await asyncio.gather(*(self.send_message(cid, text, html=html) for cid in chat_ids))
+    async def broadcast(self, chat_ids: Iterable[int], text: str) -> None:
+        await asyncio.gather(*(self.send_message(cid, text) for cid in chat_ids))
 
     async def send_document(
         self, chat_id: int, filename: str, content: bytes, caption: str = ""
@@ -116,17 +115,16 @@ class TelegramClient:
         return list(payload.get("result", []))
 
     # ── internals ───────────────────────────────────────────────────────────
-    async def _send_chunk(self, chat_id: int, chunk: str, html: bool) -> bool:
+    async def _send_chunk(self, chat_id: int, chunk: str) -> bool:
         data: dict[str, Any] = {
             "chat_id": chat_id,
             "text": chunk,
+            "parse_mode": "HTML",
             "link_preview_options": _NO_PREVIEW,
         }
-        if html:
-            data["parse_mode"] = "HTML"
         if await self._post("sendMessage", data=data) is not None:
             return True
-        if html and self._last_error and "parse" in self._last_error.lower():
+        if self._last_error and "parse" in self._last_error.lower():
             log.warning("message for chat %s had invalid HTML; resending as plain text", chat_id)
             data = {
                 "chat_id": chat_id,

@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import logging
 import time
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
 
 import httpx
 
 from scraper_bot.address_extractor import is_sui_coin_type, sui_package
 from scraper_bot.config import EvmNetwork
+from scraper_bot.evm import ERC20_PROBE
 from scraper_bot.models import (
     Address,
     Chain,
@@ -24,17 +22,12 @@ from scraper_bot.models import (
 from scraper_bot.notifier import Notifier
 from scraper_bot.preferences import Tuning
 from scraper_bot.rpc import JsonRpcClient, RpcError
+from scraper_bot.solana import account_data, is_mint
 from scraper_bot.storage import AddressCache
 from scraper_bot.sui import coin_metadata, find_coin, object_kind
 
 log = logging.getLogger(__name__)
 
-# totalSupply(), symbol(), decimals()
-ERC20_SELECTORS: tuple[str, ...] = ("0x18160ddd", "0x95d89b41", "0x313ce567")
-SOLANA_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-SOLANA_TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-_MINT_SIZE = 82
-_TOKEN_ACCOUNT_SIZE = 165
 _EMPTY_CODE = frozenset({"", "0x", "0x0"})
 
 
@@ -57,10 +50,6 @@ class EvmContractValidator:
         self._tuning = tuning
         self._failing: set[str] = set()
 
-    @property
-    def network_names(self) -> list[str]:
-        return [name for name, _ in self._clients]
-
     async def find_network(self, address: str) -> str | None:
         """Name of the first network holding a contract at ``address``.
 
@@ -69,7 +58,7 @@ class EvmContractValidator:
         a rejection based on partial information would be cached for hours.
         """
         results = await asyncio.gather(
-            *(self._check(name, client, address) for name, client in self._clients),
+            *(self._check(client, address) for _, client in self._clients),
             return_exceptions=True,
         )
         failed: list[str] = []
@@ -87,7 +76,7 @@ class EvmContractValidator:
             raise RpcUnavailable(f"no answer from {', '.join(failed)}")
         return None
 
-    async def _check(self, name: str, client: JsonRpcClient, address: str) -> bool:
+    async def _check(self, client: JsonRpcClient, address: str) -> bool:
         code = await client.call("eth_getCode", [address, "latest"])
         if not isinstance(code, str) or code.lower() in _EMPTY_CODE:
             return False
@@ -100,7 +89,7 @@ class EvmContractValidator:
         """True when the contract returns data for at least one standard ERC-20 call."""
         calls = (
             client.call("eth_call", [{"to": address, "data": selector}, "latest"])
-            for selector in ERC20_SELECTORS
+            for selector in ERC20_PROBE
         )
         answers = await asyncio.gather(*calls, return_exceptions=True)
         return any(isinstance(a, str) and a.lower() not in _EMPTY_CODE for a in answers)
@@ -132,28 +121,7 @@ class SolanaContractValidator:
             return False
         if account.get("executable"):
             return True
-        return self._is_mint(account.get("owner"), self._decode_data(account.get("data")))
-
-    @staticmethod
-    def _decode_data(data: Any) -> bytes:
-        if isinstance(data, list) and data and isinstance(data[0], str):
-            try:
-                return base64.b64decode(data[0])
-            except (ValueError, binascii.Error):
-                return b""
-        return b""
-
-    @staticmethod
-    def _is_mint(owner: Any, data: bytes) -> bool:
-        if owner == SOLANA_TOKEN_PROGRAM:
-            return len(data) == _MINT_SIZE
-        if owner == SOLANA_TOKEN_2022_PROGRAM:
-            # A Token-2022 mint is either the bare 82 bytes or 82 bytes + padding + an
-            # account-type byte (1 = Mint) at offset 165, followed by extensions.
-            return len(data) == _MINT_SIZE or (
-                len(data) > _TOKEN_ACCOUNT_SIZE and data[_TOKEN_ACCOUNT_SIZE] == 1
-            )
-        return False
+        return is_mint(account.get("owner"), account_data(result))
 
 
 class SuiCoinValidator:
@@ -192,11 +160,11 @@ class ContractValidator:
         solana: SolanaContractValidator,
         cache: AddressCache,
         *,
+        sui: SuiCoinValidator,
         max_concurrent: int,
         retry_delay: float,
         clock: Callable[[], float] = time.monotonic,
         notifier: Notifier | None = None,
-        sui: SuiCoinValidator | None = None,
     ) -> None:
         self._evm = evm
         self._solana = solana
@@ -283,6 +251,4 @@ class ContractValidator:
             return await self._evm.find_network(address.value)
         if address.chain is Chain.SOLANA:
             return "Solana" if await self._solana.is_program_or_mint(address.value) else None
-        if address.chain is Chain.SUI and self._sui is not None:
-            return "Sui" if await self._sui.is_coin_or_package(address.value) else None
-        return None
+        return "Sui" if await self._sui.is_coin_or_package(address.value) else None

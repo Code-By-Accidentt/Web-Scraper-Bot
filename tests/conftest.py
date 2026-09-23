@@ -242,6 +242,9 @@ class FakeNotifier:
         self.problems.append((key, title, detail, hint))
         return True
 
+    def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
+        self.problems.append((key, title, detail, hint))
+
     async def started(self, version: str, total_sites: int, running: int) -> None:
         self.started_calls.append((version, total_sites, running))
 
@@ -335,8 +338,8 @@ class StubTurboSession:
     def seconds_left(self) -> float:
         return self.duration
 
-    def request_stop(self, reason: str = "stopped manually") -> None:
-        self.stop_reason = reason
+    def request_stop(self) -> None:
+        self.stop_reason = "stopped manually"
         self._stop.set()
 
     async def run(self) -> TurboStats:

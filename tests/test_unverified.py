@@ -50,7 +50,6 @@ async def test_new_addresses_are_announced_once_and_persisted(tmp_path: Path) ->
     assert h.notifier.unverified == [(A, PAGE), (S, PAGE)]
     assert set(h.site.unverified) == {address_key(A), address_key(S)}
     assert h.persist_calls == 1
-    assert h.watcher.watched == 2
 
 
 async def test_known_contracts_and_disabled_mode_are_ignored(tmp_path: Path) -> None:
@@ -95,7 +94,6 @@ async def test_watch_window_expires(tmp_path: Path) -> None:
     h.now += 3601
     await h.watcher.recheck()
     assert h.validator.calls == []
-    assert h.watcher.watched == 0
     assert address_key(A) in h.site.unverified  # still remembered, not announced again
     await h.watcher.observe([A], PAGE)
     assert len(h.notifier.unverified) == 1
@@ -106,7 +104,7 @@ async def test_alert_cap_turns_the_overflow_into_a_digest(tmp_path: Path) -> Non
     await h.watcher.observe([A, B, S], PAGE)
     assert h.notifier.unverified == [(A, PAGE)]
     assert h.notifier.digests == [(ROOT, 2)]
-    assert h.watcher.watched == 3
+    assert len(h.site.unverified) == 3
 
 
 async def test_pending_overflow_is_flushed_by_rechecks_too(tmp_path: Path) -> None:

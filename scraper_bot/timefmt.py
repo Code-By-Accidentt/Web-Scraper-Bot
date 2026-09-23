@@ -1,6 +1,14 @@
-"""Small helpers for showing durations to people."""
+"""Small helpers for showing times and durations to people."""
 
 from __future__ import annotations
+
+from datetime import datetime
+
+
+def format_clock(timestamp: float, *, date: bool = True) -> str:
+    """Local time as ``2026-09-23 15:04`` or, with ``date=False``, ``15:04``."""
+    pattern = "%Y-%m-%d %H:%M" if date else "%H:%M"
+    return datetime.fromtimestamp(timestamp).strftime(pattern)
 
 
 def format_duration(seconds: float) -> str:

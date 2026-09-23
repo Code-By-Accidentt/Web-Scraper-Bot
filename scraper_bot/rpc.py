@@ -21,10 +21,6 @@ class JsonRpcClient:
         self._timeout = timeout
         self._host = urlsplit(url).hostname or url
 
-    @property
-    def url(self) -> str:
-        return self._url
-
     async def call(self, method: str, params: list[Any]) -> Any:
         """Return the ``result`` of ``method`` or raise :class:`RpcError`."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}

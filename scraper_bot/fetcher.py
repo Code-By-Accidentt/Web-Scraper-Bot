@@ -316,18 +316,18 @@ class HttpProber:
     """Cheap existence check for derived sub-URLs before spending a browser tab."""
 
     _RETRY_WITH_GET = frozenset({404, 405, 410, 501})
+    _TIMEOUT = 10.0
 
-    def __init__(self, http: httpx.AsyncClient, timeout: float = 10.0) -> None:
+    def __init__(self, http: httpx.AsyncClient) -> None:
         self._http = http
-        self._timeout = timeout
 
     async def probe(self, url: str) -> ProbeResult:
         try:
-            response = await self._http.head(url, timeout=self._timeout, follow_redirects=True)
+            response = await self._http.head(url, timeout=self._TIMEOUT, follow_redirects=True)
             status = response.status_code
             if status in self._RETRY_WITH_GET:
                 async with self._http.stream(
-                    "GET", url, timeout=self._timeout, follow_redirects=True
+                    "GET", url, timeout=self._TIMEOUT, follow_redirects=True
                 ) as streamed:
                     status = streamed.status_code
             return ProbeResult(url, status)

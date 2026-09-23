@@ -45,10 +45,6 @@ class StateStore:
     def __init__(self, path: Path) -> None:
         self._path = path
 
-    @property
-    def path(self) -> Path:
-        return self._path
-
     def exists(self) -> bool:
         return self._path.is_file()
 
@@ -282,9 +278,9 @@ class AddressCache:
         self._rejected[address] = now
         self._append(self._rejected_path, (address.chain.value, address.value, f"{now:.0f}"))
 
-    def import_known(self, addresses: Iterable[Address], network: str = "legacy") -> int:
+    def import_known(self, addresses: Iterable[Address]) -> int:
         return sum(
-            1 for address in addresses if self.add_known(ConfirmedContract(address, network))
+            1 for address in addresses if self.add_known(ConfirmedContract(address, "legacy"))
         )
 
     # ── internals ───────────────────────────────────────────────────────────

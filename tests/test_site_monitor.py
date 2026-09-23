@@ -6,6 +6,7 @@ from scraper_bot.models import (
     Address,
     BlockSignal,
     Chain,
+    ChangeCounts,
     ChangeReport,
     ConfirmedContract,
     PageCheckOutcome,
@@ -94,7 +95,7 @@ async def test_change_is_reported_only_when_alerts_are_enabled() -> None:
     await h.monitor.run_once()
     assert h.notifier.changes == [report]
     assert h.site.last_change is not None
-    assert h.site.last_change.counts.total == 2
+    assert h.site.last_change.counts == ChangeCounts(removed=1, added=1)
     assert h.persist_calls == 1
 
     h.site.notifications_enabled = False

@@ -10,8 +10,6 @@ import pytest
 
 from scraper_bot.config import EvmNetwork
 from scraper_bot.contract_validators import (
-    SOLANA_TOKEN_2022_PROGRAM,
-    SOLANA_TOKEN_PROGRAM,
     ContractValidator,
     EvmContractValidator,
     RpcUnavailable,
@@ -19,6 +17,7 @@ from scraper_bot.contract_validators import (
     SuiCoinValidator,
 )
 from scraper_bot.models import Address, Chain, ConfirmedContract, ValidationStatus
+from scraper_bot.solana import TOKEN_2022_PROGRAM, TOKEN_PROGRAM
 from scraper_bot.storage import AddressCache
 from tests.conftest import FakeTuning
 
@@ -171,15 +170,15 @@ async def test_failed_endpoint_prevents_a_rejection_but_not_a_confirmation() -> 
     ("responder", "expected"),
     [
         (solana_account(executable=True), True),
-        (solana_account(owner=SOLANA_TOKEN_PROGRAM, data=bytes(82)), True),
-        (solana_account(owner=SOLANA_TOKEN_PROGRAM, data=bytes(165)), False),
-        (solana_account(owner=SOLANA_TOKEN_2022_PROGRAM, data=bytes(82)), True),
+        (solana_account(owner=TOKEN_PROGRAM, data=bytes(82)), True),
+        (solana_account(owner=TOKEN_PROGRAM, data=bytes(165)), False),
+        (solana_account(owner=TOKEN_2022_PROGRAM, data=bytes(82)), True),
         (
-            solana_account(owner=SOLANA_TOKEN_2022_PROGRAM, data=bytes(165) + b"\x01" + bytes(10)),
+            solana_account(owner=TOKEN_2022_PROGRAM, data=bytes(165) + b"\x01" + bytes(10)),
             True,
         ),
         (
-            solana_account(owner=SOLANA_TOKEN_2022_PROGRAM, data=bytes(165) + b"\x02" + bytes(10)),
+            solana_account(owner=TOKEN_2022_PROGRAM, data=bytes(165) + b"\x02" + bytes(10)),
             False,
         ),
         (solana_account(owner="SomeOtherProgram", data=bytes(82)), False),
@@ -214,6 +213,7 @@ def build(
         EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)),
         SolanaContractValidator(http, "https://sol.rpc", timeout=5),
         cache,
+        sui=SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning()),
         max_concurrent=4,
         retry_delay=60,
         clock=clock,
@@ -306,6 +306,7 @@ async def test_rpc_failures_are_reported_through_the_notifier(tmp_path: Path) ->
             EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning()),
             SolanaContractValidator(http, "https://sol.rpc", timeout=5),
             cache,
+            sui=SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning()),
             max_concurrent=4,
             retry_delay=60,
             clock=clock,

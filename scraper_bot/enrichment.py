@@ -7,8 +7,6 @@ source only makes the alert shorter, never later than the budget and never missi
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import hashlib
 import logging
 import math
@@ -22,24 +20,24 @@ import httpx
 
 from scraper_bot.address_extractor import is_sui_coin_type
 from scraper_bot.config import EvmNetwork
+from scraper_bot.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
 from scraper_bot.models import Chain, ConfirmedContract
 from scraper_bot.preferences import Tuning
 from scraper_bot.rpc import JsonRpcClient, RpcError
+from scraper_bot.solana import (
+    METAPLEX_METADATA_PROGRAM,
+    MINT_SIZE,
+    TOKEN_2022_MINT_TYPE,
+    TOKEN_ACCOUNT_SIZE,
+    account_data,
+)
 from scraper_bot.sui import coin_metadata, find_coin, total_supply
 
 log = logging.getLogger(__name__)
 
 DEXSCREENER_API = "https://api.dexscreener.com"
-
-# name(), symbol(), decimals(), totalSupply()
-_NAME, _SYMBOL, _DECIMALS, _TOTAL_SUPPLY = "0x06fdde03", "0x95d89b41", "0x313ce567", "0x18160ddd"
 _MAX_DECIMALS = 36
 _MAX_TEXT = 64
-
-METAPLEX_METADATA_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-_MINT_SIZE = 82
-_TOKEN_ACCOUNT_SIZE = 165
-_TOKEN_2022_MINT_TYPE = 1  # account-type byte that follows the padded mint
 _TOKEN_METADATA_EXTENSION = 19
 
 
@@ -274,7 +272,7 @@ def metadata_address(mint: str) -> str:
 
 def parse_mint(data: bytes) -> tuple[int, int] | None:
     """(supply, decimals) of an SPL / Token-2022 mint account."""
-    if len(data) < _MINT_SIZE:
+    if len(data) < MINT_SIZE:
         return None
     return int.from_bytes(data[36:44], "little"), data[44]
 
@@ -298,9 +296,9 @@ def parse_metaplex_metadata(data: bytes) -> tuple[str | None, str | None]:
 
 def parse_token2022_metadata(data: bytes) -> tuple[str | None, str | None]:
     """(name, symbol) from the TokenMetadata extension embedded in a Token-2022 mint."""
-    if len(data) <= _TOKEN_ACCOUNT_SIZE + 1 or data[_TOKEN_ACCOUNT_SIZE] != _TOKEN_2022_MINT_TYPE:
+    if len(data) <= TOKEN_ACCOUNT_SIZE + 1 or data[TOKEN_ACCOUNT_SIZE] != TOKEN_2022_MINT_TYPE:
         return None, None
-    pos = _TOKEN_ACCOUNT_SIZE + 1
+    pos = TOKEN_ACCOUNT_SIZE + 1
     while pos + 4 <= len(data):
         kind = int.from_bytes(data[pos : pos + 2], "little")
         length = int.from_bytes(data[pos + 2 : pos + 4], "little")
@@ -313,17 +311,6 @@ def parse_token2022_metadata(data: bytes) -> tuple[str | None, str | None]:
             break  # padding
         pos += 4 + length
     return None, None
-
-
-def _account_data(result: Any) -> bytes:
-    value = result.get("value") if isinstance(result, dict) else None
-    data = value.get("data") if isinstance(value, dict) else None
-    if isinstance(data, list) and data and isinstance(data[0], str):
-        try:
-            return base64.b64decode(data[0])
-        except (ValueError, binascii.Error):
-            return b""
-    return b""
 
 
 # ── DexScreener ─────────────────────────────────────────────────────────────
@@ -388,16 +375,14 @@ class TokenEnricher:
         *,
         timeout: float,
         tuning: Tuning,
-        dexscreener_api: str = DEXSCREENER_API,
-        sui_rpc_url: str | None = None,
+        sui_rpc_url: str,
     ) -> None:
         self._http = http
         self._timeout = timeout
         self._tuning = tuning
-        self._api = dexscreener_api.rstrip("/")
         self._evm = {net.name: JsonRpcClient(http, net.rpc_url, timeout) for net in evm_networks}
         self._solana = JsonRpcClient(http, solana_rpc_url, timeout)
-        self._sui = JsonRpcClient(http, sui_rpc_url, timeout) if sui_rpc_url else None
+        self._sui = JsonRpcClient(http, sui_rpc_url, timeout)
 
     async def enrich(self, contract: ConfirmedContract) -> TokenInfo:
         budget = float(self._tuning.enrich_timeout)
@@ -440,16 +425,14 @@ class TokenEnricher:
             return await self._erc20_details(client, contract.address.value) if client else {}
         if contract.address.chain is Chain.SOLANA:
             return await self._solana_details(contract.address.value)
-        if contract.address.chain is Chain.SUI and self._sui is not None:
-            return await self._sui_details(self._sui, contract.address.value)
-        return {}
+        return await self._sui_details(self._sui, contract.address.value)
 
     @staticmethod
     async def _erc20_details(client: JsonRpcClient, address: str) -> dict[str, Any]:
         name, symbol, decimals, supply = await asyncio.gather(
             *(
                 client.call("eth_call", [{"to": address, "data": selector}, "latest"])
-                for selector in (_NAME, _SYMBOL, _DECIMALS, _TOTAL_SUPPLY)
+                for selector in (ERC20_NAME, ERC20_SYMBOL, ERC20_DECIMALS, ERC20_TOTAL_SUPPLY)
             ),
             return_exceptions=True,
         )
@@ -469,11 +452,11 @@ class TokenEnricher:
             return_exceptions=True,
         )
         details: dict[str, Any] = {}
-        mint_data = _account_data(mint_account)
+        mint_data = account_data(mint_account)
         parsed = parse_mint(mint_data)
         if parsed is not None:
             details["total_supply"], details["decimals"] = parsed
-        name, symbol = parse_metaplex_metadata(_account_data(metadata_account))
+        name, symbol = parse_metaplex_metadata(account_data(metadata_account))
         if name is None and symbol is None:
             name, symbol = parse_token2022_metadata(mint_data)
         if name:
@@ -515,7 +498,7 @@ class TokenEnricher:
         if links is None:
             return {}
         address = identifier or contract.address.value
-        url = f"{self._api}/tokens/v1/{links.dex_chain}/{address}"
+        url = f"{DEXSCREENER_API}/tokens/v1/{links.dex_chain}/{address}"
         response = await self._http.get(url, timeout=self._timeout)
         response.raise_for_status()
         pairs = response.json()

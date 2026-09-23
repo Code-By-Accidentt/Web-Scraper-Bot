@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from scraper_bot.config import Settings
+from scraper_bot.config import FALSE_WORDS, TRUE_WORDS, Settings
 from scraper_bot.markup import code, escape
 from scraper_bot.storage import atomic_write_text
 
@@ -423,8 +423,6 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
 
 _BY_KEY: dict[str, PreferenceSpec] = {spec.key: spec for spec in PREFERENCES}
 _BY_ATTR: dict[str, PreferenceSpec] = {spec.attr: spec for spec in PREFERENCES}
-_TRUE = {"1", "true", "yes", "on"}
-_FALSE = {"0", "false", "no", "off"}
 
 
 # Related settings whose order matters: the first must never exceed the second.
@@ -438,16 +436,12 @@ _PARTNER = {a: b for a, b in _ORDERED_PAIRS} | {b: a for a, b in _ORDERED_PAIRS}
 class Preferences:
     """Validated, persisted overrides of :class:`Settings`; readable as a :class:`Tuning`."""
 
-    def __init__(self, settings: Settings, path: Path | None = None) -> None:
+    def __init__(self, settings: Settings, path: Path) -> None:
         self._settings = settings
         self._path = path
         self._overrides: dict[str, Any] = {}
 
     # ── lookup ──────────────────────────────────────────────────────────────
-    @property
-    def specs(self) -> tuple[PreferenceSpec, ...]:
-        return PREFERENCES
-
     def spec(self, key: str) -> PreferenceSpec:
         spec = _BY_KEY.get(key.strip().lower())
         if spec is None:
@@ -526,7 +520,7 @@ class Preferences:
 
     # ── persistence ─────────────────────────────────────────────────────────
     def load(self) -> None:
-        if self._path is None or not self._path.is_file():
+        if not self._path.is_file():
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
@@ -557,8 +551,7 @@ class Preferences:
         log.info("%d preference override(s) loaded", len(self._overrides))
 
     def save(self) -> None:
-        if self._path is not None:
-            atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
+        atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
 
     # ── presentation ────────────────────────────────────────────────────────
     def format_value(self, spec: PreferenceSpec, value: Any) -> str:
@@ -604,9 +597,9 @@ class Preferences:
     def _parse(spec: PreferenceSpec, raw: str) -> Any:
         text = raw.strip().lower()
         if spec.kind == "bool":
-            if text in _TRUE:
+            if text in TRUE_WORDS:
                 return True
-            if text in _FALSE:
+            if text in FALSE_WORDS:
                 return False
             raise PreferenceError(f"{spec.key} takes on or off, got {raw!r}")
         try:

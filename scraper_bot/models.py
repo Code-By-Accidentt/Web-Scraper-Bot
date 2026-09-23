@@ -62,12 +62,12 @@ class Node:
     attrs: tuple[tuple[str, str], ...]
     text: str
 
-    def describe(self, limit: int = 120) -> str:
+    def describe(self) -> str:
         attrs = " ".join(f'{k}="{shorten(v, 40)}"' for k, v in self.attrs)
         head = f"<{self.tag} {attrs}>" if attrs else f"<{self.tag}>"
-        return shorten(f"{head} {self.text}".strip(), limit)
+        return shorten(f"{head} {self.text}".strip(), 120)
 
-    def describe_attr_change(self, other: Node, limit: int = 160) -> str:
+    def describe_attr_change(self, other: Node) -> str:
         before, after = dict(self.attrs), dict(other.attrs)
         parts = []
         for key in sorted(set(before) | set(after)):
@@ -76,7 +76,7 @@ class Node:
                 now = shorten(after.get(key, "(none)"), 40)
                 parts.append(f"{key}: {was} -> {now}")
         text = f" {self.text}" if self.text else ""
-        return shorten(f"<{self.tag}>{text}: " + "; ".join(parts), limit)
+        return shorten(f"<{self.tag}>{text}: " + "; ".join(parts), 160)
 
 
 Signature = tuple[Node, ...]
@@ -106,10 +106,6 @@ class ChangeCounts:
     removed: int = 0
     added: int = 0
     modified: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.removed + self.added + self.modified
 
 
 @dataclass(frozen=True, slots=True)

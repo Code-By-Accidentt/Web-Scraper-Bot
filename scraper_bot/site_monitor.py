@@ -92,10 +92,6 @@ class SiteMonitor:
         self._planned_delay: float | None = None
 
     @property
-    def site(self) -> SiteState:
-        return self._site
-
-    @property
     def stats(self) -> MonitorStats:
         return self._stats
 

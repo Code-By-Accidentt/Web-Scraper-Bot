@@ -23,7 +23,7 @@ from scraper_bot.monitor_manager import (
 )
 from scraper_bot.preferences import ConfirmationRequired, PreferenceError, Preferences
 from scraper_bot.telegram_client import TelegramClient
-from scraper_bot.timefmt import format_duration
+from scraper_bot.timefmt import format_clock, format_duration
 from scraper_bot.turbo import (
     ScheduledTurbo,
     TurboAlreadyRunning,
@@ -257,7 +257,7 @@ class BotCommands:
             return f"❌ {escape(exc)}\n{TURBO_USAGE}"
         started = await self._turbo.start(request.url, request.minutes, request.start_at)
         if isinstance(started, ScheduledTurbo):
-            when = datetime.fromtimestamp(started.start_at).strftime("%Y-%m-%d %H:%M")
+            when = format_clock(started.start_at)
             return (
                 f"⏰ Turbo for {escape(started.url)} scheduled at {when} for "
                 f"{started.minutes:.0f} min. Cancel with {code(f'/turbo stop {started.url}')}"
@@ -372,9 +372,9 @@ class BotCommands:
                 f"stop with {code(f'/turbo stop {session.url}')}"
             )
         for plan in self._turbo.scheduled():
-            when = datetime.fromtimestamp(plan.start_at).strftime("%Y-%m-%d %H:%M")
             lines.append(
-                f"⏰ {escape(plan.url)}: starts at {when} for {plan.minutes:.0f} min; "
+                f"⏰ {escape(plan.url)}: starts at {format_clock(plan.start_at)} for "
+                f"{plan.minutes:.0f} min; "
                 f"cancel with {code(f'/turbo stop {plan.url}')}"
             )
         if not lines:
@@ -441,8 +441,7 @@ class BotCommands:
         if stats is not None and stats.blocked:
             line += f" ⚠️ BLOCKED? ({escape(stats.block_reason)})"
         if site.last_change is not None:
-            when = datetime.fromtimestamp(site.last_change.at).strftime("%Y-%m-%d %H:%M")
-            line += f" last change: {when}"
+            line += f" last change: {format_clock(site.last_change.at)}"
         return line
 
     @staticmethod

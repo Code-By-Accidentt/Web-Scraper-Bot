@@ -10,7 +10,7 @@ from __future__ import annotations
 import html
 import re
 
-_TAG_RE = re.compile(r"</?(?:code|pre|b|i|u)>|<a href=\"[^\"]*\">|</a>")
+_TAG_RE = re.compile(r"</?(?:code|pre)>|<a href=\"[^\"]*\">|</a>")
 
 
 def escape(value: object) -> str:
@@ -25,10 +25,6 @@ def code(value: object) -> str:
 def pre(value: object) -> str:
     """Monospace block for multi-line quotes."""
     return f"<pre>{escape(value)}</pre>"
-
-
-def bold(value: object) -> str:
-    return f"<b>{escape(value)}</b>"
 
 
 def link(text: object, url: str) -> str:

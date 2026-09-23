@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 
 from scraper_bot.models import SiteState
 from scraper_bot.notifier import Notifier
@@ -71,7 +71,6 @@ class MonitorManager:
         self._sites: dict[str, SiteState] = {}
         self._monitors: dict[str, SiteMonitor] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
-        self._background: set[asyncio.Task[object]] = set()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -227,20 +226,12 @@ class MonitorManager:
                 if restarts
                 else "It will not restart on its own; check the log."
             )
-            self._in_background(
-                self._notifier.problem(
-                    f"monitor:{url}",
-                    f"Monitor for {url} crashed",
-                    f"{type(error).__name__}: {error}",
-                    hint=hint,
-                )
+            self._notifier.report_later(
+                f"monitor:{url}",
+                f"Monitor for {url} crashed",
+                f"{type(error).__name__}: {error}",
+                hint=hint,
             )
-
-    def _in_background(self, coroutine: Awaitable[object]) -> None:
-        """Run a notification from a synchronous callback without losing the task."""
-        task = asyncio.ensure_future(coroutine)
-        self._background.add(task)
-        task.add_done_callback(self._background.discard)
 
     def _restart(self, url: str) -> None:
         site = self._sites.get(url)

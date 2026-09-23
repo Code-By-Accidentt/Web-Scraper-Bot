@@ -65,6 +65,10 @@ DEFAULT_BLOCKED_RESOURCE_TYPES: tuple[str, ...] = ("image", "media", "font")
 
 _LIST_SEPARATOR_RE = re.compile(r"[,;\s]+")
 
+# Accepted spellings of booleans in .env and /set
+TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
+FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -235,9 +239,9 @@ class _EnvReader:
         if not raw:
             return default
         lowered = raw.lower()
-        if lowered in {"1", "true", "yes", "on"}:
+        if lowered in TRUE_WORDS:
             return True
-        if lowered in {"0", "false", "no", "off"}:
+        if lowered in FALSE_WORDS:
             return False
         raise ConfigError(f"{key} must be a boolean, got {raw!r}")
 

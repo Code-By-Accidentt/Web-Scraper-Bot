@@ -6,6 +6,9 @@ from difflib import SequenceMatcher
 
 from scraper_bot.models import ChangeReport, Node, Signature
 
+# A render with fewer than this share of the other render's nodes is a truncated load.
+_MIN_SIZE_RATIO = 0.6
+
 
 class ChangeDetector:
     """Ordered diff of node lists with support for excluding volatile nodes.
@@ -14,9 +17,6 @@ class ChangeDetector:
     seconds apart (timers, counters, rotating banners). They are excluded from
     the report, together with their previous values from the stored snapshot.
     """
-
-    def __init__(self, min_size_ratio: float = 0.6) -> None:
-        self._min_size_ratio = min_size_ratio
 
     @staticmethod
     def differs(old: Signature, new: Signature) -> bool:
@@ -31,12 +31,13 @@ class ChangeDetector:
                 volatile.update(second[j1:j2])
         return frozenset(volatile)
 
-    def is_unstable(self, first: Signature, second: Signature) -> bool:
+    @staticmethod
+    def is_unstable(first: Signature, second: Signature) -> bool:
         """True when one render is much smaller than the other (a truncated load)."""
         larger = max(len(first), len(second))
         if larger == 0:
             return False
-        return min(len(first), len(second)) / larger < self._min_size_ratio
+        return min(len(first), len(second)) / larger < _MIN_SIZE_RATIO
 
     def compare(
         self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()

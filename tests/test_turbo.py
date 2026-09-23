@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import scraper_bot.turbo as turbo_module
 from scraper_bot.address_extractor import AddressExtractor
 from scraper_bot.blocking import BlockDetector
 from scraper_bot.fetcher import FetchResult
@@ -162,9 +163,9 @@ async def test_stop_after_zero_keeps_running_after_a_find(tmp_path) -> None:
     assert stats.stop_reason == "time limit reached"
 
 
-async def test_watch_list_is_capped(tmp_path) -> None:
-    limits = replace(LIMITS, max_watch=1)
-    h = Harness(tmp_path, limits=limits, duration=0.05, real_clock=True)
+async def test_watch_list_is_capped(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(turbo_module, "_MAX_WATCH", 1)
+    h = Harness(tmp_path, duration=0.05, real_clock=True)
     h.fetcher.html(ROOT, WITH_TWO)
     await h.session.run()
     assert all(len(batch) == 1 for batch in h.validator.calls)

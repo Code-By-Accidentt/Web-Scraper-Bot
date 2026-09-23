@@ -70,13 +70,6 @@ class UnverifiedWatcher:
     def enabled(self) -> bool:
         return self._site.unverified_enabled
 
-    @property
-    def watched(self) -> int:
-        """Addresses still inside the watch window."""
-        now = self._clock()
-        window = self._tuning.unverified_watch
-        return sum(1 for announced in self._site.unverified.values() if now - announced <= window)
-
     async def observe(self, candidates: Sequence[Address], page_url: str) -> None:
         """Announce addresses never seen on this site before and start watching them."""
         if not self.enabled or not candidates:

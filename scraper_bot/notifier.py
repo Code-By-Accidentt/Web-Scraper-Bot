@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
@@ -36,6 +37,7 @@ class Notifier:
         self._enricher = enricher
         self._clock = clock
         self._problems: dict[str, float] = {}
+        self._background: set[asyncio.Task[bool]] = set()
 
     # ── lifecycle and failures ──────────────────────────────────────────────
     async def started(self, version: str, total_sites: int, running: int) -> None:
@@ -59,6 +61,12 @@ class Notifier:
             text += f"\n{escape(hint)}"
         await self._send(text)
         return True
+
+    def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
+        """Schedule :meth:`problem` from synchronous code, e.g. a task done-callback."""
+        task = asyncio.ensure_future(self.problem(key, title, detail, hint))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     # ── monitoring ──────────────────────────────────────────────────────────
     async def page_discovered(self, page_url: str) -> None:
