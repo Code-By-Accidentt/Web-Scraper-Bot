@@ -15,27 +15,27 @@ from typing import Protocol
 import httpx
 
 from scraper_bot import __version__
-from scraper_bot.address_extractor import AddressExtractor
-from scraper_bot.blocking import BlockDetector
-from scraper_bot.change_detector import ChangeDetector
-from scraper_bot.commands import BotCommands, TelegramListener
-from scraper_bot.config import ConfigError, Settings
-from scraper_bot.contract_validators import (
+from scraper_bot.chains.address_extractor import AddressExtractor
+from scraper_bot.chains.contract_validators import (
     ContractValidator,
     EvmContractValidator,
     SolanaContractValidator,
     SuiCoinValidator,
 )
-from scraper_bot.enrichment import TokenEnricher
-from scraper_bot.fetcher import BrowserUnavailable, HttpProber, PageFetcher, PlaywrightFetcher
-from scraper_bot.html_normalizer import HtmlNormalizer
+from scraper_bot.chains.enrichment import TokenEnricher
+from scraper_bot.config import ConfigError, Settings
 from scraper_bot.models import SiteState
-from scraper_bot.monitor_manager import MonitorManager
-from scraper_bot.notifier import Notifier
-from scraper_bot.page_checker import PageChecker
+from scraper_bot.monitoring.monitor_manager import MonitorManager
+from scraper_bot.monitoring.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
+from scraper_bot.monitoring.turbo import LimitsSource, TurboManager, TurboSession
+from scraper_bot.monitoring.unverified import UnverifiedWatcher
+from scraper_bot.pages.blocking import BlockDetector
+from scraper_bot.pages.change_detector import ChangeDetector
+from scraper_bot.pages.fetcher import BrowserUnavailable, HttpProber, PageFetcher, PlaywrightFetcher
+from scraper_bot.pages.html_normalizer import HtmlNormalizer
+from scraper_bot.pages.page_checker import PageChecker
+from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.preferences import Preferences
-from scraper_bot.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
-from scraper_bot.status import BrowserHealth, StatusReporter
 from scraper_bot.storage import (
     AddressCache,
     LegacyStateImporter,
@@ -43,10 +43,10 @@ from scraper_bot.storage import (
     StateStore,
     atomic_write_text,
 )
-from scraper_bot.telegram_client import TelegramAuthError, TelegramClient
-from scraper_bot.turbo import LimitsSource, TurboManager, TurboSession
-from scraper_bot.unverified import UnverifiedWatcher
-from scraper_bot.urls import SubUrlDeriver
+from scraper_bot.telegram.client import TelegramAuthError, TelegramClient
+from scraper_bot.telegram.commands import BotCommands, TelegramListener
+from scraper_bot.telegram.notifier import Notifier
+from scraper_bot.telegram.status import BrowserHealth, StatusReporter
 
 log = logging.getLogger(__name__)
 

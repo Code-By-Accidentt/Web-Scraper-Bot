@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from scraper_bot.markup import strip_markup
 from scraper_bot.preferences import (
     PREFERENCES,
     SECTIONS,
@@ -11,6 +10,7 @@ from scraper_bot.preferences import (
     PreferenceError,
     Preferences,
 )
+from scraper_bot.telegram.markup import strip_markup
 from tests.conftest import make_settings
 
 

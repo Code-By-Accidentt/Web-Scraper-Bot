@@ -31,14 +31,14 @@ from scraper_bot.app import (
     configure_logging,
     main,
 )
-from scraper_bot.commands import HELP_TEXT, ParsedCommand
 from scraper_bot.config import ConfigError, Settings
-from scraper_bot.fetcher import BrowserUnavailable
-from scraper_bot.markup import strip_markup
-from scraper_bot.notifier import Notifier
+from scraper_bot.pages.fetcher import BrowserUnavailable
 from scraper_bot.preferences import Preferences
 from scraper_bot.storage import LegacyStateImporter
-from scraper_bot.telegram_client import TelegramAuthError
+from scraper_bot.telegram.client import TelegramAuthError
+from scraper_bot.telegram.commands import HELP_TEXT, ParsedCommand
+from scraper_bot.telegram.markup import strip_markup
+from scraper_bot.telegram.notifier import Notifier
 from tests.conftest import FakeFetcher, FakeTelegram, make_settings
 
 SITE = "https://example.com"

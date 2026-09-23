@@ -18,13 +18,13 @@ from typing import Any
 import httpx
 
 from scraper_bot.app import Runtime, build_runtime
-from scraper_bot.commands import parse_command
+from scraper_bot.chains.enrichment import TokenEnricher
+from scraper_bot.chains.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
 from scraper_bot.config import Settings
-from scraper_bot.enrichment import TokenEnricher
-from scraper_bot.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
-from scraper_bot.fetcher import FetchResult
-from scraper_bot.notifier import Notifier
+from scraper_bot.pages.fetcher import FetchResult
 from scraper_bot.preferences import Preferences
+from scraper_bot.telegram.commands import parse_command
+from scraper_bot.telegram.notifier import Notifier
 from tests.conftest import FakeFetcher, FakeTelegram, make_settings
 
 ROOT = "https://example.com"

@@ -158,3 +158,14 @@ def test_paths_and_log_settings(tmp_path) -> None:
     assert make_settings(tmp_path, LOG_FILE="   ").log_file is None
     with pytest.raises(ConfigError, match="HEARTBEAT_INTERVAL must be >= 1"):
         make_settings(tmp_path, HEARTBEAT_INTERVAL="0.5")
+
+
+def test_env_example_values_are_the_code_defaults(tmp_path: Path) -> None:
+    """Every value shown in .env.example must equal the built-in default (documentation drift)."""
+    example_path = Path(__file__).resolve().parents[1] / ".env.example"
+    example = {k: v for k, v in dotenv_values(example_path).items() if v is not None}
+    data_dir = str(tmp_path / "data")
+    from_example = Settings.from_env({**example, "DATA_DIR": data_dir}, dotenv_path=None)
+    identity = {key: example[key] for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_IDS")}
+    defaults = Settings.from_env({**identity, "DATA_DIR": data_dir}, dotenv_path=None)
+    assert from_example == defaults

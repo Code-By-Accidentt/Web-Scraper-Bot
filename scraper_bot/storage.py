@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from scraper_bot.address_extractor import canonical_address, detect_chain
+from scraper_bot.chains.address_extractor import canonical_address, detect_chain
 from scraper_bot.models import (
     Address,
     Chain,
@@ -23,7 +23,7 @@ from scraper_bot.models import (
     SiteState,
     Snapshot,
 )
-from scraper_bot.urls import InvalidUrlError, normalize_url, url_to_filename
+from scraper_bot.pages.urls import InvalidUrlError, normalize_url, url_to_filename
 
 log = logging.getLogger(__name__)
 

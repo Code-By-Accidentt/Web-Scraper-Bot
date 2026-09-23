@@ -15,6 +15,10 @@ dependencies = [
     "psutil>=5.9",
 ]
 
+[project.urls]
+Repository = "https://github.com/code-by-accident/Web-Scraper-Bot"
+Documentation = "https://github.com/code-by-accident/Web-Scraper-Bot/tree/main/docs"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
@@ -30,7 +34,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["scraper_bot"]
+packages = ["scraper_bot", "scraper_bot.chains", "scraper_bot.pages", "scraper_bot.monitoring", "scraper_bot.telegram"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

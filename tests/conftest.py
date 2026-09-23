@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 
 from scraper_bot.config import Settings
-from scraper_bot.fetcher import FetchResult, ProbeResult
 from scraper_bot.models import (
     Address,
     ChangeReport,
@@ -24,8 +23,9 @@ from scraper_bot.models import (
     ValidationResult,
     ValidationStatus,
 )
-from scraper_bot.site_monitor import MonitorStats
-from scraper_bot.turbo import TurboStats
+from scraper_bot.monitoring.site_monitor import MonitorStats
+from scraper_bot.monitoring.turbo import TurboStats
+from scraper_bot.pages.fetcher import FetchResult, ProbeResult
 
 
 @dataclass

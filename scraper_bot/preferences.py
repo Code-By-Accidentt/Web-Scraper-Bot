@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from scraper_bot.config import FALSE_WORDS, TRUE_WORDS, Settings
-from scraper_bot.markup import code, escape
 from scraper_bot.storage import atomic_write_text
+from scraper_bot.telegram.markup import code, escape
 
 log = logging.getLogger(__name__)
 
