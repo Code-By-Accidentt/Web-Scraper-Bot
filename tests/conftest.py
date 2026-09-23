@@ -45,6 +45,7 @@ class FakeTuning:
     unverified_watch: float = 3600.0
     unverified_max_per_hour: int = 10
     max_change_examples: int = 5
+    enrich_timeout: float = 3.0
     flap_window: float = 0.0
     flap_threshold: int = 2
     turbo_interval: float = 0.01

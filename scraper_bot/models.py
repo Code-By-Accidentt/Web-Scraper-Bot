@@ -11,6 +11,7 @@ from typing import Any
 class Chain(StrEnum):
     ETHEREUM = "Ethereum"
     SOLANA = "Solana"
+    SUI = "Sui"
 
 
 @dataclass(frozen=True, slots=True)

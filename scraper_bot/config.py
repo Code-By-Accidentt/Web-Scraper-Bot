@@ -87,6 +87,7 @@ class Settings:
     sub_url_patterns: tuple[str, ...]
     ignored_attributes: tuple[str, ...]
     max_change_examples: int
+    enrich_timeout: float
     flap_window: float
     flap_threshold: int
 
@@ -117,6 +118,7 @@ class Settings:
     # Blockchain
     evm_networks: tuple[EvmNetwork, ...]
     solana_rpc_url: str
+    sui_rpc_url: str
     require_erc20: bool
     rpc_timeout: float
     max_concurrent_rpc: int
@@ -181,6 +183,7 @@ class Settings:
                 for a in reader.text_list("IGNORED_ATTRIBUTES", DEFAULT_IGNORED_ATTRIBUTES)
             ),
             max_change_examples=reader.integer("MAX_CHANGE_EXAMPLES", 5, minimum=0),
+            enrich_timeout=reader.number("ENRICH_TIMEOUT", 3.0, minimum=0.0),
             flap_window=reader.number("FLAP_WINDOW_HOURS", 24.0, minimum=0.0) * 3600.0,
             flap_threshold=reader.integer("FLAP_THRESHOLD", 2, minimum=1),
             deep_scan=reader.flag("DEEP_SCAN", True),
@@ -205,6 +208,7 @@ class Settings:
             ),
             evm_networks=networks,
             solana_rpc_url=reader.text("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
+            sui_rpc_url=reader.text("SUI_RPC_URL", "https://sui-rpc.publicnode.com"),
             require_erc20=reader.flag("REQUIRE_ERC20", True),
             rpc_timeout=reader.number("RPC_TIMEOUT", 8.0, minimum=1.0),
             max_concurrent_rpc=reader.integer("MAX_CONCURRENT_RPC", 8, minimum=1),

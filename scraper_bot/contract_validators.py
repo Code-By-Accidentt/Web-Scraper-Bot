@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from scraper_bot.address_extractor import is_sui_coin_type, sui_package
 from scraper_bot.config import EvmNetwork
 from scraper_bot.models import (
     Address,
@@ -24,6 +25,7 @@ from scraper_bot.notifier import Notifier
 from scraper_bot.preferences import Tuning
 from scraper_bot.rpc import JsonRpcClient, RpcError
 from scraper_bot.storage import AddressCache
+from scraper_bot.sui import coin_metadata, find_coin, object_kind
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +156,33 @@ class SolanaContractValidator:
         return False
 
 
+class SuiCoinValidator:
+    """Accepts coin types that have metadata and packages that define such a coin."""
+
+    def __init__(
+        self, http: httpx.AsyncClient, rpc_url: str, *, timeout: float, tuning: Tuning
+    ) -> None:
+        self._client = JsonRpcClient(http, rpc_url, timeout)
+        self._tuning = tuning
+
+    async def is_coin_or_package(self, value: str) -> bool:
+        try:
+            if is_sui_coin_type(value):
+                if await coin_metadata(self._client, value) is not None:
+                    return True
+                if self._tuning.require_erc20:
+                    return False
+                # Lenient mode counts any type of a real package, like any EVM contract.
+                return await object_kind(self._client, sui_package(value)) == "package"
+            if await object_kind(self._client, value) != "package":
+                return False  # a wallet, an owned object or nothing at all
+            if not self._tuning.require_erc20:
+                return True
+            return await find_coin(self._client, value) is not None
+        except RpcError as exc:
+            raise RpcUnavailable(str(exc)) from exc
+
+
 class ContractValidator:
     """Validates addresses once, remembers verdicts and merges concurrent checks."""
 
@@ -167,9 +196,11 @@ class ContractValidator:
         retry_delay: float,
         clock: Callable[[], float] = time.monotonic,
         notifier: Notifier | None = None,
+        sui: SuiCoinValidator | None = None,
     ) -> None:
         self._evm = evm
         self._solana = solana
+        self._sui = sui
         self._cache = cache
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._retry_delay = retry_delay
@@ -252,4 +283,6 @@ class ContractValidator:
             return await self._evm.find_network(address.value)
         if address.chain is Chain.SOLANA:
             return "Solana" if await self._solana.is_program_or_mint(address.value) else None
+        if address.chain is Chain.SUI and self._sui is not None:
+            return "Sui" if await self._sui.is_coin_or_package(address.value) else None
         return None

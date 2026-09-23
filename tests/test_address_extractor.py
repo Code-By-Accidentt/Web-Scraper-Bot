@@ -2,6 +2,7 @@ import pytest
 
 from scraper_bot.address_extractor import (
     AddressExtractor,
+    detect_chain,
     is_evm_address,
     is_solana_address,
     to_checksum_address,
@@ -84,4 +85,49 @@ def test_extract_many_deduplicates_across_texts() -> None:
     assert AddressExtractor().extract_many(texts) == [
         Address(Chain.ETHEREUM, USDC_ETH),
         Address(Chain.SOLANA, USDC_SOL),
+    ]
+
+
+SUI_PKG = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7"
+SUI_COIN = f"{SUI_PKG}::usdc::USDC"
+
+
+def test_sui_coin_types_are_extracted_and_normalised() -> None:
+    shouting = "0x" + SUI_PKG[2:].upper()
+    text = f"CA: {shouting}::usdc::USDC, native 0x2::sui::SUI, book 0xdee9::clob::Pool"
+    assert AddressExtractor().extract(text) == [Address(Chain.SUI, SUI_COIN)]
+    generic = f"Coin<{SUI_COIN}> in 0x2::coin::Coin"
+    assert AddressExtractor().extract(generic) == [Address(Chain.SUI, SUI_COIN)]
+
+
+def test_bare_sui_ids_need_sui_context_and_yield_to_coin_types() -> None:
+    tx_hash = "0x" + "9f" * 32
+    assert AddressExtractor().extract(f"Tx {tx_hash} confirmed on Etherscan") == []
+    assert AddressExtractor().extract(f"Package {tx_hash} is live on Sui") == [
+        Address(Chain.SUI, tx_hash)
+    ]
+    both = f"{SUI_PKG} publishes {SUI_COIN} (Suiscan)"
+    assert AddressExtractor().extract(both) == [Address(Chain.SUI, SUI_COIN)]
+
+
+def test_hex_runs_inside_sui_ids_are_not_solana_candidates() -> None:
+    sui_id = "0x0" + "a1b2c3d4e5f6a7b8c9d1e2f3a4b5c6d7e8f9a1b2c3d" + "0" + "ffeeddccbbaa9988776"
+    assert len(sui_id) == 66
+    found = AddressExtractor().extract(f"Object {sui_id} on Sui")
+    assert found == [Address(Chain.SUI, sui_id)]
+
+
+def test_detect_chain_for_context_free_addresses() -> None:
+    assert detect_chain(SUI_COIN) is Chain.SUI
+    assert detect_chain(SUI_PKG) is Chain.SUI
+    assert detect_chain(USDC_ETH) is Chain.ETHEREUM
+    assert detect_chain(USDC_SOL) is Chain.SOLANA
+
+
+def test_evm_pattern_stops_before_a_sui_type_separator() -> None:
+    forty = "0x" + "ab" * 20
+    found = AddressExtractor().extract(f"Type {forty}::meme::MEME on Sui")
+    assert found == [Address(Chain.SUI, "0x" + "0" * 24 + "ab" * 20 + "::meme::MEME")]
+    assert AddressExtractor().extract(f"Wallet {forty} here") == [
+        Address(Chain.ETHEREUM, to_checksum_address(forty))
     ]

@@ -21,7 +21,9 @@ from scraper_bot.contract_validators import (
     ContractValidator,
     EvmContractValidator,
     SolanaContractValidator,
+    SuiCoinValidator,
 )
+from scraper_bot.enrichment import TokenEnricher
 from scraper_bot.fetcher import BrowserUnavailable, HttpProber, PlaywrightFetcher
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import SiteState
@@ -85,8 +87,19 @@ class Application:
         ) as http:
             telegram = TelegramClient(cfg.telegram_bot_token, http)
             await self._check_token(telegram)
+            enricher = TokenEnricher(
+                http,
+                cfg.evm_networks,
+                cfg.solana_rpc_url,
+                timeout=cfg.rpc_timeout,
+                tuning=self._prefs,
+                sui_rpc_url=cfg.sui_rpc_url,
+            )
             notifier = Notifier(
-                telegram, cfg.chat_ids, max_examples=lambda: self._prefs.max_change_examples
+                telegram,
+                cfg.chat_ids,
+                max_examples=lambda: self._prefs.max_change_examples,
+                enricher=enricher,
             )
             fetcher = PlaywrightFetcher(cfg, tuning=self._prefs)
             try:
@@ -119,6 +132,7 @@ class Application:
             SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout),
             cache,
             max_concurrent=cfg.max_concurrent_rpc,
+            sui=SuiCoinValidator(http, cfg.sui_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
             retry_delay=cfg.rpc_retry_delay,
             notifier=notifier,
         )
