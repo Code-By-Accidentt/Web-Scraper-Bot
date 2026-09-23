@@ -36,7 +36,6 @@ class Harness:
         self.persist_calls = 0
         self.auto_pauses: list[tuple[str, str]] = []
         self.tuning = FakeTuning(contract_pause_threshold=threshold)
-        self.tuning = FakeTuning(contract_pause_threshold=threshold)
 
         def persist() -> None:
             self.persist_calls += 1

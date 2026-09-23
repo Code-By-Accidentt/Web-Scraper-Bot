@@ -107,3 +107,14 @@ async def test_alert_cap_turns_the_overflow_into_a_digest(tmp_path: Path) -> Non
     assert h.notifier.unverified == [(A, PAGE)]
     assert h.notifier.digests == [(ROOT, 2)]
     assert h.watcher.watched == 3
+
+
+async def test_pending_overflow_is_flushed_by_rechecks_too(tmp_path: Path) -> None:
+    h = Harness(tmp_path, unverified_max_per_hour=1)
+    await h.watcher.observe([A, B], PAGE)  # A is alerted, B goes into the first digest
+    assert h.notifier.digests == [(ROOT, 1)]
+    await h.watcher.observe([S], PAGE)  # within the hour: counted, not sent yet
+    assert h.notifier.digests == [(ROOT, 1)]
+    h.now += 3601
+    await h.watcher.recheck()  # the site stayed quiet: the round itself delivers it
+    assert h.notifier.digests == [(ROOT, 1), (ROOT, 1)]

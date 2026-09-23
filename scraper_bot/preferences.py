@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -412,6 +413,14 @@ _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
 
 
+# Related settings whose order matters: the first must never exceed the second.
+_ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
+    ("poll_interval_min", "poll_interval_max"),
+    ("turbo_default_minutes", "turbo_max_minutes"),
+)
+_PARTNER = {a: b for a, b in _ORDERED_PAIRS} | {b: a for a, b in _ORDERED_PAIRS}
+
+
 class Preferences:
     """Validated, persisted overrides of :class:`Settings`; readable as a :class:`Tuning`."""
 
@@ -472,15 +481,34 @@ class Preferences:
         return PreferenceChange(spec, old, value)
 
     def reset(self, key: str | None = None) -> list[PreferenceChange]:
-        specs = [self.spec(key)] if key else [s for s in PREFERENCES if s.key in self._overrides]
+        if key is None:
+            keys = [s.key for s in PREFERENCES if s.key in self._overrides]
+        else:
+            keys = [self.spec(key).key]
         changes = []
-        for spec in specs:
-            if spec.key in self._overrides:
-                old = self._overrides.pop(spec.key)
-                changes.append(PreferenceChange(spec, old, self.default(spec)))
+        for name in keys:
+            if name not in self._overrides:
+                continue
+            changes.append(self._drop_override(name))
+            # Resetting one side of a related pair must not leave e.g. min > max behind.
+            partner = _PARTNER.get(name)
+            if partner in self._overrides and not self._consistent(name):
+                changes.append(self._drop_override(partner))
         if changes:
             self.save()
         return changes
+
+    def _drop_override(self, key: str) -> PreferenceChange:
+        spec = self.spec(key)
+        return PreferenceChange(spec, self._overrides.pop(key), self.default(spec))
+
+    def _consistent(self, key: str) -> bool:
+        spec = self.spec(key)
+        try:
+            self._check_relations(spec, self.current(spec))
+        except PreferenceError:
+            return False
+        return True
 
     # ── persistence ─────────────────────────────────────────────────────────
     def load(self) -> None:
@@ -503,6 +531,15 @@ class Preferences:
                 continue
             if value != self.default(spec):
                 self._overrides[spec.key] = value
+        # Every value is range-checked above, but a hand-edited file can still hold
+        # a pair that contradicts itself (min > max); such a pair is not trusted.
+        for lower, upper in _ORDERED_PAIRS:
+            if self.current(self.spec(lower)) > self.current(self.spec(upper)):
+                log.warning(
+                    "preferences %s and %s contradict each other; both dropped", lower, upper
+                )
+                self._overrides.pop(lower, None)
+                self._overrides.pop(upper, None)
         log.info("%d preference override(s) loaded", len(self._overrides))
 
     def save(self) -> None:
@@ -563,6 +600,9 @@ class Preferences:
         except ValueError as exc:
             kind = "an integer" if spec.kind == "int" else "a number"
             raise PreferenceError(f"{spec.key} takes {kind}, got {raw!r}") from exc
+        if spec.kind == "float" and not math.isfinite(value):
+            # nan compares false against every bound and would poison the delays.
+            raise PreferenceError(f"{spec.key} takes a finite number, got {raw!r}")
         if spec.minimum is not None and value < spec.minimum:
             raise PreferenceError(
                 f"{spec.key} must be at least {spec.minimum:g} {spec.unit}".strip()
@@ -574,17 +614,12 @@ class Preferences:
         return value
 
     def _check_relations(self, spec: PreferenceSpec, value: Any) -> None:
-        pairs = {
-            "poll_interval_min": ("poll_interval_max", True),
-            "poll_interval_max": ("poll_interval_min", False),
-            "turbo_default_minutes": ("turbo_max_minutes", True),
-            "turbo_max_minutes": ("turbo_default_minutes", False),
-        }
-        if spec.key not in pairs:
-            return
-        other_key, must_be_lower = pairs[spec.key]
-        other = self.current(self.spec(other_key))
-        if must_be_lower and value > other:
-            raise PreferenceError(f"{spec.key} must not exceed {other_key} ({other:g})")
-        if not must_be_lower and value < other:
-            raise PreferenceError(f"{spec.key} must not be below {other_key} ({other:g})")
+        for lower, upper in _ORDERED_PAIRS:
+            if spec.key == lower:
+                limit = self.current(self.spec(upper))
+                if value > limit:
+                    raise PreferenceError(f"{lower} must not exceed {upper} ({limit:g})")
+            elif spec.key == upper:
+                limit = self.current(self.spec(lower))
+                if value < limit:
+                    raise PreferenceError(f"{upper} must not be below {lower} ({limit:g})")

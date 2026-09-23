@@ -112,6 +112,7 @@ class UnverifiedWatcher:
         if not self.enabled:
             return
         now = self._clock()
+        await self._flush_digest(now)  # a quiet site must still get its overflow digest
         due: list[Address] = []
         for key, announced_at in self._site.unverified.items():
             if now - announced_at > self._tuning.unverified_watch:

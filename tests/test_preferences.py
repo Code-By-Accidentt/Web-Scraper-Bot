@@ -120,3 +120,41 @@ def test_overview_and_describe_are_human_readable(tmp_path: Path) -> None:
     assert "• require_erc20 = on" in overview
     text = strip_markup(prefs.describe("turbo_max_pages"))
     assert "root included" in text and "Range: 1 to 10" in text and "/set turbo_max_pages" in text
+
+
+def test_non_finite_numbers_are_rejected(tmp_path: Path) -> None:
+    prefs = make_prefs(tmp_path)
+    for raw in ("nan", "inf", "-inf", "1e999"):
+        with pytest.raises(PreferenceError, match="finite number"):
+            prefs.set("settle_delay", raw)
+    assert not prefs.is_overridden(prefs.spec("settle_delay"))
+
+
+def test_resetting_one_side_of_a_pair_keeps_the_pair_consistent(tmp_path: Path) -> None:
+    prefs = make_prefs(tmp_path)
+    prefs.set("poll_interval_max", "20")
+    prefs.set("poll_interval_min", "18")
+    changes = prefs.reset("poll_interval_max")  # alone it would leave min 18 > max 15
+    assert [(c.spec.key, c.new) for c in changes] == [
+        ("poll_interval_max", 15.0),
+        ("poll_interval_min", 5.0),
+    ]
+    assert prefs.poll_interval_min <= prefs.poll_interval_max
+    prefs.set("poll_interval_max", "30")
+    prefs.set("poll_interval_min", "10")
+    assert [c.spec.key for c in prefs.reset("poll_interval_min")] == ["poll_interval_min"]
+    assert prefs.poll_interval_max == 30.0  # still consistent, so left alone
+
+
+def test_inconsistent_pairs_in_the_file_are_dropped(tmp_path: Path) -> None:
+    (tmp_path / "prefs.json").write_text(
+        '{"poll_interval_min": 18, "turbo_default_minutes": 60, "turbo_max_minutes": 40,'
+        ' "flap_threshold": 3}',
+        encoding="utf-8",
+    )
+    prefs = make_prefs(tmp_path)
+    assert prefs.poll_interval_min == 5.0  # 18 would exceed the .env maximum of 15
+    assert not prefs.is_overridden(prefs.spec("turbo_default_minutes"))
+    assert not prefs.is_overridden(prefs.spec("turbo_max_minutes"))
+    assert prefs.turbo_default_minutes <= prefs.turbo_max_minutes
+    assert prefs.flap_threshold == 3  # unrelated overrides survive

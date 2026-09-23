@@ -179,8 +179,6 @@ class FakeNotifier:
         self.digests: list[tuple[str, int]] = []
         self.problems: list[tuple[str, str, str, str | None]] = []
         self.started_calls: list[tuple[str, int, int]] = []
-        self.problems: list[tuple[str, str, str, str | None]] = []
-        self.started_calls: list[tuple[str, int, int]] = []
 
     async def page_discovered(self, page_url: str) -> None:
         self.discovered.append(page_url)

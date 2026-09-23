@@ -62,6 +62,11 @@ class TurboLimits:
     max_watch: int = 50  # unverified addresses tracked per session
 
 
+# A session takes either fixed limits or a callable returning the current ones, so that
+# /set changes reach sessions that are already running.
+LimitsSource = TurboLimits | Callable[[], TurboLimits]
+
+
 @dataclass(slots=True)
 class TurboStats:
     started_at: float | None = None
@@ -94,7 +99,7 @@ class TurboSession:
         cache: AddressCache,
         notifier: Notifier,
         block_detector: BlockDetector,
-        limits: TurboLimits,
+        limits: LimitsSource,
         duration: float,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -106,7 +111,7 @@ class TurboSession:
         self._cache = cache
         self._notifier = notifier
         self._blocks = block_detector
-        self._limits = limits
+        self._limits_source = limits
         self._duration = duration
         self._clock = clock
         self._stats = TurboStats()
@@ -125,6 +130,12 @@ class TurboSession:
         return list(self._pages)
 
     @property
+    def limits(self) -> TurboLimits:
+        """Current limits, read live when a callable was given."""
+        source = self._limits_source
+        return source() if callable(source) else source
+
+    @property
     def stats(self) -> TurboStats:
         return self._stats
 
@@ -139,7 +150,7 @@ class TurboSession:
         self._stop.set()
 
     async def run(self) -> TurboStats:
-        stats, limits = self._stats, self._limits
+        stats, limits = self._stats, self.limits
         stats.started_at = self._clock()
         stats.deadline = stats.started_at + self._duration
         log.info("turbo started for %s (%d pages)", self._url, len(self._pages))
@@ -160,6 +171,7 @@ class TurboSession:
                 if signal is not None:
                     reason = f"possible IP block ({signal.reason})"
                     break
+                limits = self.limits  # /set may have changed the pace or the stop rule
                 if limits.stop_after and len(stats.found) >= limits.stop_after:
                     reason = f"found {len(stats.found)} confirmed contract(s)"
                     break
@@ -203,23 +215,21 @@ class TurboSession:
         if address in self._seen or self._cache.is_known(address):
             return
         self._seen.add(address)
-        if len(self._watch) >= self._limits.max_watch:
+        if len(self._watch) >= self.limits.max_watch:
             log.warning("turbo %s: watch list is full, ignoring %s", self._url, address)
             return
         self._watch[address] = 0.0
         self._page_of[address] = page_url
         if not baseline:
             self._stats.unverified += 1
-            await self._notifier.unverified_address(
-                address, page_url, self._limits.recheck_interval
-            )
+            await self._notifier.unverified_address(address, page_url, self.limits.recheck_interval)
 
     async def _recheck(self) -> None:
         now = self._clock()
         due = [
             address
             for address, last in self._watch.items()
-            if last == 0.0 or now - last >= self._limits.recheck_interval
+            if last == 0.0 or now - last >= self.limits.recheck_interval
         ]
         if not due:
             return
@@ -247,7 +257,7 @@ class TurboSession:
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
 
-SessionFactory = Callable[[str, list[str], float, TurboLimits], TurboSession]
+SessionFactory = Callable[[str, list[str], float, LimitsSource], TurboSession]
 
 
 class TurboManager:
@@ -372,7 +382,7 @@ class TurboManager:
         try:
             limits = self.limits
             pages = await self._pick_pages(url, limits.max_pages)
-            session = self._factory(url, pages, duration, limits)
+            session = self._factory(url, pages, duration, lambda: self.limits)
             task = asyncio.create_task(session.run(), name=f"turbo:{url}")
             task.add_done_callback(lambda done, u=url: self._on_done(u, done))
             self._sessions[url] = session

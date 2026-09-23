@@ -105,7 +105,6 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot |
 | `UNVERIFIED_RECHECK_MINUTES` / `UNVERIFIED_WATCH_HOURS` / `UNVERIFIED_MAX_PER_HOUR` | 5 / 24 / 10 | Unverified mode: on-chain re-check interval, watch window, alerts per hour per site |
 
-Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
 | `CONTRACT_PAUSE_THRESHOLD` | 5 | New contracts on one page that trigger the auto-pause |
 | `SUB_URL_PATTERNS` | see `.env.example` | Sub-pages derived from every root URL (`{domain}` = host without `www.`) |
 | `IGNORED_ATTRIBUTES` | nonce, csrf-token, … | HTML attributes that are never compared |
@@ -119,6 +118,8 @@ Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQU
 | `RPC_RETRY_DELAY` | 600 | Seconds before an address whose RPC check failed is retried |
 | `DATA_DIR` / `LOG_LEVEL` / `LOG_FILE` | data / INFO / – | Storage directory, verbosity, optional rotating log file |
 | `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes (used by `rebooter.py`) |
+
+Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
 
 ---
 

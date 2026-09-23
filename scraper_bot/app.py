@@ -39,7 +39,7 @@ from scraper_bot.storage import (
     atomic_write_text,
 )
 from scraper_bot.telegram_client import TelegramAuthError, TelegramClient
-from scraper_bot.turbo import TurboLimits, TurboManager, TurboSession
+from scraper_bot.turbo import LimitsSource, TurboManager, TurboSession
 from scraper_bot.unverified import UnverifiedWatcher
 from scraper_bot.urls import SubUrlDeriver
 
@@ -162,7 +162,7 @@ class Application:
             )
 
         def build_turbo(
-            url: str, pages: list[str], duration: float, limits: TurboLimits
+            url: str, pages: list[str], duration: float, limits: LimitsSource
         ) -> TurboSession:
             return TurboSession(
                 url,
