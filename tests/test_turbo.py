@@ -11,6 +11,7 @@ from scraper_bot.fetcher import FetchResult
 from scraper_bot.models import Address, Chain, ConfirmedContract
 from scraper_bot.storage import AddressCache
 from scraper_bot.turbo import (
+    LimitsSource,
     ScheduledTurbo,
     TurboAlreadyRunning,
     TurboLimitReached,
@@ -24,6 +25,7 @@ from tests.conftest import (
     FakeFetcher,
     FakeNotifier,
     FakeProber,
+    FakeTuning,
     FakeValidator,
     StubTurboSession,
 )
@@ -52,7 +54,7 @@ class Harness:
         self,
         tmp_path: Path,
         *,
-        limits: TurboLimits = LIMITS,
+        limits: LimitsSource = LIMITS,
         duration: float = 60.0,
         real_clock: bool = False,
     ) -> None:
@@ -168,11 +170,33 @@ async def test_watch_list_is_capped(tmp_path) -> None:
     assert all(len(batch) == 1 for batch in h.validator.calls)
 
 
+async def test_running_session_follows_live_limit_changes(tmp_path) -> None:
+    live = replace(LIMITS, stop_after=0)
+    h = Harness(tmp_path, limits=lambda: live, duration=5.0, real_clock=True)
+    h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
+    h.validator.confirm(ADDRESS, "Base")
+    task = asyncio.create_task(h.session.run())
+    for _ in range(400):
+        if h.session.stats.found:
+            break
+        await asyncio.sleep(0.005)
+    assert h.session.stats.found and not task.done()  # stop_after=0: keeps going
+    live = replace(live, stop_after=1)  # what /set turbo_stop_after 1 does meanwhile
+    stats = await asyncio.wait_for(task, timeout=2)
+    assert stats.stop_reason == "found 1 confirmed contract(s)"
+
+
 # ── TurboManager ────────────────────────────────────────────────────────────
-def make_manager(*, sleep=asyncio.sleep, **overrides) -> TurboManager:
-    limits = replace(LIMITS, interval=2, **overrides)
+def manager_tuning(**overrides) -> FakeTuning:
+    tuning = FakeTuning(turbo_interval=2, turbo_recheck_interval=5)
+    for key, value in overrides.items():
+        setattr(tuning, f"turbo_{key}", value)
+    return tuning
+
+
+def make_manager(*, sleep=asyncio.sleep, tuning: FakeTuning | None = None, **overrides):
     return TurboManager(
-        limits=limits,
+        tuning=tuning or manager_tuning(**overrides),
         deriver=SubUrlDeriver(("https://app.{domain}", "https://{domain}/docs")),
         prober=FakeProber({"https://app.example.com": 404}),
         session_factory=StubTurboSession,
@@ -197,6 +221,18 @@ async def test_manager_starts_limits_and_stops_sessions() -> None:
         assert manager.active() == []
         with pytest.raises(TurboNotRunning):
             await manager.stop(ROOT)
+    finally:
+        await manager.shutdown()
+
+
+async def test_manager_hands_sessions_live_limits() -> None:
+    tuning = manager_tuning()
+    manager = make_manager(tuning=tuning)
+    try:
+        session = await manager.start(ROOT)
+        assert session.limits().interval == 2
+        tuning.turbo_interval = 7  # what /set turbo_interval 7 does
+        assert session.limits().interval == 7
     finally:
         await manager.shutdown()
 
@@ -246,9 +282,8 @@ class SlowProber(FakeProber):
 
 
 def make_slow_manager(**overrides) -> TurboManager:
-    limits = replace(LIMITS, interval=2, **overrides)
     return TurboManager(
-        limits=limits,
+        tuning=manager_tuning(**overrides),
         deriver=SubUrlDeriver(("https://app.{domain}",)),
         prober=SlowProber({"https://app.example.com": 404}),
         session_factory=StubTurboSession,

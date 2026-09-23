@@ -20,6 +20,8 @@ from scraper_bot.models import (
     ValidationResult,
     ValidationStatus,
 )
+from scraper_bot.notifier import Notifier
+from scraper_bot.preferences import Tuning
 from scraper_bot.rpc import JsonRpcClient, RpcError
 from scraper_bot.storage import AddressCache
 
@@ -47,10 +49,10 @@ class EvmContractValidator:
         networks: Sequence[EvmNetwork],
         *,
         timeout: float,
-        require_erc20: bool,
+        tuning: Tuning,
     ) -> None:
         self._clients = [(net.name, JsonRpcClient(http, net.rpc_url, timeout)) for net in networks]
-        self._require_erc20 = require_erc20
+        self._tuning = tuning
         self._failing: set[str] = set()
 
     @property
@@ -87,7 +89,7 @@ class EvmContractValidator:
         code = await client.call("eth_getCode", [address, "latest"])
         if not isinstance(code, str) or code.lower() in _EMPTY_CODE:
             return False
-        if not self._require_erc20:
+        if not self._tuning.require_erc20:
             return True
         return await self._answers_erc20(client, address)
 
@@ -164,6 +166,7 @@ class ContractValidator:
         max_concurrent: int,
         retry_delay: float,
         clock: Callable[[], float] = time.monotonic,
+        notifier: Notifier | None = None,
     ) -> None:
         self._evm = evm
         self._solana = solana
@@ -171,6 +174,7 @@ class ContractValidator:
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._retry_delay = retry_delay
         self._clock = clock
+        self._notifier = notifier
         self._retry_after: dict[Address, float] = {}
         self._inflight: dict[Address, asyncio.Task[ValidationResult]] = {}
 
@@ -225,6 +229,14 @@ class ContractValidator:
                 )
                 if negative_cache:
                     self._retry_after[address] = self._clock() + self._retry_delay
+                if self._notifier is not None:
+                    await self._notifier.problem(
+                        "rpc",
+                        "On-chain address checks are failing",
+                        f"{address.chain.value} {address}: {exc}",
+                        hint="Check the RPC endpoints in .env. Affected addresses are re-checked "
+                        f"automatically after {self._retry_delay:.0f} s.",
+                    )
                 return ValidationResult(address, ValidationStatus.UNAVAILABLE)
         if network is None:
             if negative_cache:

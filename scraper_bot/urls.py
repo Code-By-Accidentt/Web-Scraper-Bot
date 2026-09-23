@@ -24,22 +24,22 @@ def normalize_url(raw: str) -> str:
     """
     text = raw.strip()
     if not text or any(ch.isspace() for ch in text):
-        raise InvalidUrlError(f"not a URL: {raw!r}")
+        raise InvalidUrlError(f"{raw!r} is not a URL (expected e.g. https://example.com)")
     if "://" not in text:
         text = "https://" + text
     try:
         parts = urlsplit(text)
         port = parts.port
     except ValueError as exc:
-        raise InvalidUrlError(f"not a URL: {raw!r}") from exc
+        raise InvalidUrlError(f"{raw!r} is not a URL (expected e.g. https://example.com)") from exc
     if parts.scheme not in {"http", "https"}:
-        raise InvalidUrlError(f"unsupported scheme in {raw!r}")
+        raise InvalidUrlError(f"{raw!r}: only http and https URLs can be monitored")
     host = (parts.hostname or "").lower()
     labels = host.split(".")
     if not host or not all(_HOST_LABEL_RE.match(label) for label in labels):
-        raise InvalidUrlError(f"invalid host in {raw!r}")
+        raise InvalidUrlError(f"{raw!r} has an invalid host name")
     if len(labels) < 2 and host != "localhost":
-        raise InvalidUrlError(f"invalid host in {raw!r}")
+        raise InvalidUrlError(f"{raw!r} has an invalid host name")
     netloc = f"{host}:{port}" if port else host
     path = parts.path if parts.path not in {"", "/"} else ""
     return urlunsplit((parts.scheme, netloc, path, parts.query, ""))

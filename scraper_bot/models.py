@@ -163,6 +163,9 @@ class SiteState:
     announced_pages: set[str] = field(default_factory=set)
     last_change: LastChange | None = None
     added_at: float = field(default_factory=time.time)
+    unverified_enabled: bool = False
+    # "Chain:address" -> when it was announced as unverified (watched until confirmed)
+    unverified: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -171,11 +174,19 @@ class SiteState:
             "announced_pages": sorted(self.announced_pages),
             "last_change": self.last_change.to_dict() if self.last_change else None,
             "added_at": self.added_at,
+            "unverified_enabled": self.unverified_enabled,
+            "unverified": dict(self.unverified),
         }
 
     @classmethod
     def from_dict(cls, url: str, data: dict[str, Any]) -> SiteState:
         last = data.get("last_change")
+        raw_unverified = data.get("unverified")
+        unverified = (
+            {str(key): float(value) for key, value in raw_unverified.items()}
+            if isinstance(raw_unverified, dict)
+            else {}
+        )
         return cls(
             url=url,
             notifications_enabled=bool(data.get("notifications_enabled", True)),
@@ -183,6 +194,8 @@ class SiteState:
             announced_pages=set(data.get("announced_pages", ())),
             last_change=LastChange.from_dict(last) if isinstance(last, dict) else None,
             added_at=float(data.get("added_at", 0.0)) or time.time(),
+            unverified_enabled=bool(data.get("unverified_enabled", False)),
+            unverified=unverified,
         )
 
 
@@ -210,6 +223,7 @@ class PageCheckOutcome:
     report: ChangeReport | None = None
     error: str | None = None
     block: BlockSignal | None = None
+    candidates: tuple[Address, ...] = ()  # every syntactically valid address seen on the page
 
 
 def shorten(text: str, limit: int) -> str:

@@ -9,7 +9,11 @@ from typing import Any
 
 import httpx
 
+from scraper_bot.markup import strip_markup
+
 log = logging.getLogger(__name__)
+
+_NO_PREVIEW = '{"is_disabled": true}'
 
 
 class TelegramAuthError(Exception):
@@ -17,7 +21,12 @@ class TelegramAuthError(Exception):
 
 
 class TelegramClient:
-    """Thin wrapper over the Bot API that never raises on delivery problems."""
+    """Thin wrapper over the Bot API that never raises on delivery problems.
+
+    Messages are sent with HTML formatting (see :mod:`scraper_bot.markup`). If
+    Telegram rejects the markup of a message, the same text is re-sent as plain
+    text, so a formatting slip never swallows an alert.
+    """
 
     MAX_MESSAGE_LENGTH = 4096
 
@@ -27,18 +36,18 @@ class TelegramClient:
         self._token = token
         self._base = f"{api_base}/bot{token}"
         self._http = http
+        self._last_error: str | None = None
 
     # ── outgoing ────────────────────────────────────────────────────────────
-    async def send_message(self, chat_id: int, text: str) -> bool:
+    async def send_message(self, chat_id: int, text: str, *, html: bool = True) -> bool:
         """Send ``text`` (split into API-sized chunks); True when every chunk went out."""
         ok = True
         for chunk in self._chunks(text):
-            result = await self._post("sendMessage", data={"chat_id": chat_id, "text": chunk})
-            ok = ok and result is not None
+            ok = await self._send_chunk(chat_id, chunk, html) and ok
         return ok
 
-    async def broadcast(self, chat_ids: Iterable[int], text: str) -> None:
-        await asyncio.gather(*(self.send_message(cid, text) for cid in chat_ids))
+    async def broadcast(self, chat_ids: Iterable[int], text: str, *, html: bool = True) -> None:
+        await asyncio.gather(*(self.send_message(cid, text, html=html) for cid in chat_ids))
 
     async def send_document(
         self, chat_id: int, filename: str, content: bytes, caption: str = ""
@@ -107,6 +116,26 @@ class TelegramClient:
         return list(payload.get("result", []))
 
     # ── internals ───────────────────────────────────────────────────────────
+    async def _send_chunk(self, chat_id: int, chunk: str, html: bool) -> bool:
+        data: dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "link_preview_options": _NO_PREVIEW,
+        }
+        if html:
+            data["parse_mode"] = "HTML"
+        if await self._post("sendMessage", data=data) is not None:
+            return True
+        if html and self._last_error and "parse" in self._last_error.lower():
+            log.warning("message for chat %s had invalid HTML; resending as plain text", chat_id)
+            data = {
+                "chat_id": chat_id,
+                "text": strip_markup(chunk),
+                "link_preview_options": _NO_PREVIEW,
+            }
+            return await self._post("sendMessage", data=data) is not None
+        return False
+
     async def _post(
         self,
         method: str,
@@ -115,12 +144,14 @@ class TelegramClient:
         files: dict[str, Any] | None = None,
         retry: bool = True,
     ) -> dict[str, Any] | None:
+        self._last_error = None
         try:
             response = await self._http.post(
                 f"{self._base}/{method}", data=data, files=files, timeout=30
             )
         except httpx.HTTPError as exc:
-            log.error("%s failed: %s", method, self._redact(exc))
+            self._last_error = f"{type(exc).__name__}: {self._redact(exc)}"
+            log.error("%s failed: %s", method, self._last_error)
             return None
         try:
             payload = response.json()
@@ -132,12 +163,15 @@ class TelegramClient:
             await asyncio.sleep(wait)
             return await self._post(method, data=data, files=files, retry=False)
         if response.status_code != 200 or not payload.get("ok"):
+            self._last_error = (
+                str(payload.get("description") or "") or f"HTTP {response.status_code}"
+            )
             log.error(
                 "%s to chat %s failed: HTTP %s %s",
                 method,
                 data.get("chat_id"),
                 response.status_code,
-                payload.get("description", ""),
+                self._last_error,
             )
             return None
         return payload.get("result")

@@ -22,13 +22,13 @@ from scraper_bot.contract_validators import (
     EvmContractValidator,
     SolanaContractValidator,
 )
-from scraper_bot.fetcher import HttpProber, PlaywrightFetcher
+from scraper_bot.fetcher import BrowserUnavailable, HttpProber, PlaywrightFetcher
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import SiteState
 from scraper_bot.monitor_manager import MonitorManager
-from scraper_bot.noise_filter import NoiseFilter
 from scraper_bot.notifier import Notifier
 from scraper_bot.page_checker import PageChecker
+from scraper_bot.preferences import Preferences
 from scraper_bot.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
 from scraper_bot.status import StatusReporter
 from scraper_bot.storage import (
@@ -39,7 +39,8 @@ from scraper_bot.storage import (
     atomic_write_text,
 )
 from scraper_bot.telegram_client import TelegramAuthError, TelegramClient
-from scraper_bot.turbo import TurboLimits, TurboManager, TurboSession
+from scraper_bot.turbo import LimitsSource, TurboManager, TurboSession
+from scraper_bot.unverified import UnverifiedWatcher
 from scraper_bot.urls import SubUrlDeriver
 
 log = logging.getLogger(__name__)
@@ -72,34 +73,54 @@ class Application:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._prefs = Preferences(settings, settings.data_dir / "preferences.json")
 
     async def run(self) -> None:
         cfg = self._settings
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        self._prefs.load()
         limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
         async with httpx.AsyncClient(
             headers={"User-Agent": HTTP_USER_AGENT}, timeout=cfg.rpc_timeout, limits=limits
         ) as http:
             telegram = TelegramClient(cfg.telegram_bot_token, http)
             await self._check_token(telegram)
-            async with PlaywrightFetcher(cfg) as fetcher:
-                await self._run_with(http, telegram, fetcher)
+            notifier = Notifier(
+                telegram, cfg.chat_ids, max_examples=lambda: self._prefs.max_change_examples
+            )
+            fetcher = PlaywrightFetcher(cfg, tuning=self._prefs)
+            try:
+                await fetcher.start()
+            except BrowserUnavailable as exc:
+                await notifier.problem(
+                    "browser",
+                    "Browser failed to start; the bot stopped",
+                    str(exc),
+                    hint="Fix the browser installation and start the bot again.",
+                )
+                raise
+            try:
+                await self._run_with(http, telegram, notifier, fetcher)
+            finally:
+                await fetcher.stop()
 
     async def _run_with(
-        self, http: httpx.AsyncClient, telegram: TelegramClient, fetcher: PlaywrightFetcher
+        self,
+        http: httpx.AsyncClient,
+        telegram: TelegramClient,
+        notifier: Notifier,
+        fetcher: PlaywrightFetcher,
     ) -> None:
-        cfg = self._settings
-        notifier = Notifier(telegram, cfg.chat_ids, max_examples=cfg.max_change_examples)
+        cfg, prefs = self._settings, self._prefs
         legacy = LegacyStateImporter(Path.cwd())
         cache = self._build_address_cache(legacy)
         validator = ContractValidator(
-            EvmContractValidator(
-                http, cfg.evm_networks, timeout=cfg.rpc_timeout, require_erc20=cfg.require_erc20
-            ),
+            EvmContractValidator(http, cfg.evm_networks, timeout=cfg.rpc_timeout, tuning=prefs),
             SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout),
             cache,
             max_concurrent=cfg.max_concurrent_rpc,
             retry_delay=cfg.rpc_retry_delay,
+            notifier=notifier,
         )
         snapshots = SnapshotStore(cfg.data_dir / "snapshots")
         extractor = AddressExtractor()
@@ -111,8 +132,7 @@ class Application:
             extractor=extractor,
             validator=validator,
             snapshots=snapshots,
-            noise_filter=NoiseFilter(cfg.flap_window, cfg.flap_threshold),
-            confirm_delay=cfg.confirm_delay,
+            tuning=prefs,
             block_detector=block_detector,
         )
         prober = HttpProber(http)
@@ -121,6 +141,14 @@ class Application:
         def build_monitor(
             site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
         ) -> SiteMonitor:
+            watcher = UnverifiedWatcher(
+                site,
+                validator=validator,
+                cache=cache,
+                notifier=notifier,
+                persist=persist,
+                tuning=prefs,
+            )
             return SiteMonitor(
                 site,
                 checker=checker,
@@ -129,22 +157,13 @@ class Application:
                 notifier=notifier,
                 persist=persist,
                 on_auto_pause=on_auto_pause,
-                poll_interval=(cfg.poll_interval_min, cfg.poll_interval_max),
-                contract_threshold=cfg.contract_pause_threshold,
-                max_backoff=cfg.block_max_backoff,
+                tuning=prefs,
+                watcher=watcher,
             )
 
-        turbo_limits = TurboLimits(
-            interval=cfg.turbo_interval,
-            default_minutes=cfg.turbo_default_minutes,
-            max_minutes=cfg.turbo_max_minutes,
-            stop_after=cfg.turbo_stop_after,
-            max_sites=cfg.turbo_max_sites,
-            max_pages=cfg.turbo_max_pages,
-            recheck_interval=cfg.turbo_recheck_interval,
-        )
-
-        def build_turbo(url: str, pages: list[str], duration: float) -> TurboSession:
+        def build_turbo(
+            url: str, pages: list[str], duration: float, limits: LimitsSource
+        ) -> TurboSession:
             return TurboSession(
                 url,
                 pages,
@@ -154,12 +173,16 @@ class Application:
                 cache=cache,
                 notifier=notifier,
                 block_detector=block_detector,
-                limits=turbo_limits,
+                limits=limits,
                 duration=duration,
             )
 
         turbo = TurboManager(
-            limits=turbo_limits, deriver=deriver, prober=prober, session_factory=build_turbo
+            tuning=prefs,
+            deriver=deriver,
+            prober=prober,
+            session_factory=build_turbo,
+            notifier=notifier,
         )
 
         manager = MonitorManager(
@@ -168,8 +191,13 @@ class Application:
             deriver=deriver,
             monitor_factory=build_monitor,
             legacy_importer=legacy,
+            notifier=notifier,
         )
         await manager.start()
+        sites = manager.sites()
+        await notifier.started(
+            __version__, len(sites), sum(1 for site in sites if manager.is_running(site.url))
+        )
 
         status = StatusReporter(
             version=__version__, manager=manager, cache=cache, browser=fetcher, turbo=turbo
@@ -181,6 +209,7 @@ class Application:
             alert_chat_ids=cfg.chat_ids,
             status_provider=status.render,
             turbo=turbo,
+            preferences=prefs,
         )
         listener = TelegramListener(telegram, commands)
         heartbeat = Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval)
@@ -211,7 +240,9 @@ class Application:
         known_path = cfg.data_dir / "known_contracts.txt"
         first_run = not known_path.exists()
         cache = AddressCache(
-            known_path, cfg.data_dir / "rejected_addresses.txt", rejected_ttl=cfg.rejected_ttl
+            known_path,
+            cfg.data_dir / "rejected_addresses.txt",
+            rejected_ttl=lambda: self._prefs.rejected_ttl,
         )
         cache.load()
         if first_run and legacy.has_data():
@@ -267,4 +298,10 @@ def main() -> int:
     except TelegramAuthError as exc:
         log.error("%s", exc)
         return 2
+    except BrowserUnavailable as exc:
+        log.error("%s", exc)
+        return 3
+    except Exception:
+        log.exception("fatal error; the supervisor (rebooter.py) restarts the bot")
+        return 1
     return 0

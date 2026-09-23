@@ -23,6 +23,7 @@ from scraper_bot.contract_validators import ContractValidator
 from scraper_bot.fetcher import HttpProber, PageFetcher
 from scraper_bot.models import Address, BlockSignal, ConfirmedContract, ValidationStatus
 from scraper_bot.notifier import Notifier
+from scraper_bot.preferences import Tuning
 from scraper_bot.storage import AddressCache
 from scraper_bot.urls import SubUrlDeriver, normalize_url
 
@@ -61,6 +62,11 @@ class TurboLimits:
     max_watch: int = 50  # unverified addresses tracked per session
 
 
+# A session takes either fixed limits or a callable returning the current ones, so that
+# /set changes reach sessions that are already running.
+LimitsSource = TurboLimits | Callable[[], TurboLimits]
+
+
 @dataclass(slots=True)
 class TurboStats:
     started_at: float | None = None
@@ -93,7 +99,7 @@ class TurboSession:
         cache: AddressCache,
         notifier: Notifier,
         block_detector: BlockDetector,
-        limits: TurboLimits,
+        limits: LimitsSource,
         duration: float,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -105,7 +111,7 @@ class TurboSession:
         self._cache = cache
         self._notifier = notifier
         self._blocks = block_detector
-        self._limits = limits
+        self._limits_source = limits
         self._duration = duration
         self._clock = clock
         self._stats = TurboStats()
@@ -124,6 +130,12 @@ class TurboSession:
         return list(self._pages)
 
     @property
+    def limits(self) -> TurboLimits:
+        """Current limits, read live when a callable was given."""
+        source = self._limits_source
+        return source() if callable(source) else source
+
+    @property
     def stats(self) -> TurboStats:
         return self._stats
 
@@ -138,7 +150,7 @@ class TurboSession:
         self._stop.set()
 
     async def run(self) -> TurboStats:
-        stats, limits = self._stats, self._limits
+        stats, limits = self._stats, self.limits
         stats.started_at = self._clock()
         stats.deadline = stats.started_at + self._duration
         log.info("turbo started for %s (%d pages)", self._url, len(self._pages))
@@ -159,6 +171,7 @@ class TurboSession:
                 if signal is not None:
                     reason = f"possible IP block ({signal.reason})"
                     break
+                limits = self.limits  # /set may have changed the pace or the stop rule
                 if limits.stop_after and len(stats.found) >= limits.stop_after:
                     reason = f"found {len(stats.found)} confirmed contract(s)"
                     break
@@ -202,23 +215,21 @@ class TurboSession:
         if address in self._seen or self._cache.is_known(address):
             return
         self._seen.add(address)
-        if len(self._watch) >= self._limits.max_watch:
+        if len(self._watch) >= self.limits.max_watch:
             log.warning("turbo %s: watch list is full, ignoring %s", self._url, address)
             return
         self._watch[address] = 0.0
         self._page_of[address] = page_url
         if not baseline:
             self._stats.unverified += 1
-            await self._notifier.unverified_address(
-                address, page_url, self._limits.recheck_interval
-            )
+            await self._notifier.unverified_address(address, page_url, self.limits.recheck_interval)
 
     async def _recheck(self) -> None:
         now = self._clock()
         due = [
             address
             for address, last in self._watch.items()
-            if last == 0.0 or now - last >= self._limits.recheck_interval
+            if last == 0.0 or now - last >= self.limits.recheck_interval
         ]
         if not due:
             return
@@ -246,7 +257,7 @@ class TurboSession:
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
 
-SessionFactory = Callable[[str, list[str], float], TurboSession]
+SessionFactory = Callable[[str, list[str], float, LimitsSource], TurboSession]
 
 
 class TurboManager:
@@ -255,19 +266,22 @@ class TurboManager:
     def __init__(
         self,
         *,
-        limits: TurboLimits,
+        tuning: Tuning,
         deriver: SubUrlDeriver,
         prober: HttpProber,
         session_factory: SessionFactory,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        notifier: Notifier | None = None,
     ) -> None:
-        self._limits = limits
+        self._tuning = tuning
         self._deriver = deriver
         self._prober = prober
         self._factory = session_factory
         self._clock = clock
         self._sleep = sleep
+        self._notifier = notifier
+        self._background: set[asyncio.Task[object]] = set()
         self._sessions: dict[str, TurboSession] = {}
         self._tasks: dict[str, asyncio.Task[TurboStats]] = {}
         self._scheduled: dict[str, tuple[ScheduledTurbo, asyncio.Task[None]]] = {}
@@ -275,7 +289,17 @@ class TurboManager:
 
     @property
     def limits(self) -> TurboLimits:
-        return self._limits
+        """Current limits, read from the live tuning so /set changes apply at once."""
+        tuning = self._tuning
+        return TurboLimits(
+            interval=tuning.turbo_interval,
+            default_minutes=tuning.turbo_default_minutes,
+            max_minutes=tuning.turbo_max_minutes,
+            stop_after=tuning.turbo_stop_after,
+            max_sites=tuning.turbo_max_sites,
+            max_pages=tuning.turbo_max_pages,
+            recheck_interval=tuning.turbo_recheck_interval,
+        )
 
     def active(self) -> list[TurboSession]:
         return [
@@ -293,11 +317,12 @@ class TurboManager:
         url = normalize_url(raw_url)
         if self._is_busy(url):
             raise TurboAlreadyRunning(url)
-        if self._reserved_count() >= self._limits.max_sites:
-            raise TurboLimitReached(url, self._limits.max_sites)
+        limits = self.limits
+        if self._reserved_count() >= limits.max_sites:
+            raise TurboLimitReached(url, limits.max_sites)
         if minutes is None:
-            minutes = self._limits.default_minutes
-        minutes = min(max(minutes, 1.0), self._limits.max_minutes)
+            minutes = limits.default_minutes
+        minutes = min(max(minutes, 1.0), limits.max_minutes)
         now = self._clock()
         if start_at is not None and start_at > now + 1:
             plan = ScheduledTurbo(url, start_at, minutes)
@@ -355,8 +380,9 @@ class TurboManager:
         # concurrent /turbo can neither duplicate it nor take its slot.
         self._launching.add(url)
         try:
-            pages = await self._pick_pages(url)
-            session = self._factory(url, pages, duration)
+            limits = self.limits
+            pages = await self._pick_pages(url, limits.max_pages)
+            session = self._factory(url, pages, duration, lambda: self.limits)
             task = asyncio.create_task(session.run(), name=f"turbo:{url}")
             task.add_done_callback(lambda done, u=url: self._on_done(u, done))
             self._sessions[url] = session
@@ -365,14 +391,27 @@ class TurboManager:
         finally:
             self._launching.discard(url)
 
-    async def _pick_pages(self, url: str) -> list[str]:
+    async def _pick_pages(self, url: str, max_pages: int) -> list[str]:
         probes = await asyncio.gather(*(self._prober.probe(p) for p in self._deriver.derive(url)))
         live = [url, *(probe.url for probe in probes if probe.worth_rendering)]
-        return live[: self._limits.max_pages]
+        return live[:max_pages]
 
     def _on_done(self, url: str, task: asyncio.Task[TurboStats]) -> None:
         if self._tasks.get(url) is task:
             del self._tasks[url]
             self._sessions.pop(url, None)
-        if not task.cancelled() and task.exception() is not None:
-            log.error("turbo session for %s crashed: %r", url, task.exception())
+        if task.cancelled() or task.exception() is None:
+            return
+        error = task.exception()
+        log.error("turbo session for %s crashed: %r", url, error, exc_info=error)
+        if self._notifier is not None:
+            report = asyncio.ensure_future(
+                self._notifier.problem(
+                    f"turbo:{url}",
+                    f"Turbo session for {url} crashed",
+                    f"{type(error).__name__}: {error}",
+                    hint="The session is over; start it again with /turbo when the cause is fixed.",
+                )
+            )
+            self._background.add(report)
+            report.add_done_callback(self._background.discard)

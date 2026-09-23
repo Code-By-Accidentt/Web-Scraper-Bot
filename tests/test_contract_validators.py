@@ -19,6 +19,7 @@ from scraper_bot.contract_validators import (
 )
 from scraper_bot.models import Address, Chain, ConfirmedContract, ValidationStatus
 from scraper_bot.storage import AddressCache
+from tests.conftest import FakeTuning
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -116,7 +117,9 @@ async def test_first_network_with_erc20_code_wins() -> None:
     rpc.route("alpha.rpc", no_contract)
     rpc.route("beta.rpc", erc20_contract)
     async with rpc.client() as http:
-        validator = EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=True)
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
         assert await validator.find_network(USDC_ETH) == "Beta"
     assert rpc.count("alpha.rpc", "eth_getCode") == 1
     assert rpc.count("alpha.rpc", "eth_call") == 0
@@ -128,7 +131,9 @@ async def test_no_code_on_any_network_means_not_a_contract() -> None:
     rpc.route("alpha.rpc", no_contract)
     rpc.route("beta.rpc", no_contract)
     async with rpc.client() as http:
-        validator = EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=True)
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
         assert await validator.find_network(USDC_ETH) is None
 
 
@@ -137,9 +142,13 @@ async def test_non_erc20_contract_only_counts_when_allowed() -> None:
     rpc.route("alpha.rpc", plain_contract)
     rpc.route("beta.rpc", no_contract)
     async with rpc.client() as http:
-        strict = EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=True)
+        strict = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
         assert await strict.find_network(USDC_ETH) is None
-        lenient = EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=False)
+        lenient = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=False)
+        )
         assert await lenient.find_network(USDC_ETH) == "Alpha"
 
 
@@ -147,7 +156,9 @@ async def test_failed_endpoint_prevents_a_rejection_but_not_a_confirmation() -> 
     rpc = FakeRpc()
     rpc.route("alpha.rpc", no_contract)  # beta.rpc is unreachable
     async with rpc.client() as http:
-        validator = EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=True)
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
         with pytest.raises(RpcUnavailable, match="Beta"):
             await validator.find_network(USDC_ETH)
         rpc.route("alpha.rpc", erc20_contract)
@@ -199,7 +210,7 @@ def build(
     )
     cache.load()
     return ContractValidator(
-        EvmContractValidator(http, NETWORKS, timeout=5, require_erc20=True),
+        EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)),
         SolanaContractValidator(http, "https://sol.rpc", timeout=5),
         cache,
         max_concurrent=4,
@@ -276,3 +287,30 @@ async def test_turbo_checks_bypass_and_do_not_write_the_negative_cache(tmp_path:
             ValidationStatus.REJECTED
         )
         assert rpc.count("alpha.rpc", "eth_getCode") == 4
+
+
+async def test_rpc_failures_are_reported_through_the_notifier(tmp_path: Path) -> None:
+    from tests.conftest import FakeNotifier
+
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", no_contract)  # beta unreachable
+    notifier = FakeNotifier()
+    clock = FakeClock()
+    async with rpc.client() as http:
+        cache = AddressCache(
+            tmp_path / "known.tsv", tmp_path / "rejected.tsv", rejected_ttl=1000, clock=clock
+        )
+        cache.load()
+        validator = ContractValidator(
+            EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning()),
+            SolanaContractValidator(http, "https://sol.rpc", timeout=5),
+            cache,
+            max_concurrent=4,
+            retry_delay=60,
+            clock=clock,
+            notifier=notifier,  # type: ignore[arg-type]
+        )
+        assert (await validator.validate(ETH)).status is ValidationStatus.UNAVAILABLE
+    assert len(notifier.problems) == 1
+    key, title, detail, hint = notifier.problems[0]
+    assert key == "rpc" and "failing" in title and "Beta" in detail and "60 s" in (hint or "")

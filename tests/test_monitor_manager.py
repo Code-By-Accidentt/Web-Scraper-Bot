@@ -14,7 +14,7 @@ from scraper_bot.monitor_manager import (
 )
 from scraper_bot.storage import LegacyStateImporter, SnapshotStore, StateStore
 from scraper_bot.urls import InvalidUrlError, SubUrlDeriver
-from tests.conftest import StubMonitor, node
+from tests.conftest import FakeNotifier, StubMonitor, node
 
 ROOT = "https://example.com"
 APP = "https://app.example.com"
@@ -34,6 +34,7 @@ class Harness:
         self.snapshots = SnapshotStore(tmp_path / "snaps")
         self.monitors: list[StubMonitor] = []
         self.crash_first = crash_first
+        self.notifier = FakeNotifier()
         self.manager = MonitorManager(
             state_store=self.state,
             snapshot_store=self.snapshots,
@@ -41,6 +42,7 @@ class Harness:
             monitor_factory=self.factory,
             legacy_importer=legacy,
             restart_delay=restart_delay,
+            notifier=self.notifier,  # type: ignore[arg-type]
         )
 
     def factory(self, site: SiteState, persist: Any, on_auto_pause: Any) -> StubMonitor:
@@ -159,6 +161,10 @@ async def test_crashed_monitor_is_restarted(tmp_path: Path) -> None:
             await asyncio.sleep(0.01)
         assert len(h.monitors) == 2
         assert h.manager.is_running(ROOT)
+        await asyncio.sleep(0)
+        assert [p[0] for p in h.notifier.problems] == [f"monitor:{ROOT}"]
+        assert "RuntimeError: boom" in h.notifier.problems[0][2]
+        assert "restarts automatically" in (h.notifier.problems[0][3] or "")
     finally:
         await h.manager.shutdown()
 

@@ -12,8 +12,14 @@ import httpx
 from playwright import async_api as pw
 
 from scraper_bot.config import Settings
+from scraper_bot.preferences import Tuning
 
 log = logging.getLogger(__name__)
+
+
+class BrowserUnavailable(RuntimeError):
+    """The browser could not be started (or restarted); the message says what to do."""
+
 
 # Deep scan: response types whose bodies may hide addresses (bundles, API answers, raw HTML).
 _SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
@@ -79,8 +85,9 @@ class PlaywrightFetcher:
     found without any extra request.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, tuning: Tuning | None = None) -> None:
         self._settings = settings
+        self._tuning: Tuning = tuning if tuning is not None else settings
         self._playwright: pw.Playwright | None = None
         self._browser: pw.Browser | None = None
         self._context: pw.BrowserContext | None = None
@@ -101,7 +108,10 @@ class PlaywrightFetcher:
 
     async def start(self) -> None:
         self._playwright = await pw.async_playwright().start()
-        await self._launch()
+        try:
+            await self._launch()
+        except pw.Error as exc:
+            raise BrowserUnavailable(self._explain_launch_error(exc)) from exc
 
     async def stop(self) -> None:
         await self._close_browser()
@@ -125,10 +135,11 @@ class PlaywrightFetcher:
 
     # ── internals ───────────────────────────────────────────────────────────
     async def _fetch_in(self, context: pw.BrowserContext, url: str) -> FetchResult:
-        cfg = self._settings
+        cfg, tuning = self._settings, self._tuning
+        deep_scan = tuning.deep_scan
         page = await context.new_page()
         responses: list[pw.Response] = []
-        if cfg.deep_scan:
+        if deep_scan:
             # Playwright decorates the handler, so it must be a plain function, not a builtin.
             page.on("response", lambda response: responses.append(response))
         try:
@@ -142,16 +153,16 @@ class PlaywrightFetcher:
                 if self._browser_gone(exc):
                     raise
                 return FetchResult(url, None, error=self._brief(exc))
-            if cfg.network_idle_timeout > 0:
+            if tuning.network_idle_timeout > 0:
                 # A page that keeps polling never goes idle; the settle delay covers that case.
                 with contextlib.suppress(pw.TimeoutError):
                     await page.wait_for_load_state(
-                        "networkidle", timeout=cfg.network_idle_timeout * 1000
+                        "networkidle", timeout=tuning.network_idle_timeout * 1000
                     )
-            if cfg.settle_delay > 0:
-                await asyncio.sleep(cfg.settle_delay)
+            if tuning.settle_delay > 0:
+                await asyncio.sleep(tuning.settle_delay)
             html = await page.content()
-            extra = await self._deep_scan(page, responses) if cfg.deep_scan else ()
+            extra = await self._deep_scan(page, responses) if deep_scan else ()
             status = response.status if response is not None else None
             headers = dict(response.headers) if response is not None else {}
             return FetchResult(
@@ -213,9 +224,22 @@ class PlaywrightFetcher:
         async with self._launch_lock:
             if self._context is None or not self.is_connected:
                 await self._close_browser()
-                await self._launch()
+                try:
+                    await self._launch()
+                except pw.Error as exc:
+                    raise BrowserUnavailable(self._explain_launch_error(exc)) from exc
             assert self._context is not None
             return self._context
+
+    @classmethod
+    def _explain_launch_error(cls, exc: pw.Error) -> str:
+        brief = cls._brief(exc)
+        if "executable doesn't exist" in brief.lower() or "browsertype.launch" in brief.lower():
+            return (
+                f"browser could not start: {brief}. "
+                "Install it with: playwright install chromium (then restart the bot)"
+            )
+        return f"browser could not start: {brief}"
 
     async def _launch(self) -> None:
         assert self._playwright is not None, "start() must be called first"

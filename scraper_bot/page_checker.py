@@ -13,8 +13,15 @@ from scraper_bot.change_detector import ChangeDetector
 from scraper_bot.contract_validators import ContractValidator
 from scraper_bot.fetcher import FetchResult, PageFetcher
 from scraper_bot.html_normalizer import HtmlNormalizer
-from scraper_bot.models import ConfirmedContract, PageCheckOutcome, PageStatus, Snapshot
+from scraper_bot.models import (
+    Address,
+    ConfirmedContract,
+    PageCheckOutcome,
+    PageStatus,
+    Snapshot,
+)
 from scraper_bot.noise_filter import NoiseFilter
+from scraper_bot.preferences import Tuning
 from scraper_bot.storage import SnapshotStore
 
 log = logging.getLogger(__name__)
@@ -27,7 +34,9 @@ class PageChecker:
     ``confirm_delay`` seconds later; whatever differs between the two renders is
     volatile and ignored, and elements that keep changing across rounds are
     silenced by the :class:`NoiseFilter`. The stored snapshot is always advanced
-    to the second render so that noise never accumulates.
+    to the second render so that noise never accumulates. Every outcome also
+    carries the syntactically valid addresses seen on the page (``candidates``)
+    for the unverified mode, next to the on-chain confirmed ``contracts``.
     """
 
     def __init__(
@@ -39,8 +48,7 @@ class PageChecker:
         extractor: AddressExtractor,
         validator: ContractValidator,
         snapshots: SnapshotStore,
-        noise_filter: NoiseFilter,
-        confirm_delay: float,
+        tuning: Tuning,
         block_detector: BlockDetector | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.time,
@@ -51,8 +59,7 @@ class PageChecker:
         self._extractor = extractor
         self._validator = validator
         self._snapshots = snapshots
-        self._noise = noise_filter
-        self._confirm_delay = confirm_delay
+        self._tuning = tuning
         self._blocks = block_detector or BlockDetector()
         self._sleep = sleep
         self._clock = clock
@@ -68,39 +75,58 @@ class PageChecker:
         if not first.ok:
             return PageCheckOutcome(page_url, PageStatus.UNAVAILABLE, error=first.reason)
 
-        contracts = await self._confirm_contracts(first)
+        candidates = self._candidates(first)
+        contracts = await self._confirm(candidates)
         current = self._normalizer.signature(first.html)
         snapshot = self._snapshots.load(page_url)
         if snapshot is None:
             self._snapshots.save(page_url, Snapshot(current))
-            return PageCheckOutcome(page_url, PageStatus.BASELINE, contracts)
+            return PageCheckOutcome(page_url, PageStatus.BASELINE, contracts, candidates=candidates)
         if not self._detector.differs(snapshot.signature, current):
-            return PageCheckOutcome(page_url, PageStatus.UNCHANGED, contracts)
+            return PageCheckOutcome(
+                page_url, PageStatus.UNCHANGED, contracts, candidates=candidates
+            )
 
         # Something differs: render again to separate real edits from volatile parts.
-        await self._sleep(self._confirm_delay)
+        await self._sleep(self._tuning.confirm_delay)
         second = await self._fetcher.fetch(page_url)
         block = self._blocks.inspect(second)
         if block is not None or not second.ok:
             reason = block.reason if block is not None else second.reason
             return PageCheckOutcome(
-                page_url, PageStatus.UNAVAILABLE, contracts, error=reason, block=block
+                page_url,
+                PageStatus.UNAVAILABLE,
+                contracts,
+                error=reason,
+                block=block,
+                candidates=candidates,
             )
-        contracts = self._merge(contracts, await self._confirm_contracts(second))
+        more = self._candidates(second)
+        candidates = self._merge_addresses(candidates, more)
+        contracts = self._merge(contracts, await self._confirm(more))
         confirmed = self._normalizer.signature(second.html)
         if self._detector.is_unstable(current, confirmed):
             reason = f"renders differ in size ({len(current)} vs {len(confirmed)} nodes)"
-            return PageCheckOutcome(page_url, PageStatus.UNSTABLE, contracts, error=reason)
+            return PageCheckOutcome(
+                page_url, PageStatus.UNSTABLE, contracts, error=reason, candidates=candidates
+            )
         volatile = self._detector.volatile_nodes(current, confirmed)
         report = self._detector.compare(snapshot.signature, confirmed, page_url, ignore=volatile)
-        report, noise = self._noise.apply(report, snapshot.noise, self._clock())
-        self._snapshots.save(page_url, Snapshot(confirmed, noise))
+        noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
+        report, memory = noise.apply(report, snapshot.noise, self._clock())
+        self._snapshots.save(page_url, Snapshot(confirmed, memory))
         if report.is_empty:
-            return PageCheckOutcome(page_url, PageStatus.UNCHANGED, contracts)
-        return PageCheckOutcome(page_url, PageStatus.CHANGED, contracts, report=report)
+            return PageCheckOutcome(
+                page_url, PageStatus.UNCHANGED, contracts, candidates=candidates
+            )
+        return PageCheckOutcome(
+            page_url, PageStatus.CHANGED, contracts, report=report, candidates=candidates
+        )
 
-    async def _confirm_contracts(self, result: FetchResult) -> tuple[ConfirmedContract, ...]:
-        candidates = self._extractor.extract_many(result.scan_texts)
+    def _candidates(self, result: FetchResult) -> tuple[Address, ...]:
+        return tuple(self._extractor.extract_many(result.scan_texts))
+
+    async def _confirm(self, candidates: tuple[Address, ...]) -> tuple[ConfirmedContract, ...]:
         if not candidates:
             return ()
         results = await self._validator.validate_many(candidates)
@@ -112,3 +138,10 @@ class PageChecker:
     ) -> tuple[ConfirmedContract, ...]:
         seen = {contract.address for contract in first}
         return first + tuple(c for c in second if c.address not in seen)
+
+    @staticmethod
+    def _merge_addresses(
+        first: tuple[Address, ...], second: tuple[Address, ...]
+    ) -> tuple[Address, ...]:
+        seen = set(first)
+        return first + tuple(a for a in second if a not in seen)

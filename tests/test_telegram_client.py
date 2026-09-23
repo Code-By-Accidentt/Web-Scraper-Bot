@@ -118,3 +118,37 @@ async def test_get_me_reports_profile_or_rejects_token() -> None:
         else:
             raise AssertionError("401 must raise TelegramAuthError")
         assert await client.get_me() is None
+
+
+async def test_messages_use_html_and_fall_back_to_plain_text() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = form(request)
+        seen.append(payload)
+        if payload.get("parse_mode") == "HTML":
+            return httpx.Response(
+                400, json={"ok": False, "description": "Bad Request: can't parse entities"}
+            )
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.send_message(5, "<code>/add &lt;url&gt;</code> broken <b")
+    assert [p.get("parse_mode") for p in seen] == ["HTML", None]
+    assert seen[0]["link_preview_options"] == '{"is_disabled": true}'
+    assert seen[1]["text"] == "/add <url> broken <b"
+
+
+async def test_other_api_errors_do_not_trigger_the_fallback() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(403, json={"ok": False, "description": "Forbidden: bot was blocked"})
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.send_message(5, "<code>x</code>") is False
+    assert calls == 1

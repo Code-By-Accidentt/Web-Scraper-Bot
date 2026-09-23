@@ -203,3 +203,17 @@ def test_snapshot_with_malformed_noise_is_treated_as_missing(tmp_path: Path) -> 
         json.dumps({"version": 2, "nodes": [], "noise": {"k": "bad"}}), encoding="utf-8"
     )
     assert store.load("https://b.io") is None
+
+
+def test_rejected_ttl_can_be_a_live_provider(tmp_path: Path) -> None:
+    clock = FakeClock(0.0)
+    ttl = {"value": 100.0}
+    cache = AddressCache(
+        tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=lambda: ttl["value"], clock=clock
+    )
+    cache.load()
+    cache.add_rejected(SOL)
+    clock.now = 50.0
+    assert cache.is_rejected(SOL)
+    ttl["value"] = 10.0  # shortened at runtime through /set
+    assert not cache.is_rejected(SOL)

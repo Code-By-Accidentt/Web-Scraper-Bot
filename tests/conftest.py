@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,36 @@ from scraper_bot.models import (
 )
 from scraper_bot.site_monitor import MonitorStats
 from scraper_bot.turbo import TurboStats
+
+
+@dataclass
+class FakeTuning:
+    """Mutable stand-in for Preferences with test-friendly (tiny) timings."""
+
+    poll_interval_min: float = 0.01
+    poll_interval_max: float = 0.02
+    confirm_delay: float = 2.0
+    network_idle_timeout: float = 0.0
+    settle_delay: float = 0.0
+    require_erc20: bool = True
+    contract_pause_threshold: int = 5
+    rejected_ttl: float = 0.0
+    deep_scan: bool = True
+    unverified_recheck: float = 0.0
+    unverified_watch: float = 3600.0
+    unverified_max_per_hour: int = 10
+    max_change_examples: int = 5
+    flap_window: float = 0.0
+    flap_threshold: int = 2
+    turbo_interval: float = 0.01
+    turbo_default_minutes: float = 30.0
+    turbo_max_minutes: float = 180.0
+    turbo_stop_after: int = 1
+    turbo_max_sites: int = 1
+    turbo_max_pages: int = 4
+    turbo_recheck_interval: float = 0.0
+    block_max_backoff: float = 600.0
+
 
 MINIMAL_ENV = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_IDS": "1,2"}
 
@@ -145,6 +176,9 @@ class FakeNotifier:
         self.turbo_finished_calls: list[tuple[str, str, int]] = []
         self.blocked: list[tuple[str, str, str, float]] = []
         self.recovered: list[str] = []
+        self.digests: list[tuple[str, int]] = []
+        self.problems: list[tuple[str, str, str, str | None]] = []
+        self.started_calls: list[tuple[str, int, int]] = []
 
     async def page_discovered(self, page_url: str) -> None:
         self.discovered.append(page_url)
@@ -171,9 +205,16 @@ class FakeNotifier:
         self.turbo_started_calls.append((site_url, pages, interval, minutes, stop_after))
 
     async def unverified_address(
-        self, address: Address, page_url: str, recheck_interval: float
+        self,
+        address: Address,
+        page_url: str,
+        recheck_seconds: float,
+        watch_seconds: float | None = None,
     ) -> None:
         self.unverified.append((address, page_url))
+
+    async def unverified_digest(self, site_url: str, count: int, watch_seconds: float) -> None:
+        self.digests.append((site_url, count))
 
     async def address_confirmed(self, contract: ConfirmedContract, page_url: str) -> None:
         self.confirmed.append((contract, page_url))
@@ -195,6 +236,13 @@ class FakeNotifier:
 
     async def site_recovered(self, site_url: str) -> None:
         self.recovered.append(site_url)
+
+    async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
+        self.problems.append((key, title, detail, hint))
+        return True
+
+    async def started(self, version: str, total_sites: int, running: int) -> None:
+        self.started_calls.append((version, total_sites, running))
 
 
 class FakeChecker:
@@ -273,10 +321,11 @@ class StubMonitor:
 class StubTurboSession:
     """Stand-in for TurboSession: records its arguments and runs until stopped."""
 
-    def __init__(self, url: str, pages: list[str], duration: float) -> None:
+    def __init__(self, url: str, pages: list[str], duration: float, limits=None) -> None:
         self.url = url
         self.pages = list(pages)
         self.duration = duration
+        self.limits = limits
         self.stats = TurboStats()
         self.stop_reason: str | None = None
         self._stop = asyncio.Event()

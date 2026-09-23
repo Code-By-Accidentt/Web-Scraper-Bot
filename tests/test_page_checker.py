@@ -4,10 +4,9 @@ from scraper_bot.address_extractor import AddressExtractor
 from scraper_bot.change_detector import ChangeDetector
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import Address, Chain, ConfirmedContract, PageStatus
-from scraper_bot.noise_filter import NoiseFilter
 from scraper_bot.page_checker import PageChecker
 from scraper_bot.storage import SnapshotStore
-from tests.conftest import FakeFetcher, FakeValidator, node
+from tests.conftest import FakeFetcher, FakeTuning, FakeValidator, node
 
 URL = "https://example.com"
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -37,8 +36,7 @@ class Harness:
             extractor=AddressExtractor(),
             validator=self.validator,
             snapshots=self.snapshots,
-            noise_filter=NoiseFilter(window=flap_window, threshold=2),
-            confirm_delay=2.0,
+            tuning=FakeTuning(confirm_delay=2.0, flap_window=flap_window, flap_threshold=2),
             sleep=fake_sleep,
             clock=lambda: self.now,
         )
