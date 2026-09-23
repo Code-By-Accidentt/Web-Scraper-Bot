@@ -12,7 +12,7 @@ from lxml import html as lxml_html
 from scraper_bot.models import Node, Signature
 
 # Subtrees that never carry user-visible content worth comparing. ``canvas`` is a
-# drawing surface whose width/height are set by JavaScript after load, so it flaps.
+# drawing surface whose size is set by JavaScript after load and differs per render.
 DROP_TAGS = frozenset(
     {
         "script",
@@ -60,10 +60,9 @@ _PARSER = lxml_html.HTMLParser(encoding="utf-8", remove_comments=True, remove_pi
 class HtmlNormalizer:
     """Builds a :data:`Signature` (ordered nodes) out of raw HTML.
 
-    Each element becomes one :class:`Node` with its own text (not the text of
-    its descendants), so a change in a leaf never inflates the diff through every
-    ancestor. Elements without attributes and own text carry no information and
-    are skipped.
+    Each node holds an element's *own* text, not its descendants', so a leaf change
+    never inflates the diff through every ancestor. Elements with neither attributes
+    nor own text are skipped.
     """
 
     def __init__(self, ignored_attributes: Iterable[str] = ()) -> None:
@@ -85,7 +84,6 @@ class HtmlNormalizer:
                 nodes.append(node)
         return tuple(nodes)
 
-    # ── internals ───────────────────────────────────────────────────────────
     @staticmethod
     def _parse(html: str) -> lxml_html.HtmlElement | None:
         text = html.replace("\x00", "").strip()

@@ -1,7 +1,7 @@
 """Token details for a confirmed contract: on-chain metadata, DEX market data, links.
 
 Everything here is best effort and bounded by ``enrich_timeout``: a slow or failing
-source only makes the alert shorter, never later than the budget and never missing.
+source shortens the alert but never delays it past the budget or drops it.
 """
 
 from __future__ import annotations

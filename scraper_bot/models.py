@@ -27,7 +27,7 @@ class Address:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmedContract:
-    """An address that an RPC node confirmed to be a contract (or SPL mint)."""
+    """An address an RPC node confirmed to be a contract, an SPL mint or a Sui coin/package."""
 
     address: Address
     network: str
@@ -221,8 +221,8 @@ class PageCheckOutcome:
     error: str | None = None
     block: BlockSignal | None = None
     candidates: tuple[Address, ...] = ()  # every syntactically valid address seen on the page
+    timed_out: bool = False  # the document never arrived within the load timeout
 
 
 def shorten(text: str, limit: int) -> str:
-    """Cut ``text`` to ``limit`` characters, marking the cut with an ellipsis."""
     return text if len(text) <= limit else text[: max(limit - 3, 0)] + "..."

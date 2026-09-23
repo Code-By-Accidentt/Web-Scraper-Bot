@@ -1,4 +1,4 @@
-"""A tiny asynchronous JSON-RPC 2.0 client shared by the chain validators."""
+"""A tiny asynchronous JSON-RPC 2.0 client used by every chain validator and helper."""
 
 from __future__ import annotations
 
@@ -10,6 +10,15 @@ import httpx
 
 class RpcError(Exception):
     """Transport failure, non-200 answer or a JSON-RPC error object."""
+
+
+class RpcCallError(RpcError):
+    """The node answered, but with a JSON-RPC error object (e.g. ``execution reverted``)."""
+
+    def __init__(self, text: str, code: int | None, message: str) -> None:
+        super().__init__(text)
+        self.code = code
+        self.message = message
 
 
 class JsonRpcClient:
@@ -38,6 +47,11 @@ class JsonRpcClient:
             raise RpcError(f"{method} via {self._host}: unexpected payload")
         error = data.get("error")
         if error:
-            message = error.get("message", error) if isinstance(error, dict) else error
-            raise RpcError(f"{method} via {self._host}: {message}")
+            code = error.get("code") if isinstance(error, dict) else None
+            message = str(error.get("message", error)) if isinstance(error, dict) else str(error)
+            raise RpcCallError(
+                f"{method} via {self._host}: {message}",
+                code if isinstance(code, int) else None,
+                message,
+            )
         return data.get("result")

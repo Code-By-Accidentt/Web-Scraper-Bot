@@ -11,11 +11,10 @@ _MIN_SIZE_RATIO = 0.6
 
 
 class ChangeDetector:
-    """Ordered diff of node lists with support for excluding volatile nodes.
+    """Ordered diff of node lists that can leave volatile nodes out.
 
-    Volatile nodes are the ones that differ between two renders taken a few
-    seconds apart (timers, counters, rotating banners). They are excluded from
-    the report, together with their previous values from the stored snapshot.
+    Volatile nodes differ between two renders taken a few seconds apart (timers,
+    counters, banners); they and their previous values stay out of the report.
     """
 
     @staticmethod
@@ -42,7 +41,6 @@ class ChangeDetector:
     def compare(
         self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()
     ) -> ChangeReport:
-        """Diff ``old`` against ``new`` skipping ``ignore`` (volatile) nodes."""
         removed: list[Node] = []
         added: list[Node] = []
         modified: list[tuple[Node, Node]] = []
@@ -57,7 +55,6 @@ class ChangeDetector:
             added.extend(new_block)
         return ChangeReport(url, tuple(removed), tuple(added), tuple(modified))
 
-    # ── internals ───────────────────────────────────────────────────────────
     @staticmethod
     def _matcher(a: Signature, b: Signature) -> SequenceMatcher[Node]:
         return SequenceMatcher(None, a, b, autojunk=False)

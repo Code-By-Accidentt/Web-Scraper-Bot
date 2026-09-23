@@ -68,3 +68,20 @@ def test_unstable_when_one_render_is_much_smaller() -> None:
     assert detector.is_unstable(big, big[:40])
     assert not detector.is_unstable(big, big[:90])
     assert not detector.is_unstable((), ())
+
+
+def test_old_snapshot_node_that_is_itself_volatile_is_ignored() -> None:
+    # The stored value reappeared in the first render, so it is volatile itself.
+    old = (node("h1", "T"), node("span", "10:00", class_="timer"), node("p", "same"))
+    first = (node("h1", "T"), node("span", "10:00", class_="timer"), node("p", "same"))
+    second = (node("h1", "T"), node("span", "10:10", class_="timer"), node("p", "same"))
+    detector = ChangeDetector()
+    volatile = detector.volatile_nodes(first, second)
+    assert node("span", "10:00", class_="timer") in volatile
+    assert detector.compare(old, second, URL, ignore=volatile).is_empty
+
+    # It is dropped outright, without using up the counterpart another old node needs.
+    old = (node("span", "a", class_="timer"), node("span", "b", class_="timer"))
+    new = (node("span", "c", class_="timer"),)
+    ignore = frozenset({node("span", "a", class_="timer"), node("span", "c", class_="timer")})
+    assert detector.compare(old, new, URL, ignore=ignore).is_empty

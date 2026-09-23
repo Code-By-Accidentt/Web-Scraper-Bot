@@ -2,6 +2,7 @@ from pathlib import Path
 
 from scraper_bot.address_extractor import AddressExtractor
 from scraper_bot.change_detector import ChangeDetector
+from scraper_bot.fetcher import FetchResult
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import Address, Chain, ConfirmedContract, PageStatus
 from scraper_bot.page_checker import PageChecker
@@ -107,6 +108,17 @@ async def test_http_errors_are_unavailable(tmp_path: Path) -> None:
     assert h.snapshots.load(URL) is None
 
 
+async def test_blank_answer_is_unavailable_and_keeps_the_snapshot(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A, "<html><body></body></html>")
+    await h.checker.check(URL)
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.UNAVAILABLE
+    assert outcome.error == "empty page"
+    assert h.fetcher.calls == [URL, URL]  # no confirming render for a blank page
+    assert h.snapshots.load(URL).signature == h.signature(PAGE_A)
+
+
 async def test_second_render_failure_leaves_snapshot_untouched(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     h.fetcher.script(URL)
@@ -182,4 +194,68 @@ async def test_challenge_page_with_200_never_replaces_the_snapshot(tmp_path: Pat
     outcome = await h.checker.check(URL)
     assert outcome.status is PageStatus.UNAVAILABLE
     assert outcome.block is not None
+    assert h.snapshots.load(URL).signature == h.signature(PAGE_A)
+
+
+async def test_first_fetch_error_without_block_is_unavailable(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.script(URL, FetchResult(URL, None, error="timeout after 30s"))
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.UNAVAILABLE
+    assert outcome.error == "timeout after 30s" and outcome.block is None
+    assert outcome.candidates == () and outcome.contracts == ()
+    assert h.snapshots.load(URL) is None
+    assert h.validator.calls == [] and h.sleeps == []
+
+
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+
+async def test_candidates_carry_every_valid_address_from_both_renders(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    usdc, weth = Address(Chain.ETHEREUM, USDC_ETH), Address(Chain.ETHEREUM, WETH)
+    sol = Address(Chain.SOLANA, USDC_SOL)
+    h.validator.confirm(weth, "Base")  # usdc and sol stay rejected
+    first = PAGE_B.replace("</body>", f"<p>{USDC_ETH} {USDC_SOL}</p></body>")
+    second = PAGE_B.replace("</body>", f"<p>{USDC_ETH} {WETH}</p></body>")
+    h.fetcher.html(URL, PAGE_A, first, second)
+    assert (await h.checker.check(URL)).candidates == ()
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.CHANGED
+    assert outcome.candidates == (usdc, sol, weth)  # rejected ones included, no duplicates
+    assert outcome.contracts == (ConfirmedContract(weth, "Base"),)
+    assert h.validator.calls == [[usdc, sol], [usdc, weth]]
+
+
+async def test_block_on_the_confirming_render_keeps_the_snapshot(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A, PAGE_B)
+    h.fetcher.html(URL, CHALLENGE, status=403)
+    await h.checker.check(URL)
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.UNAVAILABLE
+    assert outcome.block is not None and outcome.block.reason.startswith("HTTP 403")
+    assert outcome.error == outcome.block.reason
+    assert h.sleeps == [2.0] and h.fetcher.calls == [URL, URL, URL]
+    assert h.snapshots.load(URL).signature == h.signature(PAGE_A)
+
+
+async def test_load_timeout_reaches_the_fetcher_and_timeouts_are_flagged(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.script(URL, FetchResult(URL, None, error="timeout after 60s", timed_out=True))
+    outcome = await h.checker.check(URL, load_timeout=60.0)
+    assert outcome.status is PageStatus.UNAVAILABLE and outcome.timed_out
+    assert h.fetcher.timeouts == [60.0]
+    assert h.snapshots.load(URL) is None
+
+
+async def test_timeout_on_the_confirming_render_is_flagged_too(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A, PAGE_B)
+    h.fetcher.script(URL, FetchResult(URL, None, error="timeout after 30s", timed_out=True))
+    await h.checker.check(URL)
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.UNAVAILABLE and outcome.timed_out
+    assert h.fetcher.timeouts == [None, None, None]
     assert h.snapshots.load(URL).signature == h.signature(PAGE_A)

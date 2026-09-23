@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
+import scraper_bot.unverified as unverified_module
 from scraper_bot.models import Address, Chain, ConfirmedContract, SiteState
-from scraper_bot.storage import AddressCache
+from scraper_bot.storage import AddressCache, StateStore
 from scraper_bot.unverified import UnverifiedWatcher, address_key, parse_key
 from tests.conftest import FakeNotifier, FakeTuning, FakeValidator
 
@@ -13,8 +16,10 @@ S = Address(Chain.SOLANA, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
 
 class Harness:
-    def __init__(self, tmp_path: Path, *, enabled: bool = True, **tuning) -> None:
-        self.site = SiteState(ROOT, unverified_enabled=enabled)
+    def __init__(
+        self, tmp_path: Path, *, enabled: bool = True, site: SiteState | None = None, **tuning
+    ) -> None:
+        self.site = site or SiteState(ROOT, unverified_enabled=enabled)
         self.validator = FakeValidator()
         self.notifier = FakeNotifier()
         self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
@@ -116,3 +121,63 @@ async def test_pending_overflow_is_flushed_by_rechecks_too(tmp_path: Path) -> No
     h.now += 3601
     await h.watcher.recheck()  # the site stayed quiet: the round itself delivers it
     assert h.notifier.digests == [(ROOT, 1), (ROOT, 1)]
+
+
+async def test_prune_forgets_addresses_older_than_seven_days(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    await h.watcher.observe([A], PAGE)
+    h.now += 7 * 86_400  # exactly seven days: still remembered
+    await h.watcher.observe([A, B], PAGE)
+    assert h.notifier.unverified == [(A, PAGE), (B, PAGE)]
+    h.now += 1  # a second older than the memory: forgotten, so announced again
+    await h.watcher.observe([A], PAGE)
+    assert h.notifier.unverified == [(A, PAGE), (B, PAGE), (A, PAGE)]
+    assert h.site.unverified == {address_key(A): h.now, address_key(B): h.now - 1}
+    assert h.persist_calls == 3
+
+
+async def test_prune_caps_remembered_addresses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(unverified_module, "_MAX_ENTRIES", 2)
+    h = Harness(tmp_path)
+    for address in (A, B, S):
+        await h.watcher.observe([address], PAGE)
+        h.now += 10
+    assert len(h.site.unverified) == 3  # the cap is enforced when the next batch arrives
+    await h.watcher.observe([B], PAGE)  # nothing new, but the oldest entry (A) is dropped
+    assert set(h.site.unverified) == {address_key(B), address_key(S)}
+    await h.watcher.observe([A], PAGE)  # forgotten, so it is announced again
+    assert h.notifier.unverified == [(A, PAGE), (B, PAGE), (S, PAGE), (A, PAGE)]
+
+
+async def test_alert_cap_window_slides(tmp_path: Path) -> None:
+    h = Harness(tmp_path, unverified_max_per_hour=1)
+    await h.watcher.observe([A], PAGE)  # the hour's only alert
+    h.now += 3599
+    await h.watcher.observe([B], PAGE)  # still inside the window: digest
+    assert h.notifier.unverified == [(A, PAGE)] and h.notifier.digests == [(ROOT, 1)]
+    h.now += 1  # A's alert is 3600 s old and out of the window
+    await h.watcher.observe([S], PAGE)
+    assert h.notifier.unverified == [(A, PAGE), (S, PAGE)]
+    assert h.notifier.digests == [(ROOT, 1)]  # nothing new was held back
+
+
+async def test_unverified_state_survives_a_restart(tmp_path: Path) -> None:
+    before = Harness(tmp_path)
+    await before.watcher.observe([A], PAGE)
+    store = StateStore(tmp_path / "state.json")
+    store.save({ROOT: before.site})
+
+    after = Harness(tmp_path, site=store.load()[ROOT])
+    after.now = before.now + 120
+    after.validator.confirm(A, "Base")
+    assert after.watcher.enabled
+    assert after.site.unverified == {address_key(A): 1_000.0}
+    await after.watcher.observe([A], PAGE)
+    assert after.notifier.unverified == []  # remembered across the restart
+    await after.watcher.recheck()  # ...and still watched
+    assert after.validator.calls == [[A]]
+    # The page it was seen on is not persisted, so the confirmation names the site.
+    assert after.notifier.confirmed == [(ConfirmedContract(A, "Base"), ROOT)]
+    assert after.site.unverified == {}

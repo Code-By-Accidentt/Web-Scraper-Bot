@@ -10,6 +10,7 @@ import http.server
 import os
 import socketserver
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -66,6 +67,13 @@ def site(tmp_path: Path) -> Iterator[str]:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path == "/slow":
+                time.sleep(3)  # longer than the 1 s load timeout the test asks for
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"<html><body>slow</body></html>")
+                return
             super().do_GET()
 
         def log_message(self, *args):
@@ -110,3 +118,11 @@ async def test_deep_scan_can_be_disabled(site: str, tmp_path: Path) -> None:
         result = await fetcher.fetch(site)
     assert result.extra_texts == ()
     assert result.scan_texts == (result.html,)
+
+
+async def test_load_timeout_override_is_reported(site: str, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, DEEP_SCAN="false")
+    async with PlaywrightFetcher(settings) as fetcher:
+        result = await fetcher.fetch(site.replace("/index.html", "/slow"), timeout=1)
+    assert result.timed_out and not result.ok
+    assert result.error == "timeout after 1s"

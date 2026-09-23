@@ -46,7 +46,6 @@ class Supervisor:
                 self._start()
             time.sleep(self._check_interval)
 
-    # ── internals ───────────────────────────────────────────────────────────
     def _alive(self) -> bool:
         proc = self._process
         if proc is None:

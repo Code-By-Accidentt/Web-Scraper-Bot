@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ def test_every_spec_has_a_section_and_maps_to_a_settings_attribute(tmp_path: Pat
 
 def test_defaults_mirror_settings_in_user_units_and_base_units(tmp_path: Path) -> None:
     prefs = make_prefs(tmp_path)
-    assert prefs.poll_interval_min == 5.0
+    assert prefs.poll_interval_min == 4.0
     assert prefs.rejected_ttl == 6 * 3600
     assert prefs.current(prefs.spec("rejected_ttl_hours")) == 6.0
     assert prefs.require_erc20 is True
@@ -63,7 +64,7 @@ def test_related_settings_are_kept_consistent(tmp_path: Path) -> None:
     with pytest.raises(PreferenceError, match="must not exceed poll_interval_max"):
         prefs.set("poll_interval_min", "16")
     with pytest.raises(PreferenceError, match="must not be below poll_interval_min"):
-        prefs.set("poll_interval_max", "4")
+        prefs.set("poll_interval_max", "3")
     with pytest.raises(PreferenceError, match="must not exceed turbo_max_minutes"):
         prefs.set("turbo_default_minutes", "999")
 
@@ -96,7 +97,7 @@ def test_reset_restores_env_values(tmp_path: Path) -> None:
     prefs.set("poll_interval_min", "7")
     prefs.set("max_change_examples", "9")
     changes = prefs.reset("poll_interval_min")
-    assert [(c.spec.key, c.old, c.new) for c in changes] == [("poll_interval_min", 7.0, 5.0)]
+    assert [(c.spec.key, c.old, c.new) for c in changes] == [("poll_interval_min", 7.0, 4.0)]
     assert prefs.reset() and prefs.max_change_examples == 5
     assert prefs.reset() == []
 
@@ -134,10 +135,10 @@ def test_resetting_one_side_of_a_pair_keeps_the_pair_consistent(tmp_path: Path) 
     prefs = make_prefs(tmp_path)
     prefs.set("poll_interval_max", "20")
     prefs.set("poll_interval_min", "18")
-    changes = prefs.reset("poll_interval_max")  # alone it would leave min 18 > max 15
+    changes = prefs.reset("poll_interval_max")  # alone it would leave min 18 > max 10
     assert [(c.spec.key, c.new) for c in changes] == [
-        ("poll_interval_max", 15.0),
-        ("poll_interval_min", 5.0),
+        ("poll_interval_max", 10.0),
+        ("poll_interval_min", 4.0),
     ]
     assert prefs.poll_interval_min <= prefs.poll_interval_max
     prefs.set("poll_interval_max", "30")
@@ -153,8 +154,64 @@ def test_inconsistent_pairs_in_the_file_are_dropped(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     prefs = make_prefs(tmp_path)
-    assert prefs.poll_interval_min == 5.0  # 18 would exceed the .env maximum of 15
+    assert prefs.poll_interval_min == 4.0  # 18 would exceed the .env maximum of 10
     assert not prefs.is_overridden(prefs.spec("turbo_default_minutes"))
     assert not prefs.is_overridden(prefs.spec("turbo_max_minutes"))
     assert prefs.turbo_default_minutes <= prefs.turbo_max_minutes
     assert prefs.flap_threshold == 3  # unrelated overrides survive
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '"poll_interval_min"', "7"])
+def test_unreadable_or_non_object_preferences_file_is_ignored(tmp_path: Path, content: str) -> None:
+    (tmp_path / "prefs.json").write_text(content, encoding="utf-8")
+    prefs = make_prefs(tmp_path)
+    assert prefs.poll_interval_min == 4.0
+    assert not any(prefs.is_overridden(spec) for spec in PREFERENCES)
+    prefs.set("flap_threshold", "3")  # the next save replaces the broken file
+    assert make_prefs(tmp_path).flap_threshold == 3
+
+
+# key -> (risky value, safe neighbour). No ordered-pair preparation is needed: the .env
+# poll_interval_max (10) is above 3, and turbo_default/max_minutes carry no caution.
+CAUTION_BOUNDARIES: dict[str, tuple[str, str]] = {
+    "poll_interval_min": ("2.99", "3"),
+    "require_erc20": ("off", "on"),
+    "rejected_ttl_hours": ("0", "0.5"),
+    "deep_scan": ("off", "on"),
+    "flap_window_hours": ("0", "0.5"),
+    "turbo_interval": ("1.99", "2"),
+    "turbo_max_sites": ("2", "1"),
+    "turbo_max_pages": ("9", "8"),
+    "block_max_backoff": ("59.9", "60"),
+}
+
+
+def test_boundary_table_covers_every_caution() -> None:
+    assert set(CAUTION_BOUNDARIES) == {s.key for s in PREFERENCES if s.caution is not None}
+
+
+@pytest.mark.parametrize("key", list(CAUTION_BOUNDARIES))
+def test_every_caution_fires_at_its_boundary(tmp_path: Path, key: str) -> None:
+    risky, safe = CAUTION_BOUNDARIES[key]
+    prefs = make_prefs(tmp_path)
+    spec = prefs.spec(key)
+    with pytest.raises(ConfirmationRequired) as info:
+        prefs.set(key, risky)
+    assert info.value.spec is spec and info.value.warning
+    assert not prefs.is_overridden(spec)  # nothing changed without confirmation
+    assert prefs.set(key, safe).spec is spec  # the neighbour needs no confirmation
+    assert prefs.set(key, risky, confirmed=True).new == prefs.current(spec)
+
+
+def test_reset_of_a_key_without_override_is_a_noop(tmp_path: Path) -> None:
+    path = tmp_path / "prefs.json"
+    prefs = make_prefs(tmp_path)
+    assert prefs.reset("settle_delay") == [] and prefs.reset() == []
+    assert not path.exists()  # nothing to save
+    prefs.set("flap_threshold", "3")
+    saved = path.read_text(encoding="utf-8")
+    assert prefs.reset("settle_delay") == []
+    assert prefs.flap_threshold == 3 and path.read_text(encoding="utf-8") == saved
+    assert json.loads(saved) == {"flap_threshold": 3}
+    with pytest.raises(PreferenceError, match="unknown setting"):
+        prefs.reset("nope")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Callable
 
@@ -24,7 +23,7 @@ MonitorFactory = Callable[[SiteState, PersistCallback, AutoPauseCallback], SiteM
 
 
 class MonitorError(Exception):
-    """Base class for problems reported back to the user verbatim."""
+    """Base class for errors that a command turns into a reply (see ``BotCommands``)."""
 
     def __init__(self, url: str) -> None:
         super().__init__(url)
@@ -100,7 +99,6 @@ class MonitorManager:
         return task is not None and not task.done()
 
     def stats(self, url: str) -> MonitorStats | None:
-        """Runtime counters of the running monitor for ``url``, if any."""
         monitor = self._monitors.get(url)
         return monitor.stats if monitor is not None else None
 
@@ -170,7 +168,6 @@ class MonitorManager:
             monitor.request_stop()
         log.info("auto-paused %s (trigger: %s)", url, page_url)
 
-    # ── internals ───────────────────────────────────────────────────────────
     def _import_legacy(self) -> None:
         if self._legacy_importer is None or not self._legacy_importer.has_data():
             return
@@ -204,8 +201,9 @@ class MonitorManager:
             monitor.request_stop()
         if task is not None and not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # asyncio.wait, not `await task`: a suppressed CancelledError would also
+            # swallow the cancellation of the caller (e.g. Ctrl-C during /remove).
+            await asyncio.wait({task})
 
     def _on_monitor_done(self, url: str, task: asyncio.Task[None]) -> None:
         if self._tasks.get(url) is task:
@@ -215,6 +213,9 @@ class MonitorManager:
             return
         error = task.exception()
         if error is None:
+            # The monitor stopped itself (auto-pause) while finishing its round. If
+            # /resume cleared the pause flag meanwhile, the site needs a fresh monitor.
+            self._restart(url)
             return
         log.error("monitor for %s crashed: %r", url, error, exc_info=error)
         restarts = self._restart_delay > 0 and url in self._sites

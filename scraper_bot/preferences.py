@@ -1,9 +1,8 @@
-"""Runtime-adjustable settings: what ``/settings`` and ``/set`` expose.
+"""Runtime-adjustable settings behind ``/settings`` and ``/set``.
 
-:class:`Settings` (from ``.env``) stays the source of defaults. :class:`Preferences`
-layers validated overrides on top, persists them to ``data/preferences.json`` and
-exposes the *effective* values under the same attribute names as ``Settings``, so
-components that read a :class:`Tuning` at use time pick up changes immediately.
+:class:`Settings` (``.env``) supplies the defaults. :class:`Preferences` keeps validated
+overrides in ``data/preferences.json`` and exposes the effective values under the same
+attribute names, so anything reading a :class:`Tuning` at use time sees changes at once.
 """
 
 from __future__ import annotations
@@ -24,13 +23,14 @@ log = logging.getLogger(__name__)
 
 
 class Tuning(Protocol):
-    """The knobs components consult while running (base units: seconds, counts)."""
+    """Knobs read at use time, in base units (seconds, counts)."""
 
     poll_interval_min: float
     poll_interval_max: float
     confirm_delay: float
     network_idle_timeout: float
     settle_delay: float
+    render_failure_threshold: int
     require_erc20: bool
     contract_pause_threshold: int
     rejected_ttl: float
@@ -76,7 +76,7 @@ class PreferenceSpec:
     section: str
     kind: str  # bool | int | float
     label: str
-    description: str  # what it does and why you would change it
+    description: str
     minimum: float | None = None
     maximum: float | None = None
     unit: str = ""
@@ -107,12 +107,11 @@ def _above(limit: float, text: str) -> Caution:
     return lambda value: text if value > limit else None
 
 
-def _when(flag: bool, text: str) -> Caution:
-    return lambda value: text if value is flag else None
+def _when(flag: bool | float, text: str) -> Caution:
+    return lambda value: text if value == flag else None
 
 
 PREFERENCES: tuple[PreferenceSpec, ...] = (
-    # ── monitoring ──────────────────────────────────────────────────────────
     PreferenceSpec(
         "poll_interval_min",
         "poll_interval_min",
@@ -171,13 +170,25 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "monitoring",
         "float",
         "Extra settle time after network idle",
-        "Pause after the page went quiet so JavaScript can finish drawing. 0.5 s produced "
-        "identical results to 1 s on the measured sites.",
+        "Pause after the page went quiet so JavaScript can finish drawing. 0.25 s produced "
+        "the same result as 0.5 s and 1 s on every measured page; each 0.25 s costs 0.25 s "
+        "per render.",
         0,
         10,
         "s",
     ),
-    # ── contracts ───────────────────────────────────────────────────────────
+    PreferenceSpec(
+        "render_failure_threshold",
+        "render_failure_threshold",
+        "monitoring",
+        "int",
+        "Load timeouts in a row before a page is flagged",
+        "When a page fails to load this many times in a row you get one alert and its load "
+        "timeout is stretched (doubled, up to three times PAGE_LOAD_TIMEOUT) until it renders "
+        "again. 0 turns the counter off.",
+        0,
+        50,
+    ),
     PreferenceSpec(
         "require_erc20",
         "require_erc20",
@@ -271,7 +282,6 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         1,
         100,
     ),
-    # ── alerts ──────────────────────────────────────────────────────────────
     PreferenceSpec(
         "max_change_examples",
         "max_change_examples",
@@ -322,14 +332,13 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         1,
         10,
     ),
-    # ── turbo & blocking ────────────────────────────────────────────────────
     PreferenceSpec(
         "turbo_interval",
         "turbo_interval",
         "turbo",
         "float",
         "Turbo: seconds between renders",
-        "Pause between full renders of a site in turbo mode. Each render takes about 1.5 s "
+        "Pause between full renders of a site in turbo mode. Each render takes about 1 s "
         "on top of this.",
         1,
         60,
@@ -393,7 +402,7 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "Root page plus live sub-pages rendered in every turbo cycle, root included.",
         1,
         10,
-        caution=_above(6, "More pages than browser tabs (6) makes every cycle wait."),
+        caution=_above(8, "More pages than browser tabs (8) makes every cycle wait."),
     ),
     PreferenceSpec(
         "turbo_recheck_interval",
@@ -592,7 +601,6 @@ class Preferences:
         lines.append(f"Change: {code(f'/set {spec.key} <value>')}")
         return "\n".join(lines)
 
-    # ── internals ───────────────────────────────────────────────────────────
     @staticmethod
     def _parse(spec: PreferenceSpec, raw: str) -> Any:
         text = raw.strip().lower()

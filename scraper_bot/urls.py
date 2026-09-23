@@ -16,11 +16,10 @@ class InvalidUrlError(ValueError):
 
 
 def normalize_url(raw: str) -> str:
-    """Return a canonical form of ``raw`` or raise :class:`InvalidUrlError`.
+    """Canonical form of ``raw``, or :class:`InvalidUrlError`.
 
-    A missing scheme defaults to ``https``; scheme and host are lower-cased; the
-    fragment is dropped and a bare ``/`` path is removed so that
-    ``Example.com`` and ``https://example.com/`` map to the same key.
+    https is assumed, scheme and host are lower-cased, the fragment and a bare ``/``
+    path are dropped, so ``Example.com`` and ``https://example.com/`` share one key.
     """
     text = raw.strip()
     if not text or any(ch.isspace() for ch in text):
@@ -73,7 +72,6 @@ class SubUrlDeriver:
         return result
 
     def pages(self, root_url: str) -> list[str]:
-        """Root URL first, then its derived sub-pages."""
         return [root_url, *self.derive(root_url)]
 
 

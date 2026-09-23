@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from scraper_bot.models import (
     Address,
@@ -11,7 +14,13 @@ from scraper_bot.models import (
     SiteState,
     Snapshot,
 )
-from scraper_bot.storage import AddressCache, LegacyStateImporter, SnapshotStore, StateStore
+from scraper_bot.storage import (
+    AddressCache,
+    LegacyStateImporter,
+    SnapshotStore,
+    StateStore,
+    atomic_write_text,
+)
 from tests.conftest import node
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -234,3 +243,87 @@ def test_legacy_wallet_lines_of_every_chain_are_recognised(tmp_path: Path) -> No
         (Chain.SUI, sui),
         (Chain.SUI, f"{sui}::usdc::USDC"),
     ]
+
+
+def test_state_roundtrip_keeps_unverified_fields_and_added_at(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    watched = {"Ethereum:0xabc": 1_700_000_100.0, "Solana:mint": 1_700_000_200.0}
+    site = SiteState(
+        "https://a.io", added_at=1_700_000_000.5, unverified_enabled=True, unverified=watched
+    )
+    store.save({site.url: site})
+    restored = store.load()["https://a.io"]
+    assert restored.added_at == 1_700_000_000.5
+    assert restored.unverified_enabled is True
+    assert restored.unverified == watched
+
+    # A file written before these fields existed, and one with a mangled watch list.
+    sites = {"https://old.io": {"paused": True}, "https://odd.io": {"unverified": ["x"]}}
+    path.write_text(json.dumps({"version": 1, "sites": sites}), encoding="utf-8")
+    loaded = store.load()
+    old = loaded["https://old.io"]
+    assert old.paused is True and old.unverified_enabled is False and old.unverified == {}
+    assert old.added_at > 0  # "now" stands in for the missing timestamp
+    assert loaded["https://odd.io"].unverified == {}
+
+
+def test_corrupt_cache_rows_are_skipped_and_compacted(tmp_path: Path) -> None:
+    other = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+    (tmp_path / "known.tsv").write_text(
+        f"Ethereum\t{USDC_ETH}\tBase\t2024-01-01T00:00:00+00:00\n"
+        "Dogecoin\tDBXu2kgc3xtvCUWFcxFE3r9hEYgmuaaCyD\tDoge\n"  # unknown chain
+        "Ethereum\tnot-an-address\tBase\n"  # not an address
+        f"Solana\t{USDC_SOL}\n"  # two fields: still a known address
+        "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "rejected.tsv").write_text(
+        f"Ethereum\t{USDC_ETH}\t900\n"
+        "Bitcoin\t1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2\t900\n"  # unknown chain
+        f"Solana\t{USDC_SOL}\n"  # no stamp
+        f"Ethereum\t{other}\tyesterday\n"  # non-numeric stamp
+        "Ethereum\t\t900\n"  # empty address
+        f"Ethereum\t{other.lower()}\t940\n",  # valid; canonicalised on load
+        encoding="utf-8",
+    )
+    cache = make_cache(tmp_path, FakeClock(950.0), ttl=100.0)
+    assert cache.known_count == 2
+    assert cache.is_known(ETH) and cache.is_known(SOL)
+    assert cache.known_network(ETH) == "Base"
+    assert cache.rejected_count == 2
+    assert cache.is_rejected(ETH) and cache.is_rejected(Address(Chain.ETHEREUM, other))
+    assert not cache.is_rejected(SOL)
+    assert (tmp_path / "rejected.tsv").read_text(encoding="utf-8") == (
+        f"Ethereum\t{USDC_ETH}\t900\nEthereum\t{other}\t940\n"
+    )
+
+
+def test_atomic_write_keeps_the_old_file_when_the_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    store = StateStore(path)
+    store.save({"https://a.io": SiteState("https://a.io")})
+    before = path.read_text(encoding="utf-8")
+
+    def failing_replace(src: object, dst: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", failing_replace)
+    with pytest.raises(OSError, match="disk full"):
+        store.save({"https://b.io": SiteState("https://b.io")})
+    with pytest.raises(OSError, match="disk full"):
+        atomic_write_text(path, "garbage")
+    monkeypatch.undo()
+    assert path.read_text(encoding="utf-8") == before
+    assert set(store.load()) == {"https://a.io"}
+
+
+def test_corrupt_legacy_notifications_file_means_alerts_on(tmp_path: Path) -> None:
+    (tmp_path / LegacyStateImporter.SITES_FILE).write_text("https://a.io\n", encoding="utf-8")
+    flags = tmp_path / LegacyStateImporter.NOTIFICATIONS_FILE
+    for content in ("{not json", "[false]", '"https://a.io"'):
+        flags.write_text(content, encoding="utf-8")
+        sites = LegacyStateImporter(tmp_path).sites()
+        assert sites["https://a.io"].notifications_enabled is True, content

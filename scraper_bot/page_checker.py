@@ -31,15 +31,12 @@ T = TypeVar("T")
 
 
 class PageChecker:
-    """Stateless orchestration of the per-page pipeline.
+    """Runs the per-page pipeline; keeps no per-page state.
 
-    A change is reported only when it survives a second render taken
-    ``confirm_delay`` seconds later; whatever differs between the two renders is
-    volatile and ignored, and elements that keep changing across rounds are
-    silenced by the :class:`NoiseFilter`. The stored snapshot is always advanced
-    to the second render so that noise never accumulates. Every outcome also
-    carries the syntactically valid addresses seen on the page (``candidates``)
-    for the unverified mode, next to the on-chain confirmed ``contracts``.
+    A change counts only when it survives a second render taken ``confirm_delay``
+    seconds later: whatever differs between the two renders is volatile, elements
+    that keep changing across rounds are silenced by :class:`NoiseFilter`, and the
+    snapshot always advances to the second render so noise never accumulates.
     """
 
     def __init__(
@@ -67,8 +64,9 @@ class PageChecker:
         self._sleep = sleep
         self._clock = clock
 
-    async def check(self, page_url: str) -> PageCheckOutcome:
-        first = await self._fetcher.fetch(page_url)
+    async def check(self, page_url: str, *, load_timeout: float | None = None) -> PageCheckOutcome:
+        """Check one page; ``load_timeout`` replaces the configured load timeout (seconds)."""
+        first = await self._fetcher.fetch(page_url, timeout=load_timeout)
         block = self._blocks.inspect(first)
         if block is not None:
             # A challenge or ban page must never be diffed against the real snapshot.
@@ -76,11 +74,22 @@ class PageChecker:
                 page_url, PageStatus.UNAVAILABLE, error=block.reason, block=block
             )
         if not first.ok:
-            return PageCheckOutcome(page_url, PageStatus.UNAVAILABLE, error=first.reason)
+            return PageCheckOutcome(
+                page_url, PageStatus.UNAVAILABLE, error=first.reason, timed_out=first.timed_out
+            )
 
         candidates = self._candidates(first)
         contracts = await self._confirm(candidates)
         current = self._normalizer.signature(first.html)
+        if not current:
+            # A blank 200 (deploy in progress, empty shell) is not a page to compare.
+            return PageCheckOutcome(
+                page_url,
+                PageStatus.UNAVAILABLE,
+                contracts,
+                error="empty page",
+                candidates=candidates,
+            )
         snapshot = self._snapshots.load(page_url)
         if snapshot is None:
             self._snapshots.save(page_url, Snapshot(current))
@@ -92,7 +101,7 @@ class PageChecker:
 
         # Something differs: render again to separate real edits from volatile parts.
         await self._sleep(self._tuning.confirm_delay)
-        second = await self._fetcher.fetch(page_url)
+        second = await self._fetcher.fetch(page_url, timeout=load_timeout)
         block = self._blocks.inspect(second)
         if block is not None or not second.ok:
             reason = block.reason if block is not None else second.reason
@@ -103,20 +112,35 @@ class PageChecker:
                 error=reason,
                 block=block,
                 candidates=candidates,
+                timed_out=second.timed_out,
             )
         more = self._candidates(second)
         candidates = self._unique(candidates, more, key=lambda address: address)
         contracts = self._unique(contracts, await self._confirm(more), key=lambda c: c.address)
         confirmed = self._normalizer.signature(second.html)
+        if not confirmed:
+            return PageCheckOutcome(
+                page_url,
+                PageStatus.UNAVAILABLE,
+                contracts,
+                error="empty page",
+                candidates=candidates,
+            )
         if self._detector.is_unstable(current, confirmed):
             reason = f"renders differ in size ({len(current)} vs {len(confirmed)} nodes)"
             return PageCheckOutcome(
                 page_url, PageStatus.UNSTABLE, contracts, error=reason, candidates=candidates
             )
-        volatile = self._detector.volatile_nodes(current, confirmed)
-        report = self._detector.compare(snapshot.signature, confirmed, page_url, ignore=volatile)
+        # The diffs are pure CPU work that can take seconds on pages with thousands of
+        # look-alike nodes; a worker thread keeps the other monitors and Telegram alive.
+        volatile = await asyncio.to_thread(self._detector.volatile_nodes, current, confirmed)
+        report = await asyncio.to_thread(
+            self._detector.compare, snapshot.signature, confirmed, page_url, ignore=volatile
+        )
         noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
-        report, memory = noise.apply(report, snapshot.noise, self._clock())
+        report, memory = noise.apply(
+            report, snapshot.noise, self._clock(), before=snapshot.signature, after=confirmed
+        )
         self._snapshots.save(page_url, Snapshot(confirmed, memory))
         if report.is_empty:
             return PageCheckOutcome(

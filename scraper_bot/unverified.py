@@ -1,11 +1,8 @@
 """Report-first, verify-later mode for one site (``/unverified <url> on``).
 
-With the mode on, every address that shows up on the site's pages is announced
-at once with an *unverified* label and then checked on-chain again every
-``unverified_recheck`` seconds for ``unverified_watch`` seconds, ignoring the
-regular negative cache. An address that becomes a contract in that window gets a
-confirmation message; the rest simply stop being watched. Alerts are capped per
-hour and the overflow is summarised in one digest message.
+Every new address is announced at once as *unverified*, then re-checked on-chain
+every ``unverified_recheck`` seconds for ``unverified_watch`` seconds, bypassing the
+negative cache. Confirmations get a message; alerts above the hourly cap go into one digest.
 """
 
 from __future__ import annotations
@@ -22,7 +19,7 @@ from scraper_bot.storage import AddressCache
 
 log = logging.getLogger(__name__)
 
-_MEMORY = 7 * 86_400  # announced addresses are remembered this long, so they are not repeated
+_MEMORY = 7 * 86_400  # how long an announced address is remembered, so it is not announced twice
 _MAX_ENTRIES = 1000
 _DIGEST_PERIOD = 3600.0
 
@@ -133,7 +130,6 @@ class UnverifiedWatcher:
         if changed:
             self._persist()
 
-    # ── internals ───────────────────────────────────────────────────────────
     def _under_cap(self, now: float) -> bool:
         self._alert_times = [stamp for stamp in self._alert_times if now - stamp < 3600]
         return len(self._alert_times) < self._tuning.unverified_max_per_hour

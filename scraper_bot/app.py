@@ -6,8 +6,11 @@ import asyncio
 import logging
 import sys
 import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 
@@ -24,7 +27,7 @@ from scraper_bot.contract_validators import (
     SuiCoinValidator,
 )
 from scraper_bot.enrichment import TokenEnricher
-from scraper_bot.fetcher import BrowserUnavailable, HttpProber, PlaywrightFetcher
+from scraper_bot.fetcher import BrowserUnavailable, HttpProber, PageFetcher, PlaywrightFetcher
 from scraper_bot.html_normalizer import HtmlNormalizer
 from scraper_bot.models import SiteState
 from scraper_bot.monitor_manager import MonitorManager
@@ -32,7 +35,7 @@ from scraper_bot.notifier import Notifier
 from scraper_bot.page_checker import PageChecker
 from scraper_bot.preferences import Preferences
 from scraper_bot.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
-from scraper_bot.status import StatusReporter
+from scraper_bot.status import BrowserHealth, StatusReporter
 from scraper_bot.storage import (
     AddressCache,
     LegacyStateImporter,
@@ -53,6 +56,12 @@ HTTP_USER_AGENT = (
 )
 HEARTBEAT_FILE = "heartbeat"
 
+Sleep = Callable[[float], Awaitable[None]]
+
+
+class Browser(PageFetcher, BrowserHealth, Protocol):
+    """What the runtime needs from the renderer: page fetching plus a health flag."""
+
 
 class Heartbeat:
     """Touches a file periodically so an external supervisor can detect a hung process."""
@@ -70,8 +79,185 @@ class Heartbeat:
             await asyncio.sleep(self._interval)
 
 
+@dataclass(slots=True)
+class Runtime:
+    """The wired bot. :class:`Application` serves it; tests drive its parts directly."""
+
+    manager: MonitorManager
+    turbo: TurboManager
+    commands: BotCommands
+    listener: TelegramListener
+    heartbeat: Heartbeat
+    notifier: Notifier
+
+    async def start(self) -> None:
+        await self.manager.start()
+        sites = self.manager.sites()
+        running = sum(1 for site in sites if self.manager.is_running(site.url))
+        await self.notifier.started(__version__, len(sites), running)
+
+    async def serve(self) -> None:
+        """Start the monitors, then poll Telegram and write heartbeats until cancelled."""
+        await self.start()
+        tasks = [
+            asyncio.create_task(self.listener.run(), name="telegram-listener"),
+            asyncio.create_task(self.heartbeat.run(), name="heartbeat"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self.shutdown()
+
+    async def shutdown(self) -> None:
+        await self.turbo.shutdown()
+        await self.manager.shutdown()
+
+
+def build_runtime(
+    settings: Settings,
+    prefs: Preferences,
+    *,
+    http: httpx.AsyncClient,
+    telegram: TelegramClient,
+    notifier: Notifier,
+    fetcher: Browser,
+    legacy_dir: Path,
+    sleep: Sleep | None = None,
+) -> Runtime:
+    """Wire monitoring, turbo and commands around the given adapters.
+
+    ``sleep`` replaces the pauses between monitor rounds and turbo cycles (tests).
+    """
+    cfg = settings
+    legacy = LegacyStateImporter(legacy_dir)
+    cache = _load_address_cache(cfg, prefs, legacy)
+    validator = ContractValidator(
+        EvmContractValidator(http, cfg.evm_networks, timeout=cfg.rpc_timeout, tuning=prefs),
+        SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout),
+        cache,
+        sui=SuiCoinValidator(http, cfg.sui_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
+        max_concurrent=cfg.max_concurrent_rpc,
+        retry_delay=cfg.rpc_retry_delay,
+        notifier=notifier,
+    )
+    snapshots = SnapshotStore(cfg.data_dir / "snapshots")
+    extractor = AddressExtractor()
+    block_detector = BlockDetector()
+    checker = PageChecker(
+        fetcher=fetcher,
+        normalizer=HtmlNormalizer(cfg.ignored_attributes),
+        detector=ChangeDetector(),
+        extractor=extractor,
+        validator=validator,
+        snapshots=snapshots,
+        tuning=prefs,
+        block_detector=block_detector,
+    )
+    prober = HttpProber(http)
+    deriver = SubUrlDeriver(cfg.sub_url_patterns)
+
+    def build_monitor(
+        site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
+    ) -> SiteMonitor:
+        watcher = UnverifiedWatcher(
+            site, validator=validator, cache=cache, notifier=notifier, persist=persist, tuning=prefs
+        )
+        return SiteMonitor(
+            site,
+            checker=checker,
+            prober=prober,
+            deriver=deriver,
+            notifier=notifier,
+            persist=persist,
+            on_auto_pause=on_auto_pause,
+            tuning=prefs,
+            watcher=watcher,
+            sleep=sleep,
+            page_load_timeout=cfg.page_load_timeout,
+        )
+
+    def build_turbo(
+        url: str, pages: list[str], duration: float, limits: LimitsSource
+    ) -> TurboSession:
+        return TurboSession(
+            url,
+            pages,
+            fetcher=fetcher,
+            extractor=extractor,
+            validator=validator,
+            cache=cache,
+            notifier=notifier,
+            block_detector=block_detector,
+            limits=limits,
+            duration=duration,
+            sleep=sleep,
+        )
+
+    turbo = TurboManager(
+        tuning=prefs,
+        deriver=deriver,
+        prober=prober,
+        session_factory=build_turbo,
+        notifier=notifier,
+    )
+    manager = MonitorManager(
+        state_store=StateStore(cfg.data_dir / "state.json"),
+        snapshot_store=snapshots,
+        deriver=deriver,
+        monitor_factory=build_monitor,
+        legacy_importer=legacy,
+        notifier=notifier,
+    )
+    status = StatusReporter(
+        version=__version__, manager=manager, cache=cache, browser=fetcher, turbo=turbo
+    )
+    commands = BotCommands(
+        manager,
+        telegram,
+        allowed_chat_ids=cfg.allowed_chat_ids,
+        alert_chat_ids=cfg.chat_ids,
+        status_provider=status.render,
+        turbo=turbo,
+        preferences=prefs,
+    )
+    return Runtime(
+        manager=manager,
+        turbo=turbo,
+        commands=commands,
+        listener=TelegramListener(telegram, commands),
+        heartbeat=Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval),
+        notifier=notifier,
+    )
+
+
+def _load_address_cache(
+    settings: Settings, prefs: Preferences, legacy: LegacyStateImporter
+) -> AddressCache:
+    known_path = settings.data_dir / "known_contracts.txt"
+    first_run = not known_path.exists()
+    cache = AddressCache(
+        known_path,
+        settings.data_dir / "rejected_addresses.txt",
+        rejected_ttl=lambda: prefs.rejected_ttl,
+    )
+    cache.load()
+    if first_run and legacy.has_data():
+        imported = cache.import_known(legacy.known_addresses())
+        if imported:
+            log.info("imported %d known contract(s) from found_wallets.txt", imported)
+    log.info(
+        "address cache: %d known contract(s), %d rejected address(es)",
+        cache.known_count,
+        cache.rejected_count,
+    )
+    return cache
+
+
 class Application:
-    """Wires the components together; :meth:`run` blocks until cancelled."""
+    """Owns the process-level resources (HTTP client, browser) and serves a :class:`Runtime`."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -113,132 +299,18 @@ class Application:
                 )
                 raise
             try:
-                await self._run_with(http, telegram, notifier, fetcher)
+                runtime = build_runtime(
+                    cfg,
+                    self._prefs,
+                    http=http,
+                    telegram=telegram,
+                    notifier=notifier,
+                    fetcher=fetcher,
+                    legacy_dir=Path.cwd(),
+                )
+                await runtime.serve()
             finally:
                 await fetcher.stop()
-
-    async def _run_with(
-        self,
-        http: httpx.AsyncClient,
-        telegram: TelegramClient,
-        notifier: Notifier,
-        fetcher: PlaywrightFetcher,
-    ) -> None:
-        cfg, prefs = self._settings, self._prefs
-        legacy = LegacyStateImporter(Path.cwd())
-        cache = self._build_address_cache(legacy)
-        validator = ContractValidator(
-            EvmContractValidator(http, cfg.evm_networks, timeout=cfg.rpc_timeout, tuning=prefs),
-            SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout),
-            cache,
-            max_concurrent=cfg.max_concurrent_rpc,
-            sui=SuiCoinValidator(http, cfg.sui_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
-            retry_delay=cfg.rpc_retry_delay,
-            notifier=notifier,
-        )
-        snapshots = SnapshotStore(cfg.data_dir / "snapshots")
-        extractor = AddressExtractor()
-        block_detector = BlockDetector()
-        checker = PageChecker(
-            fetcher=fetcher,
-            normalizer=HtmlNormalizer(cfg.ignored_attributes),
-            detector=ChangeDetector(),
-            extractor=extractor,
-            validator=validator,
-            snapshots=snapshots,
-            tuning=prefs,
-            block_detector=block_detector,
-        )
-        prober = HttpProber(http)
-        deriver = SubUrlDeriver(cfg.sub_url_patterns)
-
-        def build_monitor(
-            site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
-        ) -> SiteMonitor:
-            watcher = UnverifiedWatcher(
-                site,
-                validator=validator,
-                cache=cache,
-                notifier=notifier,
-                persist=persist,
-                tuning=prefs,
-            )
-            return SiteMonitor(
-                site,
-                checker=checker,
-                prober=prober,
-                deriver=deriver,
-                notifier=notifier,
-                persist=persist,
-                on_auto_pause=on_auto_pause,
-                tuning=prefs,
-                watcher=watcher,
-            )
-
-        def build_turbo(
-            url: str, pages: list[str], duration: float, limits: LimitsSource
-        ) -> TurboSession:
-            return TurboSession(
-                url,
-                pages,
-                fetcher=fetcher,
-                extractor=extractor,
-                validator=validator,
-                cache=cache,
-                notifier=notifier,
-                block_detector=block_detector,
-                limits=limits,
-                duration=duration,
-            )
-
-        turbo = TurboManager(
-            tuning=prefs,
-            deriver=deriver,
-            prober=prober,
-            session_factory=build_turbo,
-            notifier=notifier,
-        )
-
-        manager = MonitorManager(
-            state_store=StateStore(cfg.data_dir / "state.json"),
-            snapshot_store=snapshots,
-            deriver=deriver,
-            monitor_factory=build_monitor,
-            legacy_importer=legacy,
-            notifier=notifier,
-        )
-        await manager.start()
-        sites = manager.sites()
-        await notifier.started(
-            __version__, len(sites), sum(1 for site in sites if manager.is_running(site.url))
-        )
-
-        status = StatusReporter(
-            version=__version__, manager=manager, cache=cache, browser=fetcher, turbo=turbo
-        )
-        commands = BotCommands(
-            manager,
-            telegram,
-            allowed_chat_ids=cfg.allowed_chat_ids,
-            alert_chat_ids=cfg.chat_ids,
-            status_provider=status.render,
-            turbo=turbo,
-            preferences=prefs,
-        )
-        listener = TelegramListener(telegram, commands)
-        heartbeat = Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval)
-        tasks = [
-            asyncio.create_task(listener.run(), name="telegram-listener"),
-            asyncio.create_task(heartbeat.run(), name="heartbeat"),
-        ]
-        try:
-            await asyncio.gather(*tasks)
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await turbo.shutdown()
-            await manager.shutdown()
 
     @staticmethod
     async def _check_token(telegram: TelegramClient) -> None:
@@ -248,27 +320,6 @@ class Application:
             log.warning("could not verify the Telegram token now; continuing anyway")
         else:
             log.info("Telegram bot @%s (id %s)", profile.get("username"), profile.get("id"))
-
-    def _build_address_cache(self, legacy: LegacyStateImporter) -> AddressCache:
-        cfg = self._settings
-        known_path = cfg.data_dir / "known_contracts.txt"
-        first_run = not known_path.exists()
-        cache = AddressCache(
-            known_path,
-            cfg.data_dir / "rejected_addresses.txt",
-            rejected_ttl=lambda: self._prefs.rejected_ttl,
-        )
-        cache.load()
-        if first_run and legacy.has_data():
-            imported = cache.import_known(legacy.known_addresses())
-            if imported:
-                log.info("imported %d known contract(s) from found_wallets.txt", imported)
-        log.info(
-            "address cache: %d known contract(s), %d rejected address(es)",
-            cache.known_count,
-            cache.rejected_count,
-        )
-        return cache
 
 
 def configure_logging(settings: Settings) -> None:

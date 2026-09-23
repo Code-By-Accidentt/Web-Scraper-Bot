@@ -1,5 +1,6 @@
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from scraper_bot.turbo import (
     TurboManager,
     TurboNotRunning,
     TurboSession,
+    TurboStats,
 )
 from scraper_bot.urls import SubUrlDeriver
 from tests.conftest import (
@@ -58,8 +60,11 @@ class Harness:
         limits: LimitsSource = LIMITS,
         duration: float = 60.0,
         real_clock: bool = False,
+        pages: list[str] | None = None,
+        fetcher: FakeFetcher | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
-        self.fetcher = FakeFetcher()
+        self.fetcher = fetcher or FakeFetcher()
         self.validator = FakeValidator()
         self.notifier = FakeNotifier()
         self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
@@ -67,7 +72,7 @@ class Harness:
         self.now = 1_000.0
         self.session = TurboSession(
             ROOT,
-            [ROOT],
+            pages or [ROOT],
             fetcher=self.fetcher,
             extractor=AddressExtractor(),
             validator=self.validator,  # type: ignore[arg-type]
@@ -77,7 +82,21 @@ class Harness:
             limits=limits,
             duration=duration,
             clock=time.time if real_clock else (lambda: self.now),
+            sleep=sleep,
         )
+
+
+async def instant(_seconds: float) -> None:
+    """Stand-in for the between-cycle pause: yields once, sleeps for nothing."""
+    await asyncio.sleep(0)
+
+
+async def wait_for_cycles(session: TurboSession, count: int) -> None:
+    for _ in range(400):
+        if session.stats.cycles >= count:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"session did not reach {count} cycle(s)")
 
 
 async def test_new_address_is_announced_then_confirmed_and_ends_the_session(tmp_path) -> None:
@@ -274,6 +293,31 @@ async def test_manager_schedules_and_cancels_sessions() -> None:
         await manager.shutdown()
 
 
+class StubbornSession(StubTurboSession):
+    """Ignores request_stop(), like a session stuck in a long render."""
+
+    def request_stop(self) -> None:
+        self.stop_reason = "stopped manually"
+
+
+async def test_cancelling_a_pending_stop_is_not_swallowed() -> None:
+    manager = TurboManager(
+        tuning=manager_tuning(),
+        deriver=SubUrlDeriver(()),
+        prober=FakeProber(),
+        session_factory=StubbornSession,
+    )
+    try:
+        await manager.start(ROOT)
+        stopping = asyncio.create_task(manager.stop(ROOT))
+        await asyncio.sleep(0)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+    finally:
+        await manager.shutdown()
+
+
 class SlowProber(FakeProber):
     """Probe that takes a moment, opening the launch window a concurrent /turbo could abuse."""
 
@@ -340,5 +384,205 @@ async def test_zero_minutes_is_clamped_to_the_minimum() -> None:
     try:
         session = await manager.start(ROOT, 0)
         assert session.duration == 60
+    finally:
+        await manager.shutdown()
+
+
+# ── TurboSession: pacing, skipped pages and properties ──────────────────────
+async def test_recheck_interval_is_honoured(tmp_path) -> None:
+    limits = replace(LIMITS, recheck_interval=5.0, stop_after=0)
+    h = Harness(tmp_path, limits=limits, duration=600.0, sleep=instant)
+    h.fetcher.html(ROOT, WITH_ADDRESS)
+    task = asyncio.create_task(h.session.run())
+    try:
+        await wait_for_cycles(h.session, 3)
+        assert h.validator.calls == [[ADDRESS]]  # never checked before: due at once
+        h.now += 4
+        await wait_for_cycles(h.session, h.session.stats.cycles + 2)
+        assert len(h.validator.calls) == 1  # 4 s is less than the recheck interval
+        h.now += 1
+        await wait_for_cycles(h.session, h.session.stats.cycles + 2)
+        assert h.validator.calls == [[ADDRESS], [ADDRESS]]
+        await wait_for_cycles(h.session, h.session.stats.cycles + 2)
+        assert len(h.validator.calls) == 2  # the clock stood still again
+    finally:
+        h.session.request_stop()
+        await asyncio.wait_for(task, timeout=2)
+
+
+async def test_fetch_errors_inside_a_cycle_are_skipped(tmp_path) -> None:
+    docs, app = "https://example.com/docs", "https://app.example.com"
+    h = Harness(tmp_path, pages=[ROOT, docs, app])
+    h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
+    h.fetcher.script(docs, FetchResult(docs, None, error="Timeout 30000ms exceeded"))
+    h.fetcher.html(app, WITH_TWO, status=500)  # server error: no block, not scanned either
+    h.validator.confirm(ADDRESS, "Base")
+    stats = await h.session.run()
+    assert stats.stop_reason == "found 1 confirmed contract(s)"
+    assert (stats.cycles, stats.renders) == (2, 6)
+    assert h.notifier.unverified == [(ADDRESS, ROOT)]
+    assert h.validator.calls == [[ADDRESS]]  # the addresses on the 500 page were never seen
+    assert h.fetcher.calls.count(docs) == 2 and h.fetcher.calls.count(app) == 2
+
+
+class SlowFetcher(FakeFetcher):
+    """Every render takes longer than the turbo interval."""
+
+    async def fetch(self, url: str) -> FetchResult:
+        await asyncio.sleep(0.02)
+        return await super().fetch(url)
+
+
+async def test_slow_cycle_does_not_sleep(tmp_path) -> None:
+    pauses: list[float] = []
+
+    async def record(seconds: float) -> None:
+        pauses.append(seconds)
+        if len(pauses) == 2:
+            session.request_stop()
+
+    slow = Harness(tmp_path, fetcher=SlowFetcher(), sleep=record)  # 0.01 s interval, 0.02 s render
+    session = slow.session
+    slow.fetcher.html(ROOT, EMPTY)
+    stats = await session.run()
+    assert stats.cycles == 2 and stats.stop_reason == "stopped manually"
+    assert pauses == [0.0, 0.0]
+
+    pauses.clear()
+    fast = Harness(tmp_path, limits=replace(LIMITS, interval=1.0), sleep=record)
+    session = fast.session
+    fast.fetcher.html(ROOT, EMPTY)
+    await session.run()
+    assert len(pauses) == 2 and all(0.5 < pause <= 1.0 for pause in pauses)  # the remainder
+
+
+async def test_real_session_properties(tmp_path) -> None:
+    docs = "https://example.com/docs"
+    limits = replace(LIMITS, stop_after=0)
+    h = Harness(tmp_path, limits=limits, duration=120.0, pages=[ROOT, docs], sleep=instant)
+    assert h.session.url == ROOT
+    pages = h.session.pages
+    pages.append("https://example.com/evil")
+    assert h.session.pages == [ROOT, docs]  # a copy, not the session's own list
+    assert h.session.limits == limits
+    assert h.session.seconds_left == 120.0  # not started yet: the whole duration
+    assert h.session.stats.started_at is None and h.session.stats.deadline is None
+
+    h.fetcher.html(ROOT, EMPTY)
+    h.fetcher.html(docs, EMPTY)
+    task = asyncio.create_task(h.session.run())
+    await wait_for_cycles(h.session, 1)
+    assert (h.session.stats.started_at, h.session.stats.deadline) == (1000.0, 1120.0)
+    assert h.session.seconds_left == 120.0
+    h.now += 45
+    assert h.session.seconds_left == 75.0
+    h.now += 100  # past the deadline: never negative, and the session notices by itself
+    assert h.session.seconds_left == 0.0
+    stats = await asyncio.wait_for(task, timeout=2)
+    assert stats.stop_reason == "time limit reached"
+    assert stats.renders == 2 * stats.cycles
+
+
+# ── TurboManager with real sessions, crashes and cancelled timers ───────────
+class RealSessions:
+    """Session factory building real TurboSession objects over the shared fakes."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.fetcher = FakeFetcher()
+        self.validator = FakeValidator()
+        self.notifier = FakeNotifier()
+        self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+        self.cache.load()
+
+    def __call__(
+        self, url: str, pages: list[str], duration: float, limits: LimitsSource
+    ) -> TurboSession:
+        return TurboSession(
+            url,
+            pages,
+            fetcher=self.fetcher,
+            extractor=AddressExtractor(),
+            validator=self.validator,  # type: ignore[arg-type]
+            cache=self.cache,
+            notifier=self.notifier,  # type: ignore[arg-type]
+            block_detector=BlockDetector(),
+            limits=limits,
+            duration=duration,
+        )
+
+
+async def test_real_session_is_cancelled_on_shutdown(tmp_path) -> None:
+    factory = RealSessions(tmp_path)
+    factory.fetcher.html(ROOT, EMPTY)
+    manager = TurboManager(
+        tuning=manager_tuning(),
+        deriver=SubUrlDeriver(()),
+        prober=FakeProber(),
+        session_factory=factory,
+        notifier=factory.notifier,  # type: ignore[arg-type]
+    )
+    session = await manager.start(ROOT)
+    assert isinstance(session, TurboSession)
+    await wait_for_cycles(session, 1)  # now waiting out the 2 s interval
+    await manager.shutdown()
+    await asyncio.sleep(0)  # lets the task's done-callback run
+    assert session.stats.stop_reason == "bot is shutting down"
+    assert factory.notifier.turbo_finished_calls == [(ROOT, "bot is shutting down", 0)]
+    assert manager.active() == [] and manager.scheduled() == []
+    assert factory.notifier.problems == []  # a cancellation is not a crash
+
+
+class CrashingSession(StubTurboSession):
+    async def run(self) -> TurboStats:
+        raise RuntimeError("renderer died")
+
+
+async def test_crashed_session_is_reported_as_a_problem() -> None:
+    notifier = FakeNotifier()
+    manager = TurboManager(
+        tuning=manager_tuning(),
+        deriver=SubUrlDeriver(()),
+        prober=FakeProber(),
+        session_factory=CrashingSession,
+        notifier=notifier,  # type: ignore[arg-type]
+    )
+    try:
+        await manager.start(ROOT)
+        for _ in range(100):
+            if notifier.problems:
+                break
+            await asyncio.sleep(0.005)
+        assert [(key, detail) for key, _, detail, _ in notifier.problems] == [
+            (f"turbo:{ROOT}", "RuntimeError: renderer died")
+        ]
+        _, title, _, hint = notifier.problems[0]
+        assert ROOT in title and hint is not None and "/turbo" in hint
+        assert manager.active() == []
+        assert isinstance(await manager.start(ROOT), CrashingSession)  # the slot is free again
+    finally:
+        await manager.shutdown()
+
+
+async def test_cancelling_a_scheduled_plan_clears_the_timer() -> None:
+    prober = FakeProber()
+    manager = TurboManager(
+        tuning=manager_tuning(),
+        deriver=SubUrlDeriver(("https://app.{domain}",)),
+        prober=prober,
+        session_factory=StubTurboSession,
+        sleep=lambda seconds: asyncio.sleep(seconds / 100),
+    )
+    try:
+        plan = await manager.start(ROOT, 5, start_at=time.time() + 2)
+        assert isinstance(plan, ScheduledTurbo)
+        timers = [t for t in asyncio.all_tasks() if t.get_name() == f"turbo-timer:{ROOT}"]
+        assert len(timers) == 1
+        await manager.stop(ROOT)
+        assert manager.scheduled() == []
+        await asyncio.sleep(0.05)  # well past the (scaled) start time
+        assert timers[0].cancelled()
+        assert prober.calls == [] and manager.active() == []  # nothing was launched
+        assert not any(t.get_name() == f"turbo:{ROOT}" for t in asyncio.all_tasks())
+        assert isinstance(await manager.start(ROOT), StubTurboSession)  # the slot is free
     finally:
         await manager.shutdown()

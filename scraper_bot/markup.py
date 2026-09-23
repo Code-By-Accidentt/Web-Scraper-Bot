@@ -1,8 +1,7 @@
-"""Telegram HTML formatting helpers.
+"""Telegram HTML helpers.
 
-Every message the bot sends uses Telegram's HTML parse mode, so every dynamic
-value (URLs, page text, error messages) must pass through :func:`escape`, and
-things people copy (commands, addresses, chat ids) are wrapped in :func:`code`.
+Every message uses HTML parse mode, so dynamic values go through :func:`escape` and
+things people copy (commands, addresses, chat ids) through :func:`code`.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ def code(value: object) -> str:
 
 
 def pre(value: object) -> str:
-    """Monospace block for multi-line quotes."""
     return f"<pre>{escape(value)}</pre>"
 
 

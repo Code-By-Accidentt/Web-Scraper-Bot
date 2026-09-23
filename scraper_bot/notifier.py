@@ -47,10 +47,7 @@ class Notifier:
         )
 
     async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
-        """Report an operational failure, at most once per cooldown for the same ``key``.
-
-        Returns True when the message was sent, False when it was suppressed.
-        """
+        """Report a failure at most once per cooldown per ``key``; False when suppressed."""
         now = self._clock()
         last = self._problems.get(key)
         if last is not None and now - last < self._problem_cooldown:
@@ -74,6 +71,20 @@ class Notifier:
 
     async def page_changed(self, report: ChangeReport) -> None:
         await self._send(self.format_report(report, self._max_examples()))
+
+    async def page_timing_out(
+        self, page_url: str, streak: int, reason: str, timeout: float
+    ) -> None:
+        await self._send(
+            f"🐢 {escape(page_url)} has not rendered {streak} times in a row ({escape(reason)}).\n"
+            f"Load timeout for this page raised to {timeout:.0f}s; "
+            f"you will hear when it renders again."
+        )
+
+    async def page_renders_again(self, page_url: str, timeout: float) -> None:
+        await self._send(
+            f"✅ {escape(page_url)} renders again; load timeout back to {timeout:.0f}s."
+        )
 
     async def contract_found(self, contract: ConfirmedContract, page_url: str) -> None:
         await self._send(
@@ -232,7 +243,7 @@ class Notifier:
 
 
 def describe_token(info: TokenInfo, now: float) -> list[str]:
-    """Lines for a token alert; unknown parts are simply left out."""
+    """Lines for a token alert; unknown parts are left out."""
     lines: list[str] = []
     if info.coin_type:
         lines.append(f"Coin type: {code(info.coin_type)}")

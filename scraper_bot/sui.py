@@ -14,7 +14,7 @@ from typing import Any
 from scraper_bot.rpc import JsonRpcClient
 
 COIN_CHECK_BATCH = 8  # metadata lookups in flight per package
-MAX_COIN_CANDIDATES = 128  # structs of one package ever tried as coin types
+MAX_COIN_CANDIDATES = 128  # at most this many structs per package are tried as coin types
 
 
 async def object_kind(client: JsonRpcClient, address: str) -> str:

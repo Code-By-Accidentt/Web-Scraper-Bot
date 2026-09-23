@@ -1,4 +1,8 @@
+import logging
+import re
+
 import httpx
+import pytest
 
 from scraper_bot.telegram_client import TelegramClient
 
@@ -152,3 +156,101 @@ async def test_other_api_errors_do_not_trigger_the_fallback() -> None:
     async with http:
         assert await client.send_message(5, "<code>x</code>") is False
     assert calls == 1
+
+
+async def test_token_never_appears_in_logs(caplog: pytest.LogCaptureFixture) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("offset") == "1":
+            return httpx.Response(500, text=f"gateway error for {request.url}")
+        raise httpx.ConnectError(f"cannot reach {request.url}", request=request)
+
+    client, http = make_client(handler)
+    with caplog.at_level(logging.WARNING, logger="scraper_bot.telegram_client"):
+        async with http:
+            assert await client.send_message(1, "hi") is False
+            assert await client.get_updates(None, 30) is None
+            assert await client.get_updates(1, 30) is None
+            assert await client.get_me() is None
+    messages = [r.getMessage() for r in caplog.records if r.name == "scraper_bot.telegram_client"]
+    assert len(messages) == 4
+    assert all("<token>" in message for message in messages)
+    assert all("secret" not in message for message in messages)
+    assert messages[0].startswith("sendMessage failed: ConnectError: cannot reach")
+    assert messages[2].startswith("getUpdates HTTP 500: gateway error for")
+    assert messages[3].startswith("getMe failed: cannot reach")
+
+
+async def test_long_text_without_newlines_is_hard_cut_at_4096() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(form(request)["text"])
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client, http = make_client(handler)
+    limit = TelegramClient.MAX_MESSAGE_LENGTH
+    async with http:
+        assert await client.send_message(1, "a" * (limit + 100))
+        assert seen == ["a" * limit, "a" * 100]
+        seen.clear()
+        # A newline in the first half is too early to be a useful cut point.
+        text = "head\n" + "b" * (limit + 5)
+        assert await client.send_message(1, text)
+    assert [len(chunk) for chunk in seen] == [limit, 10]
+    assert "".join(seen) == text
+
+
+async def test_get_updates_handles_http_errors_and_invalid_json() -> None:
+    responses = [
+        httpx.Response(502, text="<html>Bad Gateway</html>"),
+        httpx.Response(200, text="<html>not json</html>"),
+        httpx.Response(200, json={"ok": True}),  # no result field
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.get_updates(None, 30) is None
+        assert await client.get_updates(None, 30) is None
+        assert await client.get_updates(None, 30) == []
+
+
+async def test_get_me_with_invalid_json_returns_none() -> None:
+    responses = [
+        httpx.Response(200, text="<html>maintenance</html>"),
+        httpx.Response(200, json={"ok": True, "result": "not a dict"}),
+        httpx.Response(200, json={"ok": False, "description": "nope"}),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return responses.pop(0)
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.get_me() is None
+        assert await client.get_me() is None
+        assert await client.get_me() is None
+
+
+async def test_broadcast_and_broadcast_document_reach_every_chat() -> None:
+    messages: list[str] = []
+    documents: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/sendMessage"):
+            messages.append(form(request)["chat_id"])
+        else:
+            assert request.url.path.endswith("/sendDocument")
+            documents.append(request.content)
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client, http = make_client(handler)
+    async with http:
+        await client.broadcast([1, 2, 3], "hello")
+        await client.broadcast_document([4, 5], "c.txt", b"0xabc\n", "caption")
+    assert sorted(messages) == ["1", "2", "3"]
+    chat_ids = {re.search(rb'name="chat_id"\r\n\r\n(\d+)\r\n', body)[1] for body in documents}
+    assert chat_ids == {b"4", b"5"}
+    assert all(b'filename="c.txt"' in body and b"0xabc" in body for body in documents)

@@ -65,3 +65,11 @@ def test_canvas_is_ignored_because_scripts_resize_it() -> None:
     with_size = "<div><canvas width='1266' height='340'></canvas><p>chart</p></div>"
     without_size = "<div><canvas></canvas><p>chart</p></div>"
     assert sig(with_size) == sig(without_size) == (node("p", "chart"),)
+
+
+def test_comment_only_or_unparsable_document_gives_empty_signature() -> None:
+    assert sig("<!-- nothing but a comment -->") == ()
+    assert sig("<?xml version='1.0'?>") == ()
+    assert sig("<!DOCTYPE html>") == ()
+    assert sig("<html></html>") == ()
+    assert sig("﻿") == ()  # a lone byte-order mark is invisible text

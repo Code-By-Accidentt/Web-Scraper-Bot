@@ -1,4 +1,4 @@
-"""Finding candidate contract addresses in raw page HTML."""
+"""Finding candidate contract addresses in page text: HTML, frames, scripts, API bodies."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ _SUI_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _SUI_COIN_TYPE_FULL_RE = re.compile(rf"^0x[0-9a-fA-F]{{1,64}}::{_MOVE_IDENT}::{_MOVE_IDENT}$")
 _HEX_ONLY_RE = re.compile(r"^[0-9a-fA-F]+$")
 # Package ids below this value are the Move stdlib, the Sui framework and system
-# packages (0x1, 0x2, 0x3, 0xdee9, ...): their coins, e.g. 0x2::sui::SUI, are no launch.
+# packages (0x1, 0x2, 0x3, 0xdee9, ...): their coins, e.g. 0x2::sui::SUI, are never a launch.
 _SUI_RESERVED_PACKAGES = 0x10000
 
 
@@ -66,7 +66,6 @@ def is_solana_address(text: str) -> bool:
 
 
 def is_sui_address(text: str) -> bool:
-    """A bare 32-byte Sui id: ``0x`` and 64 hex digits."""
     return bool(_SUI_HEX_RE.match(text))
 
 
@@ -99,12 +98,12 @@ def normalize_sui(raw: str) -> str | None:
 
 
 def canonical_address(chain: Chain, raw: str) -> Address | None:
-    """Validate ``raw`` for ``chain`` and return it in canonical form."""
+    """``None`` unless ``raw`` is a valid address of ``chain`` (EVM ones come back checksummed)."""
     if chain is Chain.ETHEREUM:
         return Address(chain, to_checksum_address(raw)) if is_evm_address(raw) else None
     if chain is Chain.SOLANA:
         if _HEX_ONLY_RE.match(raw):
-            return None  # a run of hex digits out of some 0x... id, never a real key
+            return None  # all-hex text is a slice of some 0x... id, not a base58 key
         return Address(chain, raw) if is_solana_address(raw) else None
     if chain is Chain.SUI:
         value = normalize_sui(raw)

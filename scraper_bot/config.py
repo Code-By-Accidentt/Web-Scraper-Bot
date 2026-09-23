@@ -1,7 +1,6 @@
-"""Application settings.
+"""Process-level settings, read once from the environment and ``.env``.
 
-Everything configurable lives in :class:`Settings`, which is built once from the
-process environment (plus an optional ``.env`` file) by :meth:`Settings.from_env`.
+Knobs that may change at runtime are layered on top by :mod:`scraper_bot.preferences`.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class EvmNetwork:
-    """One EVM-compatible chain queried while validating ``0x`` addresses."""
+    """One EVM-compatible chain queried while validating 20-byte ``0x`` addresses."""
 
     name: str
     rpc_url: str
@@ -86,6 +85,7 @@ class Settings:
     page_load_timeout: float
     network_idle_timeout: float
     settle_delay: float
+    render_failure_threshold: int
     confirm_delay: float
     contract_pause_threshold: int
     sub_url_patterns: tuple[str, ...]
@@ -141,10 +141,7 @@ class Settings:
         env: Mapping[str, str] | None = None,
         dotenv_path: str | os.PathLike[str] | None = ".env",
     ) -> Settings:
-        """Build settings from ``env`` (default: ``os.environ``) layered over ``.env``.
-
-        Real environment variables win over values from the ``.env`` file.
-        """
+        """Settings from ``env`` (default ``os.environ``) over ``.env``; real variables win."""
         merged: dict[str, str] = {}
         if dotenv_path is not None and Path(dotenv_path).is_file():
             merged.update({k: v for k, v in dotenv_values(dotenv_path).items() if v is not None})
@@ -155,8 +152,8 @@ class Settings:
         if not token:
             raise ConfigError("TELEGRAM_BOT_TOKEN is required (get one from @BotFather)")
 
-        poll_min = reader.number("POLL_INTERVAL_MIN", 5.0, minimum=1.0)
-        poll_max = reader.number("POLL_INTERVAL_MAX", 15.0, minimum=1.0)
+        poll_min = reader.number("POLL_INTERVAL_MIN", 4.0, minimum=1.0)
+        poll_max = reader.number("POLL_INTERVAL_MAX", 10.0, minimum=1.0)
         if poll_max < poll_min:
             raise ConfigError("POLL_INTERVAL_MAX must be >= POLL_INTERVAL_MIN")
 
@@ -175,10 +172,11 @@ class Settings:
             allowed_chat_ids=reader.int_list("TELEGRAM_ALLOWED_CHAT_IDS"),
             poll_interval_min=poll_min,
             poll_interval_max=poll_max,
-            max_concurrent_pages=reader.integer("MAX_CONCURRENT_PAGES", 6, minimum=1),
-            page_load_timeout=reader.number("PAGE_LOAD_TIMEOUT", 30.0, minimum=1.0),
-            network_idle_timeout=reader.number("NETWORK_IDLE_TIMEOUT", 4.0, minimum=0.0),
-            settle_delay=reader.number("SETTLE_DELAY", 0.5, minimum=0.0),
+            max_concurrent_pages=reader.integer("MAX_CONCURRENT_PAGES", 8, minimum=1),
+            page_load_timeout=reader.number("PAGE_LOAD_TIMEOUT", 20.0, minimum=1.0),
+            network_idle_timeout=reader.number("NETWORK_IDLE_TIMEOUT", 2.0, minimum=0.0),
+            settle_delay=reader.number("SETTLE_DELAY", 0.25, minimum=0.0),
+            render_failure_threshold=reader.integer("RENDER_FAILURE_THRESHOLD", 5, minimum=0),
             confirm_delay=reader.number("CONFIRM_DELAY", 2.0, minimum=0.0),
             contract_pause_threshold=reader.integer("CONTRACT_PAUSE_THRESHOLD", 5, minimum=1),
             sub_url_patterns=reader.text_list("SUB_URL_PATTERNS", DEFAULT_SUB_URL_PATTERNS),
@@ -187,12 +185,12 @@ class Settings:
                 for a in reader.text_list("IGNORED_ATTRIBUTES", DEFAULT_IGNORED_ATTRIBUTES)
             ),
             max_change_examples=reader.integer("MAX_CHANGE_EXAMPLES", 5, minimum=0),
-            enrich_timeout=reader.number("ENRICH_TIMEOUT", 3.0, minimum=0.0),
+            enrich_timeout=reader.number("ENRICH_TIMEOUT", 2.0, minimum=0.0),
             flap_window=reader.number("FLAP_WINDOW_HOURS", 24.0, minimum=0.0) * 3600.0,
             flap_threshold=reader.integer("FLAP_THRESHOLD", 2, minimum=1),
             deep_scan=reader.flag("DEEP_SCAN", True),
             deep_scan_max_bytes=int(
-                reader.number("DEEP_SCAN_MAX_MB", 10.0, minimum=0.0) * 1024 * 1024
+                reader.number("DEEP_SCAN_MAX_MB", 5.0, minimum=0.0) * 1024 * 1024
             ),
             turbo_interval=reader.number("TURBO_INTERVAL", 2.0, minimum=1.0),
             turbo_default_minutes=reader.number("TURBO_DEFAULT_MINUTES", 30.0, minimum=1.0),
@@ -214,7 +212,7 @@ class Settings:
             solana_rpc_url=reader.text("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
             sui_rpc_url=reader.text("SUI_RPC_URL", "https://sui-rpc.publicnode.com"),
             require_erc20=reader.flag("REQUIRE_ERC20", True),
-            rpc_timeout=reader.number("RPC_TIMEOUT", 8.0, minimum=1.0),
+            rpc_timeout=reader.number("RPC_TIMEOUT", 5.0, minimum=1.0),
             max_concurrent_rpc=reader.integer("MAX_CONCURRENT_RPC", 8, minimum=1),
             rejected_ttl=reader.number("REJECTED_TTL_HOURS", 6.0, minimum=0.0) * 3600.0,
             rpc_retry_delay=reader.number("RPC_RETRY_DELAY", 600.0, minimum=0.0),

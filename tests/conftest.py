@@ -37,6 +37,7 @@ class FakeTuning:
     confirm_delay: float = 2.0
     network_idle_timeout: float = 0.0
     settle_delay: float = 0.0
+    render_failure_threshold: int = 5
     require_erc20: bool = True
     contract_pause_threshold: int = 5
     rejected_ttl: float = 0.0
@@ -80,9 +81,12 @@ def node(tag: str, text: str = "", **attrs: str) -> Node:
 class FakeFetcher:
     """Returns scripted results per URL; the last scripted result repeats forever."""
 
+    is_connected = True  # so it can stand in for the browser behind /status
+
     def __init__(self) -> None:
         self.scripts: dict[str, list[FetchResult]] = defaultdict(list)
         self.calls: list[str] = []
+        self.timeouts: list[float | None] = []  # the ``timeout`` passed to each fetch
 
     def script(self, url: str, *results: FetchResult) -> None:
         self.scripts[url].extend(results)
@@ -103,8 +107,9 @@ class FakeFetcher:
             ),
         )
 
-    async def fetch(self, url: str) -> FetchResult:
+    async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult:
         self.calls.append(url)
+        self.timeouts.append(timeout)
         queue = self.scripts[url]
         if not queue:
             return FetchResult(url, None, error="no scripted response")
@@ -168,6 +173,8 @@ class FakeNotifier:
     def __init__(self) -> None:
         self.discovered: list[str] = []
         self.changes: list[ChangeReport] = []
+        self.timing_out: list[tuple[str, int, str, float]] = []
+        self.renders_again: list[tuple[str, float]] = []
         self.contracts: list[tuple[ConfirmedContract, str]] = []
         self.batches: list[tuple[str, str, tuple[ConfirmedContract, ...]]] = []
         self.paused: list[tuple[str, str, int]] = []
@@ -186,6 +193,14 @@ class FakeNotifier:
 
     async def page_changed(self, report: ChangeReport) -> None:
         self.changes.append(report)
+
+    async def page_timing_out(
+        self, page_url: str, streak: int, reason: str, timeout: float
+    ) -> None:
+        self.timing_out.append((page_url, streak, reason, timeout))
+
+    async def page_renders_again(self, page_url: str, timeout: float) -> None:
+        self.renders_again.append((page_url, timeout))
 
     async def contract_found(self, contract: ConfirmedContract, page_url: str) -> None:
         self.contracts.append((contract, page_url))
@@ -255,9 +270,11 @@ class FakeChecker:
     def __init__(self) -> None:
         self.outcomes: dict[str, PageCheckOutcome] = {}
         self.calls: list[str] = []
+        self.timeouts: list[float | None] = []  # the ``load_timeout`` passed to each check
 
-    async def check(self, page_url: str) -> PageCheckOutcome:
+    async def check(self, page_url: str, *, load_timeout: float | None = None) -> PageCheckOutcome:
         self.calls.append(page_url)
+        self.timeouts.append(load_timeout)
         return self.outcomes.get(page_url, PageCheckOutcome(page_url, PageStatus.UNCHANGED))
 
 

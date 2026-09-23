@@ -22,11 +22,10 @@ class TelegramAuthError(Exception):
 
 
 class TelegramClient:
-    """Thin wrapper over the Bot API that never raises on delivery problems.
+    """Thin Bot API wrapper that never raises on delivery problems.
 
-    Messages are sent with HTML formatting (see :mod:`scraper_bot.markup`). If
-    Telegram rejects the markup of a message, the same text is re-sent as plain
-    text, so a formatting slip never swallows an alert.
+    Messages go out as HTML (:mod:`scraper_bot.markup`); if Telegram rejects the markup
+    the text is re-sent plain, so a formatting slip never swallows an alert.
     """
 
     MAX_MESSAGE_LENGTH = 4096
@@ -83,11 +82,7 @@ class TelegramClient:
         return result if isinstance(result, dict) else None
 
     async def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]] | None:
-        """Long-poll for updates.
-
-        Returns the (possibly empty) list of updates, or ``None`` when the request
-        failed so that the caller can back off instead of polling in a tight loop.
-        """
+        """Long-poll for updates; ``None`` (not ``[]``) on failure so the caller can back off."""
         params: dict[str, Any] = {"timeout": timeout, "allowed_updates": '["message"]'}
         if offset is not None:
             params["offset"] = offset
@@ -114,7 +109,6 @@ class TelegramClient:
             return None
         return list(payload.get("result", []))
 
-    # ── internals ───────────────────────────────────────────────────────────
     async def _send_chunk(self, chat_id: int, chunk: str) -> bool:
         data: dict[str, Any] = {
             "chat_id": chat_id,

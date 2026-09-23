@@ -1,4 +1,4 @@
-"""On-chain validation of candidate addresses (EVM chains and Solana)."""
+"""On-chain validation of candidate addresses (EVM chains, Solana and Sui)."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from scraper_bot.models import (
 )
 from scraper_bot.notifier import Notifier
 from scraper_bot.preferences import Tuning
-from scraper_bot.rpc import JsonRpcClient, RpcError
+from scraper_bot.rpc import JsonRpcClient, RpcCallError, RpcError
 from scraper_bot.solana import account_data, is_mint
 from scraper_bot.storage import AddressCache
 from scraper_bot.sui import coin_metadata, find_coin, object_kind
@@ -29,14 +29,19 @@ from scraper_bot.sui import coin_metadata, find_coin, object_kind
 log = logging.getLogger(__name__)
 
 _EMPTY_CODE = frozenset({"", "0x", "0x0"})
+# JSON-RPC errors that mean the EVM ran the call and it failed: a real "not a token".
+_REVERT_MARKERS = ("revert", "invalid opcode", "out of gas", "vm execution")
 
 
 class RpcUnavailable(Exception):
-    """The endpoints that failed make it impossible to reach a verdict."""
+    """No verdict is possible: at least one endpoint failed."""
 
 
 class EvmContractValidator:
-    """Looks for bytecode (optionally ERC-20 bytecode) on every configured network at once."""
+    """Looks for bytecode on every configured network at once.
+
+    With ``require_erc20`` a contract only counts when it also answers an ERC-20 call.
+    """
 
     def __init__(
         self,
@@ -86,13 +91,23 @@ class EvmContractValidator:
 
     @staticmethod
     async def _answers_erc20(client: JsonRpcClient, address: str) -> bool:
-        """True when the contract returns data for at least one standard ERC-20 call."""
+        """True when the contract returns data for at least one standard ERC-20 call.
+
+        Empty results and EVM reverts are answers ("not a token"). A rate limit or
+        timeout is not: it is re-raised so the network counts as failed, instead of
+        a real token being rejected and cached for hours.
+        """
         calls = (
             client.call("eth_call", [{"to": address, "data": selector}, "latest"])
             for selector in ERC20_PROBE
         )
         answers = await asyncio.gather(*calls, return_exceptions=True)
-        return any(isinstance(a, str) and a.lower() not in _EMPTY_CODE for a in answers)
+        if any(isinstance(a, str) and a.lower() not in _EMPTY_CODE for a in answers):
+            return True
+        for answer in answers:
+            if isinstance(answer, BaseException) and not _is_revert(answer):
+                raise answer
+        return False
 
     def _note_failure(self, name: str, error: RpcError) -> None:
         if name not in self._failing:
@@ -103,6 +118,13 @@ class EvmContractValidator:
         if name in self._failing:
             self._failing.discard(name)
             log.info("RPC endpoint %s recovered", name)
+
+
+def _is_revert(error: BaseException) -> bool:
+    if not isinstance(error, RpcCallError):
+        return False
+    lowered = error.message.lower()
+    return error.code == 3 or any(marker in lowered for marker in _REVERT_MARKERS)
 
 
 class SolanaContractValidator:
@@ -189,9 +211,9 @@ class ContractValidator:
     async def validate(self, address: Address, *, negative_cache: bool = True) -> ValidationResult:
         """Verdict for ``address``.
 
-        With ``negative_cache=False`` (turbo mode) earlier rejections and RPC
-        failures are ignored and a new rejection is not remembered, so an address
-        published before its contract is deployed can be re-checked freely.
+        With ``negative_cache=False`` (turbo and /unverified mode) earlier rejections
+        and RPC failures are ignored and a new rejection is not remembered, so an
+        address published before its contract is deployed can be re-checked freely.
         """
         if self._cache.is_known(address):
             return ValidationResult(address, ValidationStatus.ALREADY_KNOWN)

@@ -1,11 +1,8 @@
-"""Turbo mode: render one site every few seconds to catch a launch the moment it happens.
+"""Turbo mode: render one site every few seconds to catch a launch as it happens.
 
-A :class:`TurboSession` renders the root page plus a few live sub-pages every
-``interval`` seconds and only looks for addresses (change alerts stay with the
-regular monitor). Every address that shows up after the first cycle is announced
-immediately as *unverified* and re-checked on-chain until it is confirmed; the
-session ends after ``stop_after`` confirmed contracts, when the time is up, on a
-manual stop, or when the site starts refusing us.
+Sessions only hunt addresses (change alerts stay with the regular monitor): anything
+new after the first cycle is announced as *unverified* and re-checked on-chain until
+confirmed. A session ends on ``stop_after`` contracts, timeout, /turbo stop or a block.
 """
 
 from __future__ import annotations
@@ -104,6 +101,7 @@ class TurboSession:
         limits: LimitsSource,
         duration: float,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         self._url = url
         self._pages = list(pages)
@@ -116,6 +114,7 @@ class TurboSession:
         self._limits_source = limits
         self._duration = duration
         self._clock = clock
+        self._sleep = sleep  # tests replace the stop-aware pause with an instant one
         self._stats = TurboStats()
         self._stop = asyncio.Event()
         self._seen: set[Address] = set()
@@ -192,7 +191,6 @@ class TurboSession:
                 )
         return stats
 
-    # ── internals ───────────────────────────────────────────────────────────
     async def _cycle(self) -> BlockSignal | None:
         results = await asyncio.gather(*(self._fetcher.fetch(page) for page in self._pages))
         self._stats.cycles += 1
@@ -250,6 +248,9 @@ class TurboSession:
                 self._watch[address] = now
 
     async def _pause(self, seconds: float) -> None:
+        if self._sleep is not None:
+            await self._sleep(max(seconds, 0.0))
+            return
         if seconds <= 0:
             await asyncio.sleep(0)
             return
@@ -340,8 +341,9 @@ class TurboManager:
         if session is None or task is None or task.done():
             raise TurboNotRunning(url)
         session.request_stop()
-        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), timeout=15)
+        # asyncio.wait never raises for the session's own outcome, and it lets a
+        # cancellation of the caller (Ctrl-C during /turbo stop) through.
+        await asyncio.wait({task}, timeout=15)
         return url
 
     async def shutdown(self) -> None:
@@ -351,7 +353,6 @@ class TurboManager:
         await asyncio.gather(*tasks, return_exceptions=True)
         self._scheduled.clear()
 
-    # ── internals ───────────────────────────────────────────────────────────
     def _is_busy(self, url: str) -> bool:
         task = self._tasks.get(url)
         return (
@@ -361,7 +362,7 @@ class TurboManager:
         )
 
     def _reserved_count(self) -> int:
-        """Sessions that occupy a slot: running, waiting for their start time, or launching."""
+        """Everything that holds a ``max_sites`` slot."""
         return len(self.active()) + len(self._scheduled) + len(self._launching)
 
     async def _start_later(self, plan: ScheduledTurbo) -> None:
@@ -370,7 +371,8 @@ class TurboManager:
         except asyncio.CancelledError:
             self._scheduled.pop(plan.url, None)
             raise
-        # No await between dropping the timer entry and reserving the launch slot.
+        # No await between dropping the timer entry and _launch reserving the slot, so a
+        # concurrent /turbo cannot slip in.
         self._scheduled.pop(plan.url, None)
         await self._launch(plan.url, plan.minutes * 60)
 

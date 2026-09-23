@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python)
 
-Telegram-controlled watcher that renders websites in a headless browser, reports **confirmed changes** of their content and hunts for **smart-contract addresses** (EVM + Solana), validating every candidate on-chain before it bothers you.
+Telegram-controlled watcher that renders websites in a headless browser, reports **confirmed changes** of their content and hunts for **smart-contract addresses** (EVM, Solana and Sui), validating every candidate on-chain before it bothers you.
 
 ---
 
@@ -40,12 +40,14 @@ scraper_bot/
   turbo.py                  # turbo sessions and their manager (/turbo)
   unverified.py             # report-first mode: announce, then confirm on-chain
   preferences.py            # runtime settings registry: validation, persistence, /settings
-  timefmt.py                # duration formatting
+  timefmt.py                # time and duration formatting
   address_extractor.py      # regex + syntactic validation (EIP-55, base58)
   contract_validators.py    # EVM / Solana / Sui RPC checks + caching facade
   enrichment.py             # token details: on-chain metadata, DexScreener, explorer/DEX links
   rpc.py                    # tiny JSON-RPC client
   sui.py                    # Sui RPC helpers: coin metadata, packages, coin discovery
+  solana.py                 # Solana account layouts shared by validator and enricher
+  evm.py                    # ERC-20 selectors shared by validator and enricher
   page_checker.py           # per-page pipeline: render -> contracts -> diff
   site_monitor.py           # loop for one root site and its sub-pages
   monitor_manager.py        # add / remove / pause / resume, task lifecycle
@@ -97,12 +99,13 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `TELEGRAM_BOT_TOKEN` | – | **Required.** Token from [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_CHAT_IDS` | – | Comma separated chats that receive alerts |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty = everyone | Chats allowed to send commands |
-| `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX` | 5 / 15 | Seconds between two rounds of one site (random within the range) |
-| `MAX_CONCURRENT_PAGES` | 6 | Browser tabs rendered at the same time |
-| `PAGE_LOAD_TIMEOUT` / `NETWORK_IDLE_TIMEOUT` / `SETTLE_DELAY` | 30 / 4 / 0.5 | Rendering timing, seconds (measured: pages go idle in ~1 s, 0.5 s settle gives identical output) |
+| `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX` | 4 / 10 | Seconds between two rounds of one site (random within the range); a round itself takes about 2 s |
+| `MAX_CONCURRENT_PAGES` | 8 | Browser tabs rendered at the same time |
+| `PAGE_LOAD_TIMEOUT` / `NETWORK_IDLE_TIMEOUT` / `SETTLE_DELAY` | 20 / 2 / 0.25 | Rendering timing, seconds (measured: pages go idle in ~0.8 s, 0.25 s settle gives the same output as 0.5 s; a page that never goes idle costs the full idle cap per render) |
+| `RENDER_FAILURE_THRESHOLD` | 5 | Load timeouts in a row that flag a page: one alert, its load timeout is doubled (up to 3×) until it renders again; 0 = off |
 | `CONFIRM_DELAY` | 2 | Seconds between the two renders that confirm a change |
 | `FLAP_WINDOW_HOURS` / `FLAP_THRESHOLD` | 24 / 2 | Silence an element after it alerted `FLAP_THRESHOLD` times within the window (0 hours = off) |
-| `DEEP_SCAN` / `DEEP_SCAN_MAX_MB` | true / 10 | Also search iframes, shadow DOM and the scripts/JSON the page loaded; byte budget per render |
+| `DEEP_SCAN` / `DEEP_SCAN_MAX_MB` | true / 5 | Also search iframes, shadow DOM and the scripts/JSON the page loaded; byte budget per render (5 MB of JS take about 0.8 s to scan) |
 | `TURBO_INTERVAL` / `TURBO_DEFAULT_MINUTES` / `TURBO_MAX_MINUTES` | 2 / 30 / 180 | Seconds between turbo renders, default and maximum session length |
 | `TURBO_STOP_AFTER` / `TURBO_MAX_SITES` / `TURBO_MAX_PAGES` / `TURBO_RECHECK_INTERVAL` | 1 / 1 / 4 / 5 | Confirmed contracts that end a session (0 = timer only), concurrent turbo sites, pages rendered per cycle (root included), seconds between on-chain re-checks of unverified addresses |
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot |
@@ -112,18 +115,18 @@ Every setting is an environment variable. A `.env` file in the working directory
 | `SUB_URL_PATTERNS` | see `.env.example` | Sub-pages derived from every root URL (`{domain}` = host without `www.`) |
 | `IGNORED_ATTRIBUTES` | nonce, csrf-token, … | HTML attributes that are never compared |
 | `MAX_CHANGE_EXAMPLES` | 5 | Examples per category in a change alert (0 = counts only) |
-| `ENRICH_TIMEOUT` | 3 | Seconds a contract alert may wait for token details (name, supply, DEX pair via DexScreener); 0 = links only |
+| `ENRICH_TIMEOUT` | 2 | Seconds a contract alert may wait for token details (name, supply, DEX pair via DexScreener; measured 0.05–0.2 s); 0 = links only |
 | `BROWSER_CHANNEL` | chromium | `chromium` (bundled) or an installed `chrome` / `msedge` |
 | `BLOCKED_RESOURCE_TYPES` | image,media,font | Resources the browser does not download |
 | `ETH_RPC_URL`, `BASE_RPC_URL`, `ARB_RPC_URL`, `OPT_RPC_URL`, `BSC_RPC_URL`, `FANTOM_RPC_URL`, `SONIC_RPC_URL`, `AVAX_RPC_URL`, `SOLANA_RPC_URL`, `SUI_RPC_URL` | public nodes | RPC endpoints; set an EVM one to an empty string to skip that network |
 | `REQUIRE_ERC20` | true | Count an EVM contract only if it answers `totalSupply` / `symbol` / `decimals` |
-| `RPC_TIMEOUT` / `MAX_CONCURRENT_RPC` | 8 / 8 | RPC timeout in seconds, concurrent address checks |
+| `RPC_TIMEOUT` / `MAX_CONCURRENT_RPC` | 5 / 8 | RPC timeout in seconds (public nodes answer in 0.05–0.3 s), concurrent address checks |
 | `REJECTED_TTL_HOURS` | 6 | Hours before an address that was *not* a contract is checked again (0 = never) |
 | `RPC_RETRY_DELAY` | 600 | Seconds before an address whose RPC check failed is retried |
 | `DATA_DIR` / `LOG_LEVEL` / `LOG_FILE` | data / INFO / – | Storage directory, verbosity, optional rotating log file |
 | `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes (used by `rebooter.py`) |
 
-Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, token details timeout, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
+Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, render failure threshold, `REQUIRE_ERC20`, pause threshold, rejected TTL, deep scan, unverified-mode knobs, alert examples, token details timeout, flapping memory, every turbo limit and the block backoff. Token, chat ids, browser, concurrency, RPC endpoints and paths need a restart.
 
 ---
 
@@ -152,7 +155,7 @@ Live (changeable with `/set`): poll intervals, confirm/idle/settle delays, `REQU
 ## 🔍 How a check works
 
 1. Derived sub-pages are probed with a cheap `HEAD` (falling back to `GET`). Only pages that are conclusively missing (DNS failure, 404/410) are skipped; everything else is rendered.
-2. The page is rendered in Chromium: DOM content loaded → network idle (bounded) → short settle delay.
+2. The page is rendered in Chromium: DOM content loaded → network idle (bounded) → short settle delay. A page that fails to load `RENDER_FAILURE_THRESHOLD` times in a row gets one 🐢 alert and a longer load timeout (doubled, up to three times `PAGE_LOAD_TIMEOUT`) until it renders again; `/status` counts such pages.
 3. The full rendered HTML is scanned for addresses; with `DEEP_SCAN` the markup of iframes and shadow roots and the bodies of the scripts and JSON answers the page loaded are scanned too (they were downloaded by the browser anyway). Unknown candidates are validated: `eth_getCode` on every EVM network in parallel (plus the ERC-20 calls when required) or `getAccountInfo` on Solana. Verdicts are cached: confirmed forever, rejected for `REJECTED_TTL_HOURS`, failed lookups retried after `RPC_RETRY_DELAY`. Concurrent checks of the same address share one lookup.
 4. The HTML is reduced to an ordered list of nodes (tag, attributes, own text). Scripts, styles, svg and meta tags are dropped, tracking parameters are stripped from URLs, class tokens are sorted. The list is compared with the stored snapshot.
 5. If it differs, the page is rendered again after `CONFIRM_DELAY`. Nodes that differ between the two renders are volatile and excluded from the report together with their previous values. If one render is much smaller than the other (a truncated load) the round is skipped. Otherwise the snapshot advances to the second render, so noise never accumulates.

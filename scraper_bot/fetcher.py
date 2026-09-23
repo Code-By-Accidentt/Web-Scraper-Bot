@@ -53,6 +53,7 @@ class FetchResult:
     extra_texts: tuple[str, ...] = ()  # frames, shadow roots, script/JSON bodies (deep scan)
     headers: dict[str, str] = field(default_factory=dict)  # of the main document
     retry_after: float | None = None  # seconds, from a Retry-After header
+    timed_out: bool = False  # the document never arrived within the load timeout
 
     @property
     def ok(self) -> bool:
@@ -69,20 +70,21 @@ class FetchResult:
 
 
 class PageFetcher(Protocol):
-    """Anything that can turn a URL into rendered HTML."""
+    """Anything that can turn a URL into rendered HTML.
 
-    async def fetch(self, url: str) -> FetchResult: ...
+    ``timeout`` overrides the configured load timeout for this one fetch (seconds).
+    """
+
+    async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult: ...
 
 
 class PlaywrightFetcher:
     """Renders pages in one shared Chromium.
 
-    A tab is opened per fetch and closed afterwards; the browser itself lives for
-    the whole process and is relaunched transparently if it crashes. Concurrency
-    is bounded by ``max_concurrent_pages``. With ``deep_scan`` enabled the fetch
-    also returns the markup of iframes and shadow roots and the bodies of the
-    scripts and JSON answers the page loaded, so addresses hidden there can be
-    found without any extra request.
+    A tab per fetch; the browser lives for the whole process and is relaunched if it
+    crashes; at most ``max_concurrent_pages`` renders run at once. With ``deep_scan``
+    the result also carries iframe and shadow-root markup and the script/JSON bodies
+    the page loaded, so addresses hidden there cost no extra request.
     """
 
     def __init__(self, settings: Settings, tuning: Tuning | None = None) -> None:
@@ -119,12 +121,12 @@ class PlaywrightFetcher:
             await self._playwright.stop()
             self._playwright = None
 
-    async def fetch(self, url: str) -> FetchResult:
+    async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult:
         async with self._semaphore:
             for attempt in (1, 2):
                 context = await self._ensure_context()
                 try:
-                    return await self._fetch_in(context, url)
+                    return await self._fetch_in(context, url, timeout)
                 except pw.Error as exc:
                     if attempt == 1 and self._browser_gone(exc):
                         log.warning("browser connection lost (%s); relaunching", self._brief(exc))
@@ -133,22 +135,26 @@ class PlaywrightFetcher:
                     return FetchResult(url, None, error=self._brief(exc))
             return FetchResult(url, None, error="browser unavailable")
 
-    # ── internals ───────────────────────────────────────────────────────────
-    async def _fetch_in(self, context: pw.BrowserContext, url: str) -> FetchResult:
-        cfg, tuning = self._settings, self._tuning
+    async def _fetch_in(
+        self, context: pw.BrowserContext, url: str, timeout: float | None
+    ) -> FetchResult:
+        tuning = self._tuning
+        load_timeout = timeout or self._settings.page_load_timeout
         deep_scan = tuning.deep_scan
         page = await context.new_page()
         responses: list[pw.Response] = []
         if deep_scan:
-            # Playwright decorates the handler, so it must be a plain function, not a builtin.
+            # Playwright wraps the handler; that breaks on a builtin like responses.append.
             page.on("response", lambda response: responses.append(response))
         try:
             try:
                 response = await page.goto(
-                    url, wait_until="domcontentloaded", timeout=cfg.page_load_timeout * 1000
+                    url, wait_until="domcontentloaded", timeout=load_timeout * 1000
                 )
             except pw.TimeoutError:
-                return FetchResult(url, None, error=f"timeout after {cfg.page_load_timeout:.0f}s")
+                return FetchResult(
+                    url, None, error=f"timeout after {load_timeout:.0f}s", timed_out=True
+                )
             except pw.Error as exc:
                 if self._browser_gone(exc):
                     raise

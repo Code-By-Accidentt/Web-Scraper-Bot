@@ -1,11 +1,13 @@
 import asyncio
 import base64
 import json
+import logging
 import time
 from typing import Any
 
 import base58
 import httpx
+import pytest
 
 from scraper_bot.config import EvmNetwork
 from scraper_bot.enrichment import (
@@ -359,3 +361,82 @@ def test_sui_types_match_case_sensitively_except_for_the_package() -> None:
     assert best_pair([pair(chain="sui", base=other_case)], "sui", SUI_COIN, Chain.SUI) is None
     shouting = "0x" + SUI_PKG[2:].upper() + "::usdc::USDC"
     assert best_pair([pair(chain="sui", base=shouting)], "sui", SUI_COIN, Chain.SUI) is not None
+
+
+def test_abi_decoder_edge_cases() -> None:
+    head = (32).to_bytes(32, "big") + (100).to_bytes(32, "big")  # offset 32, length 100
+    assert decode_abi_string("0x" + "00" * 40) is None  # neither bytes32 nor a full head
+    assert decode_abi_string("0x" + (head + b"short").hex()) is None  # chunk shorter than said
+    assert decode_abi_string("0x" + "00" * 64) is None  # a well-formed empty string
+    assert decode_abi_string("0x" + "00" * 32) is None  # a blank bytes32
+    assert decode_abi_string(abi_string("x" * 200)) == "x" * 64  # long names are cut
+    assert decode_abi_uint("0xzz") is None
+    assert decode_abi_uint(None) is None and decode_abi_uint(b"0x1") is None
+    assert decode_abi_uint("0x0") == 0
+    assert decode_abi_uint(abi_uint(36), limit=36) == 36
+    assert decode_abi_uint(abi_uint(37), limit=36) is None
+
+
+def test_token2022_edge_cases() -> None:
+    padded = MINT.ljust(165, b"\x00")
+    metadata = (19).to_bytes(2, "little") + len(_T22_BODY).to_bytes(2, "little") + _T22_BODY
+    other = (7).to_bytes(2, "little") + (2).to_bytes(2, "little") + b"\x00\x00"
+    nothing = (None, None)
+    assert parse_token2022_metadata(padded + b"\x01") == nothing  # no extensions at all
+    assert parse_token2022_metadata(padded + b"\x01" + other) == nothing  # no metadata one
+    assert parse_token2022_metadata(padded + b"\x01" + other + metadata) == ("PayPal USD", "PYUSD")
+    # The (0, 0) padding sentinel ends the walk even when bytes follow it.
+    assert parse_token2022_metadata(padded + b"\x01" + bytes(4) + metadata) == nothing
+    # Account-type byte 2 is a token account, whatever comes after it.
+    assert parse_token2022_metadata(padded + b"\x02" + metadata) == nothing
+    assert parse_token2022_metadata(padded + b"\x01" + metadata[:3]) == nothing  # cut header
+    assert parse_token2022_metadata(padded + b"\x01" + metadata[:70]) == nothing  # cut body
+
+
+async def test_market_lookup_edge_cases() -> None:
+    from scraper_bot.enrichment import _number, best_pair
+
+    backend = Backend()
+    backend.pairs = {"pairs": [pair()]}  # an object where a list is expected
+    info = await make(backend).enrich(ETH_CONTRACT)
+    assert not info.market_checked and info.pair is None
+    assert info.decimals == 6  # the chain data is unaffected
+
+    backend = Backend()
+    backend.pairs = [{**pair(), "baseToken": {"address": 12345, "symbol": "USDC"}}]
+    info = await make(backend).enrich(ETH_CONTRACT)
+    assert info.market_checked and info.pair is None and info.dex is None
+
+    backend = Backend()
+    info = await make(backend).enrich(ConfirmedContract(ETH_CONTRACT.address, "Nowhere"))
+    assert info == TokenInfo()
+    assert backend.calls == []  # neither an RPC node nor DexScreener is known for it
+
+    assert best_pair({"pairs": []}, "ethereum", USDC_ETH, Chain.ETHEREUM) is None
+    assert best_pair([None, "x", 1], "ethereum", USDC_ETH, Chain.ETHEREUM) is None
+    assert _number(True) is None and _number(False) is None
+    assert _number("12.5") == 12.5 and _number(3) == 3.0
+    assert _number("abc") is None and _number([1]) is None and _number(None) is None
+
+
+async def test_unexpected_exceptions_in_a_source_are_swallowed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken(self: TokenEnricher, contract: ConfirmedContract) -> dict[str, Any]:
+        raise KeyError("odd payload")
+
+    monkeypatch.setattr(TokenEnricher, "_chain_details", broken)
+    backend = Backend()
+    backend.pairs = [pair()]
+    with caplog.at_level(logging.WARNING, logger="scraper_bot.enrichment"):
+        info = await make(backend).enrich(ETH_CONTRACT)
+    assert info.market_checked and info.pair == "USDC/WETH" and info.name == "USD Coin"
+    assert info.decimals is None and info.total_supply is None
+    assert any("chain source raised" in r.getMessage() for r in caplog.records)
+
+    monkeypatch.undo()
+    backend = Backend()
+    backend.pairs = [{**pair(), "quoteToken": ["not", "a", "dict"]}]  # trips the market code
+    info = await make(backend).enrich(ETH_CONTRACT)
+    assert info.decimals == 6 and info.name == "USD Coin"
+    assert not info.market_checked and info.pair is None

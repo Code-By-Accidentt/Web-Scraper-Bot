@@ -16,6 +16,7 @@ from scraper_bot.contract_validators import (
     SolanaContractValidator,
     SuiCoinValidator,
 )
+from scraper_bot.evm import ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
 from scraper_bot.models import Address, Chain, ConfirmedContract, ValidationStatus
 from scraper_bot.solana import TOKEN_2022_PROGRAM, TOKEN_PROGRAM
 from scraper_bot.storage import AddressCache
@@ -31,6 +32,14 @@ Responder = Callable[[str, list[Any]], Any]
 
 class RpcFailure(Exception):
     """Simulates a JSON-RPC error object (for example ``execution reverted``)."""
+
+    def __init__(self, message: str, code: int = 3) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class RateLimited(Exception):
+    """Simulates an HTTP 429 from a public node."""
 
 
 class FakeRpc:
@@ -53,8 +62,10 @@ class FakeRpc:
         try:
             result = responder(body["method"], body["params"])
         except RpcFailure as exc:
-            error = {"code": 3, "message": str(exc)}
+            error = {"code": exc.code, "message": str(exc)}
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": error})
+        except RateLimited:
+            return httpx.Response(429, text="too many requests")
         return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
 
     def client(self) -> httpx.AsyncClient:
@@ -80,6 +91,20 @@ def plain_contract(method: str, _params: list[Any]) -> Any:
 
 def no_contract(method: str, _params: list[Any]) -> Any:
     return "0x"
+
+
+def throttled_contract(method: str, _params: list[Any]) -> Any:
+    """Code is there, but every ERC-20 probe hits an HTTP 429."""
+    if method == "eth_getCode":
+        return "0x6080604052"
+    raise RateLimited()
+
+
+def throttled_by_json_error(method: str, _params: list[Any]) -> Any:
+    """Code is there, but the node rate-limits through a JSON-RPC error object."""
+    if method == "eth_getCode":
+        return "0x6080604052"
+    raise RpcFailure("rate limit exceeded", code=-32005)
 
 
 def solana_account(
@@ -150,6 +175,23 @@ async def test_non_erc20_contract_only_counts_when_allowed() -> None:
             http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=False)
         )
         assert await lenient.find_network(USDC_ETH) == "Alpha"
+
+
+@pytest.mark.parametrize("responder", [throttled_contract, throttled_by_json_error])
+async def test_throttled_erc20_probe_gives_no_verdict(responder: Responder, tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", responder)
+    rpc.route("beta.rpc", no_contract)
+    rpc.route("sol.rpc", solana_missing)
+    async with rpc.client() as http:
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
+        with pytest.raises(RpcUnavailable, match="Alpha"):
+            await validator.find_network(USDC_ETH)
+        facade = build(rpc, http, tmp_path, FakeClock())
+        assert (await facade.validate(ETH)).status is ValidationStatus.UNAVAILABLE
+    assert not (tmp_path / "rejected.tsv").exists()  # nothing was cached as rejected
 
 
 async def test_failed_endpoint_prevents_a_rejection_but_not_a_confirmation() -> None:
@@ -427,3 +469,100 @@ async def test_packages_with_many_structs_are_searched_completely() -> None:
         strict = SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning())
         assert await strict.is_coin_or_package(SUI_PKG)
     assert rpc.count("sui.rpc", "suix_getCoinMetadata") == 21
+
+
+# ── ERC-20 probe: reverts vs. real failures ─────────────────────────────────
+def mixed_probe_failures(method: str, params: list[Any]) -> Any:
+    """Code is there; one ERC-20 probe reverts, another one is throttled."""
+    if method == "eth_getCode":
+        return "0x6080604052"
+    if params[0]["data"] == ERC20_SYMBOL:
+        raise RateLimited()
+    raise RpcFailure("execution reverted")
+
+
+def one_answer_rest_throttled(method: str, params: list[Any]) -> Any:
+    """Only totalSupply() answers; the other probes hit an HTTP 429."""
+    if method == "eth_getCode":
+        return "0x6080604052"
+    if params[0]["data"] == ERC20_TOTAL_SUPPLY:
+        return "0x" + "00" * 31 + "12"
+    raise RateLimited()
+
+
+async def test_mixed_revert_and_throttle_gives_no_verdict() -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", mixed_probe_failures)
+    rpc.route("beta.rpc", no_contract)
+    async with rpc.client() as http:
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
+        with pytest.raises(RpcUnavailable, match="Alpha"):
+            await validator.find_network(USDC_ETH)
+    assert rpc.count("alpha.rpc", "eth_call") == 3
+
+
+async def test_one_erc20_answer_outweighs_throttled_probes() -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", one_answer_rest_throttled)
+    rpc.route("beta.rpc", no_contract)
+    async with rpc.client() as http:
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
+        assert await validator.find_network(USDC_ETH) == "Alpha"
+
+
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("execution reverted", 3),
+        ("anything with code 3", 3),
+        ("execution reverted: no such function", -32000),
+        ("invalid opcode: INVALID", -32015),
+        ("out of gas", -32000),
+        ("VM execution error.", -32015),
+    ],
+)
+async def test_every_revert_flavour_means_not_a_token(message: str, code: int) -> None:
+    def reverting(method: str, _params: list[Any]) -> Any:
+        if method == "eth_getCode":
+            return "0x6080604052"
+        raise RpcFailure(message, code=code)
+
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", reverting)
+    rpc.route("beta.rpc", no_contract)
+    async with rpc.client() as http:
+        validator = EvmContractValidator(
+            http, NETWORKS, timeout=5, tuning=FakeTuning(require_erc20=True)
+        )
+        assert await validator.find_network(USDC_ETH) is None
+
+
+async def test_non_rpc_exceptions_propagate_from_find_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def broken(self: EvmContractValidator, client: Any, address: str) -> bool:
+        raise ValueError("programming error")
+
+    monkeypatch.setattr(EvmContractValidator, "_check", broken)
+    rpc = FakeRpc()
+    async with rpc.client() as http:
+        validator = EvmContractValidator(http, NETWORKS, timeout=5, tuning=FakeTuning())
+        with pytest.raises(ValueError, match="programming error"):
+            await validator.find_network(USDC_ETH)
+    assert rpc.calls == []
+
+
+async def test_solana_bad_base64_is_not_a_mint() -> None:
+    def responder(_method: str, _params: list[Any]) -> Any:
+        value = {"executable": False, "owner": TOKEN_PROGRAM, "data": ["not*base64!", "base64"]}
+        return {"context": {"slot": 1}, "value": value}
+
+    rpc = FakeRpc()
+    rpc.route("sol.rpc", responder)
+    async with rpc.client() as http:
+        validator = SolanaContractValidator(http, "https://sol.rpc", timeout=5)
+        assert await validator.is_program_or_mint(USDC_SOL) is False

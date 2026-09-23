@@ -142,7 +142,7 @@ def parse_command(text: str) -> ParsedCommand | None:
 
 
 class BotCommands:
-    """Maps commands to :class:`MonitorManager` calls and phrases the replies (HTML)."""
+    """Turns commands into manager, turbo and preferences calls and phrases the replies (HTML)."""
 
     def __init__(
         self,

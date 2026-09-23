@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +15,12 @@ from scraper_bot.commands import (
     parse_turbo_request,
 )
 from scraper_bot.markup import strip_markup
-from scraper_bot.monitor_manager import MonitorManager
+from scraper_bot.models import ChangeCounts, LastChange, SiteState
+from scraper_bot.monitor_manager import MonitorError, MonitorManager
 from scraper_bot.preferences import Preferences
 from scraper_bot.storage import SnapshotStore, StateStore
-from scraper_bot.turbo import TurboManager
+from scraper_bot.timefmt import format_clock
+from scraper_bot.turbo import TurboError, TurboManager
 from scraper_bot.urls import SubUrlDeriver
 from tests.conftest import (
     FakeProber,
@@ -245,7 +248,7 @@ def with_preferences(tmp_path: Path, chat_ids: tuple[int, ...] = (1,)):
 async def test_settings_overview_and_details(tmp_path: Path) -> None:
     _, telegram, commands = with_preferences(tmp_path)
     overview = await send(commands, telegram, "/settings")
-    assert "poll_interval_min = 5 s" in overview and "require_erc20 = on" in overview
+    assert "poll_interval_min = 4 s" in overview and "require_erc20 = on" in overview
     details = await send(commands, telegram, "/settings require_erc20")
     assert "Only token-like contracts" in details and "Default from .env: on" in details
     assert (await send(commands, telegram, "/settings nope")).startswith("❌ unknown setting")
@@ -254,7 +257,7 @@ async def test_settings_overview_and_details(tmp_path: Path) -> None:
 async def test_set_validates_confirms_and_persists(tmp_path: Path) -> None:
     _, telegram, commands = with_preferences(tmp_path)
     assert await send(commands, telegram, "/set poll_interval_min 10") == (
-        "✅ poll_interval_min: 5 s → 10 s (applies immediately)"
+        "✅ poll_interval_min: 4 s → 10 s (applies immediately)"
     )
     assert "must not exceed poll_interval_max" in await send(
         commands, telegram, "/set poll_interval_min 20"
@@ -266,7 +269,7 @@ async def test_set_validates_confirms_and_persists(tmp_path: Path) -> None:
     assert "require_erc20 = off*" in await send(commands, telegram, "/settings")
     assert (tmp_path / "prefs.json").is_file()
     reset = await send(commands, telegram, "/settings reset all")
-    assert "poll_interval_min: 10 s → 5 s" in reset and "require_erc20: off → on" in reset
+    assert "poll_interval_min: 10 s → 4 s" in reset and "require_erc20: off → on" in reset
     assert await send(commands, telegram, "/set") == strip_markup(SETTINGS_USAGE)
 
 
@@ -276,7 +279,7 @@ async def test_settings_changes_need_an_admin_chat(tmp_path: Path) -> None:
         "🔒"
     )
     assert (await send(commands, telegram, "/settings reset all", chat_id=99)).startswith("🔒")
-    assert "poll_interval_min = 5 s" in await send(commands, telegram, "/settings", chat_id=99)
+    assert "poll_interval_min = 4 s" in await send(commands, telegram, "/settings", chat_id=99)
     _, telegram, nobody = with_preferences(tmp_path, chat_ids=())
     assert "both are empty" in await send(nobody, telegram, "/set poll_interval_min 10")
 
@@ -330,3 +333,191 @@ async def test_internal_errors_are_reported_to_the_user(tmp_path: Path) -> None:
     reply = await send(commands, telegram, "/add example.com")
     assert reply.startswith("⚠️ Internal error while running /add: RuntimeError: disk on fire")
     assert "keeps running" in reply
+
+
+async def test_mute_and_unmute_aliases(tmp_path: Path) -> None:
+    manager, telegram, commands = make(tmp_path)
+    await manager.start()
+    try:
+        await manager.add_site("https://example.com")
+        assert await send(commands, telegram, "/mute example.com") == (
+            "🔇 Change alerts disabled for https://example.com."
+        )
+        assert manager.sites()[0].notifications_enabled is False
+        assert await send(commands, telegram, "/unmute example.com") == (
+            "🔔 Change alerts enabled for https://example.com."
+        )
+        assert manager.sites()[0].notifications_enabled is True
+    finally:
+        await manager.shutdown()
+
+
+async def test_usage_hints_for_every_url_command(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    for name in ("remove", "pause", "resume", "notify", "nonotifi"):
+        assert await send(commands, telegram, f"/{name}") == f"Usage: /{name} <url>"
+    # The aliases share their handler, so they answer with the canonical usage line.
+    assert await send(commands, telegram, "/mute") == "Usage: /nonotifi <url>"
+    assert await send(commands, telegram, "/unmute") == "Usage: /notify <url>"
+
+
+async def test_list_shows_stopped_blocked_and_last_change(tmp_path: Path) -> None:
+    def factory(site: SiteState, persist: Any, on_auto_pause: Any) -> StubMonitor:
+        return StubMonitor(site, persist, on_auto_pause, crash=site.url == "https://crash.io")
+
+    manager = MonitorManager(
+        state_store=StateStore(tmp_path / "state.json"),
+        snapshot_store=SnapshotStore(tmp_path / "snaps"),
+        deriver=SubUrlDeriver(()),
+        monitor_factory=factory,
+        restart_delay=0,  # a crashed monitor stays down: the site reads as STOPPED
+    )
+    telegram = FakeTelegram()
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,))
+    changed_at = 1_700_000_000.0
+    await manager.start()
+    try:
+        await manager.add_site("https://crash.io")
+        blocked = await manager.add_site("https://blocked.io")
+        changed = await manager.add_site("https://changed.io")
+        stats = manager.stats(blocked.url)
+        assert stats is not None
+        stats.block_level, stats.block_reason = 1, "HTTP 403"
+        changed.last_change = LastChange(changed_at, changed.url, ChangeCounts(added=1))
+        for _ in range(100):
+            if not manager.is_running("https://crash.io"):
+                break
+            await asyncio.sleep(0.01)
+        reply = await send(commands, telegram, "/list")
+    finally:
+        await manager.shutdown()
+    assert reply.split("\n") == [
+        "➡️ Monitored sites (3):",
+        "• https://blocked.io [alerts: ON] [RUNNING] ⚠️ BLOCKED? (HTTP 403)",
+        f"• https://changed.io [alerts: ON] [RUNNING] last change: {format_clock(changed_at)}",
+        "• https://crash.io [alerts: ON] [STOPPED]",
+    ]
+
+
+async def test_settings_reset_with_nothing_overridden(tmp_path: Path) -> None:
+    _, telegram, commands = with_preferences(tmp_path)
+    assert (await send(commands, telegram, "/settings reset all")).startswith(
+        "Nothing to reset: every setting already has its .env value."
+    )
+    assert (await send(commands, telegram, "/settings reset poll_interval_min")).startswith(
+        "Nothing to reset"
+    )
+
+
+async def test_settings_and_set_without_preferences_wired(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    for text in ("/settings", "/settings reset all", "/set poll_interval_min 10"):
+        assert await send(commands, telegram, text) == "Settings are not available."
+
+
+async def test_missing_recipients_warning_on_list_and_resume_but_not_pause(
+    tmp_path: Path,
+) -> None:
+    manager, telegram, _ = make(tmp_path)
+    commands = BotCommands(manager, telegram, alert_chat_ids=())
+    warning = "⚠️ TELEGRAM_CHAT_IDS is empty"
+    await manager.start()
+    try:
+        await manager.add_site("https://example.com")
+        listed = await send(commands, telegram, "/list", chat_id=7)
+        assert listed.startswith("➡️ Monitored sites (1):") and warning in listed
+        paused = await send(commands, telegram, "/pause example.com", chat_id=7)
+        assert paused.startswith("⏸️ https://example.com paused.") and warning not in paused
+        resumed = await send(commands, telegram, "/resume example.com", chat_id=7)
+        assert resumed.startswith("▶️ https://example.com resumed.") and warning in resumed
+        assert "chat id 7" in resumed
+    finally:
+        await manager.shutdown()
+
+
+async def test_updates_without_text_or_int_chat_are_ignored(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    await commands.handle_update({"update_id": 1, "message": {"chat": {"id": 1}}})
+    await commands.handle_update(
+        {"update_id": 2, "message": {"chat": {"id": "1"}, "text": "/help"}}
+    )
+    await commands.handle_update({"update_id": 3, "message": {"chat": {"id": 1}, "text": 42}})
+    await commands.handle_update({"update_id": 4, "message": "/help"})
+    await commands.handle_update({"update_id": 5})
+    assert telegram.messages == []
+    assert "Available commands" in await send(commands, telegram, "/help")
+
+
+class FlakyCommands:
+    """Stands in for BotCommands: handling the first update blows up, the rest go through."""
+
+    def __init__(self, inner: BotCommands) -> None:
+        self.inner = inner
+        self.calls = 0
+
+    async def handle_update(self, update: dict[str, Any]) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("handler exploded")
+        await self.inner.handle_update(update)
+
+
+async def test_listener_survives_a_failing_handler(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    flaky = FlakyCommands(commands)
+    telegram.updates = [[update("/help", update_id=10)], [update("/list", update_id=11)]]
+    listener = TelegramListener(telegram, flaky, poll_timeout=1, error_backoff=0.01)  # type: ignore[arg-type]
+    task = asyncio.create_task(listener.run())
+    for _ in range(200):
+        if telegram.messages and len(telegram.offsets) >= 3:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert flaky.calls == 2
+    assert [strip_markup(text).split("\n")[0] for _, text in telegram.messages] == [
+        "‼️ No site is monitored. Add one with /add <url>."
+    ]
+    assert telegram.offsets[:3] == [None, 11, 12]  # the failed update is not fetched again
+
+
+def test_turbo_at_clock_time_rolls_over_to_tomorrow() -> None:
+    now = datetime(2024, 2, 13, 12, 0).timestamp()
+    tomorrow = datetime(2024, 2, 14, 11, 30).timestamp()
+    assert parse_turbo_request(["x.io", "at", "11:30"], now).start_at == tomorrow
+    # Exactly "now" counts as past, so it rolls over too; one minute later does not.
+    assert parse_turbo_request(["x.io", "at", "12:00"], now).start_at == (
+        datetime(2024, 2, 14, 12, 0).timestamp()
+    )
+    assert parse_turbo_request(["x.io", "at", "12:01"], now).start_at == (
+        datetime(2024, 2, 13, 12, 1).timestamp()
+    )
+
+
+class OddMonitorError(MonitorError):
+    pass
+
+
+class OddTurboError(TurboError):
+    pass
+
+
+async def test_generic_monitor_and_turbo_errors_fall_back_to_the_message(
+    tmp_path: Path,
+) -> None:
+    manager, telegram, _ = make(tmp_path)
+    turbo = make_turbo()
+    commands = BotCommands(manager, telegram, turbo=turbo)
+
+    async def odd_pause(_url: str) -> SiteState:
+        raise OddMonitorError("https://example.com")
+
+    async def odd_stop(_url: str) -> str:
+        raise OddTurboError("<https://example.com>")
+
+    manager.pause_site = odd_pause  # type: ignore[method-assign]
+    turbo.stop = odd_stop  # type: ignore[method-assign]
+    assert await send(commands, telegram, "/pause example.com") == "❌ https://example.com"
+    assert await send(commands, telegram, "/turbo stop example.com") == "❌ <https://example.com>"
+    assert "&lt;https://example.com&gt;" in telegram.messages[-1][1]  # escaped for HTML

@@ -72,7 +72,7 @@ class StateStore:
 
 
 class LegacyStateImporter:
-    """Reads the flat files written by version 1 of the bot (``monitored_sites.txt`` & co)."""
+    """Reads the flat files of bot version 1: sites, notification flags, found wallets."""
 
     SITES_FILE = "monitored_sites.txt"
     NOTIFICATIONS_FILE = "notifications_status.json"
@@ -181,7 +181,6 @@ class SnapshotStore:
             self.delete(url)
 
     def prune(self, keep_urls: Iterable[str]) -> int:
-        """Delete every snapshot that does not belong to one of ``keep_urls``."""
         keep = {self.path_for(url).name for url in keep_urls}
         removed = 0
         for path in self._dir.glob("*.json"):
@@ -196,8 +195,8 @@ class SnapshotStore:
 class AddressCache:
     """Confirmed contracts (kept forever) and rejected addresses (kept for a TTL).
 
-    Both caches are append-only text files (tab separated) mirrored in memory, so
-    lookups are free and a crash never loses more than the last line.
+    Both are tab-separated text files mirrored in memory and only appended to while
+    running, so lookups are free and a crash never loses more than the last line.
     """
 
     def __init__(
@@ -283,7 +282,6 @@ class AddressCache:
             1 for address in addresses if self.add_known(ConfirmedContract(address, "legacy"))
         )
 
-    # ── internals ───────────────────────────────────────────────────────────
     def _expired(self, rejected_at: float, now: float) -> bool:
         ttl = self._ttl()
         return ttl > 0 and now - rejected_at >= ttl

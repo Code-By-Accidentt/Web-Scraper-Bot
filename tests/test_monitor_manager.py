@@ -21,6 +21,43 @@ APP = "https://app.example.com"
 SIGNATURE = (node("p", "x"),)
 
 
+class LingeringMonitor(StubMonitor):
+    """Keeps running after request_stop() until released, like a monitor mid-round."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.released = asyncio.Event()
+
+    async def run(self) -> None:
+        self.started = True
+        await self.released.wait()
+
+
+class SelfPausingMonitor(StubMonitor):
+    """Hits the contract threshold at once: pauses the site from inside its own task and ends."""
+
+    async def run(self) -> None:
+        self.started = True
+        await self.on_auto_pause(self.site.url, APP)
+
+
+class CleaningUpMonitor(StubMonitor):
+    """Ignores request_stop() (like a monitor mid-render); only cancellation ends it."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.cleaned_up = False
+
+    async def run(self) -> None:
+        self.started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.01)  # closing the browser page takes a moment
+            self.cleaned_up = True
+            raise
+
+
 class Harness:
     def __init__(
         self,
@@ -28,12 +65,15 @@ class Harness:
         *,
         restart_delay: float = 0.0,
         crash_first: bool = False,
+        lingering: bool = False,
         legacy: LegacyStateImporter | None = None,
+        kind: type[StubMonitor] = StubMonitor,
     ) -> None:
         self.state = StateStore(tmp_path / "state.json")
         self.snapshots = SnapshotStore(tmp_path / "snaps")
         self.monitors: list[StubMonitor] = []
         self.crash_first = crash_first
+        self.kind = LingeringMonitor if lingering else kind
         self.notifier = FakeNotifier()
         self.manager = MonitorManager(
             state_store=self.state,
@@ -47,7 +87,7 @@ class Harness:
 
     def factory(self, site: SiteState, persist: Any, on_auto_pause: Any) -> StubMonitor:
         crash = self.crash_first and not self.monitors
-        monitor = StubMonitor(site, persist, on_auto_pause, crash=crash)
+        monitor = self.kind(site, persist, on_auto_pause, crash=crash)
         self.monitors.append(monitor)
         return monitor
 
@@ -150,6 +190,28 @@ async def test_auto_pause_marks_paused_and_stops_monitor(tmp_path: Path) -> None
         await h.manager.shutdown()
 
 
+async def test_resume_during_the_auto_pause_round_still_gets_a_monitor(tmp_path: Path) -> None:
+    h = Harness(tmp_path, lingering=True)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        first = h.monitors[0]
+        assert isinstance(first, LingeringMonitor)
+        await first.on_auto_pause(ROOT, APP)  # the monitor is told to stop, its round goes on
+        assert h.manager.is_running(ROOT)
+        await h.manager.resume_site(ROOT)  # the user answers the pause alert at once
+        assert len(h.monitors) == 1  # the old task is still there, nothing new could start
+        first.released.set()  # the old round ends
+        for _ in range(100):
+            if len(h.monitors) == 2 and h.manager.is_running(ROOT):
+                break
+            await asyncio.sleep(0.01)
+        assert len(h.monitors) == 2 and h.manager.is_running(ROOT)
+        assert h.notifier.problems == []
+    finally:
+        await h.manager.shutdown()
+
+
 async def test_crashed_monitor_is_restarted(tmp_path: Path) -> None:
     h = Harness(tmp_path, restart_delay=0.01, crash_first=True)
     await h.manager.start()
@@ -177,5 +239,120 @@ async def test_legacy_files_are_imported_when_no_state_exists(tmp_path: Path) ->
         assert [site.url for site in h.manager.sites()] == ["https://a.io", "https://b.io"]
         assert h.state.exists()
         assert h.manager.is_running("https://a.io")
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_auto_pause_from_inside_the_monitor_task(tmp_path: Path) -> None:
+    h = Harness(tmp_path, kind=SelfPausingMonitor)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        for _ in range(100):
+            if not h.manager.is_running(ROOT):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0)  # let the task's done-callback run
+        assert not h.manager.is_running(ROOT)
+        assert h.monitors[0].stopped
+        assert h.state.load()[ROOT].paused is True
+        assert h.notifier.problems == []  # a normal end is not a crash
+        assert len(h.monitors) == 1  # and a paused site gets no restart
+        resumed = await h.manager.resume_site(ROOT)
+        assert not resumed.paused and h.manager.is_running(ROOT)
+        assert len(h.monitors) == 2
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_remove_while_running_cancels_and_awaits_the_task(tmp_path: Path) -> None:
+    h = Harness(tmp_path, kind=CleaningUpMonitor)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        await asyncio.sleep(0)
+        monitor = h.monitors[0]
+        assert isinstance(monitor, CleaningUpMonitor) and monitor.started
+        await h.manager.remove_site(ROOT)
+        assert monitor.cleaned_up  # remove_site came back only once the task was gone
+        assert monitor.stopped and not h.manager.is_running(ROOT)
+        assert h.manager.sites() == []
+        assert h.notifier.problems == []  # a cancelled task is not a crash
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_crash_without_restart_delay_reports_no_restart_hint(tmp_path: Path) -> None:
+    h = Harness(tmp_path, restart_delay=0, crash_first=True)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        for _ in range(100):
+            if h.notifier.problems:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)  # room for a restart that must not happen
+        assert len(h.notifier.problems) == 1
+        key, title, detail, hint = h.notifier.problems[0]
+        assert key == f"monitor:{ROOT}" and title == f"Monitor for {ROOT} crashed"
+        assert detail == "RuntimeError: boom"
+        assert "will not restart" in (hint or "")
+        assert len(h.monitors) == 1
+        assert not h.manager.is_running(ROOT)
+        assert h.state.load()[ROOT].paused is False  # still registered, just stopped
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("action", ["pause", "remove"])
+async def test_restart_is_skipped_when_site_paused_or_removed_meanwhile(
+    tmp_path: Path, action: str
+) -> None:
+    h = Harness(tmp_path, restart_delay=0.03, crash_first=True)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        for _ in range(100):
+            if h.notifier.problems:
+                break
+            await asyncio.sleep(0.005)
+        assert "restarts automatically" in (h.notifier.problems[0][3] or "")
+        if action == "pause":
+            await h.manager.pause_site(ROOT)
+        else:
+            await h.manager.remove_site(ROOT)
+        for _ in range(12):  # 60 ms in small steps: the restart timer fires meanwhile
+            await asyncio.sleep(0.005)
+        assert len(h.monitors) == 1
+        assert not h.manager.is_running(ROOT)
+        assert [site.url for site in h.manager.sites()] == ([ROOT] if action == "pause" else [])
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_invalid_url_to_a_site_command_reads_as_not_tracked(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    with pytest.raises(SiteNotTracked) as info:
+        await h.manager.pause_site("not a url")
+    assert info.value.url == "not a url"
+    with pytest.raises(SiteNotTracked):
+        await h.manager.resume_site("not a url")
+    with pytest.raises(SiteNotTracked):
+        await h.manager.remove_site("not a url")
+    with pytest.raises(SiteNotTracked):
+        h.manager.set_notifications("not a url", True)
+    with pytest.raises(SiteNotTracked):
+        h.manager.set_unverified("not a url", True)
+
+
+async def test_legacy_import_skipped_when_state_file_exists_but_is_empty(tmp_path: Path) -> None:
+    (tmp_path / "monitored_sites.txt").write_text("https://a.io\n", encoding="utf-8")
+    h = Harness(tmp_path, legacy=LegacyStateImporter(tmp_path))
+    h.state.save({})  # every site was removed on purpose; the legacy list must stay dead
+    await h.manager.start()
+    try:
+        assert h.manager.sites() == []
+        assert not h.manager.is_running("https://a.io")
+        assert h.state.load() == {}
     finally:
         await h.manager.shutdown()
