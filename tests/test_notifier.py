@@ -153,3 +153,11 @@ async def test_an_alert_names_exactly_one_token() -> None:
     assert f"Coin type: {coin}" in plain and "Token: MEME" in plain
     assert f'<a href="https://suiscan.xyz/mainnet/coin/{coin}">Suiscan</a>' in text
     assert {sui_package(found) for found in ANY_ID_RE.findall(text)} == {package}
+
+
+async def test_broken_token_details_do_not_drop_the_alert() -> None:
+    weird = TokenInfo(market_checked=True, pair_url="https://x", pair_created_at=float("nan"))
+    notifier, telegram = make(enricher=FakeEnricher(weird))
+    await notifier.contract_found(ConfirmedContract(ADDRESS, "Ethereum"), "https://x.io")
+    plain = strip_markup(telegram.messages[-1][1])
+    assert plain.startswith("🔔 Contract found") and "Links: Etherscan" in plain

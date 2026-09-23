@@ -204,12 +204,13 @@ class Notifier:
     async def _token_details(self, contract: ConfirmedContract) -> str:
         """Extra lines: what the token is, where it trades, where to look it up."""
         info = TokenInfo()
+        lines: list[str] = []
         if self._enricher is not None:
             try:
                 info = await self._enricher.enrich(contract)
+                lines = describe_token(info, self._clock())
             except Exception:  # details must never hold back the alert
                 log.warning("token details failed for %s", contract.address.value, exc_info=True)
-        lines = describe_token(info, self._clock())
         links = token_links(contract, info.coin_type)
         if links:
             lines.append("Links: " + " · ".join(link(label, url) for label, url in links))

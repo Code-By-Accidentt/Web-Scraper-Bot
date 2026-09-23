@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -330,9 +331,10 @@ def _number(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if math.isfinite(number) else None  # JSON may carry NaN/Infinity
 
 
 def _liquidity(pair: dict[str, Any]) -> float:
@@ -345,6 +347,11 @@ def _same_address(left: Any, right: str, chain: Chain) -> bool:
         return False
     if chain is Chain.SOLANA:
         return left == right
+    if chain is Chain.SUI:
+        # Move module and struct names are case-sensitive; only the package hex is not.
+        left_package, _, left_type = left.partition("::")
+        right_package, _, right_type = right.partition("::")
+        return left_package.lower() == right_package.lower() and left_type == right_type
     return left.lower() == right.lower()
 
 

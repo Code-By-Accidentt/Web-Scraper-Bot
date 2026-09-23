@@ -13,11 +13,14 @@ from typing import Any
 
 from scraper_bot.rpc import JsonRpcClient
 
-MAX_COIN_CANDIDATES = 8  # structs of a package tried as coin types
+COIN_CHECK_BATCH = 8  # metadata lookups in flight per package
+MAX_COIN_CANDIDATES = 128  # structs of one package ever tried as coin types
 
 
 async def object_kind(client: JsonRpcClient, address: str) -> str:
     """``package``, ``object`` or ``missing`` (wallets and unknown ids are missing)."""
+    # With showType a package answers ``type: "package"``; Move objects carry their
+    # struct type there instead (checked against mainnet).
     result = await client.call("sui_getObject", [address, {"showType": True}])
     data = result.get("data") if isinstance(result, dict) else None
     if isinstance(data, dict):
@@ -58,17 +61,22 @@ async def coin_type_candidates(
 
 
 async def find_coin(client: JsonRpcClient, package: str) -> tuple[str, dict[str, Any]] | None:
-    """The first coin type defined by ``package`` together with its metadata."""
+    """The first coin type defined by ``package`` together with its metadata.
+
+    Every candidate is tried (likeliest first, a batch at a time), so a coin that sits
+    behind many helper structs is still found.
+    """
     candidates = await coin_type_candidates(client, package)
-    if not candidates:
-        return None
-    answers = await asyncio.gather(
-        *(coin_metadata(client, candidate) for candidate in candidates), return_exceptions=True
-    )
-    for candidate, metadata in zip(candidates, answers, strict=True):
-        if isinstance(metadata, dict):
-            return candidate, metadata
-    for answer in answers:
-        if isinstance(answer, BaseException):
-            raise answer  # nothing confirmed and a lookup failed: no verdict possible
+    failure: BaseException | None = None
+    for start in range(0, len(candidates), COIN_CHECK_BATCH):
+        batch = candidates[start : start + COIN_CHECK_BATCH]
+        answers = await asyncio.gather(
+            *(coin_metadata(client, candidate) for candidate in batch), return_exceptions=True
+        )
+        for candidate, metadata in zip(batch, answers, strict=True):
+            if isinstance(metadata, dict):
+                return candidate, metadata
+        failure = failure or next((a for a in answers if isinstance(a, BaseException)), None)
+    if failure is not None:
+        raise failure  # nothing confirmed and a lookup failed: no verdict possible
     return None

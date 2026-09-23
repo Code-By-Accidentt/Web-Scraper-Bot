@@ -415,3 +415,14 @@ async def test_facade_routes_sui_addresses(tmp_path: Path) -> None:
         rejected = await validator.validate(Address(Chain.SUI, SUI_WALLET))
         assert rejected.status is ValidationStatus.REJECTED
         assert rpc.count("sol.rpc") == 0 and rpc.count("alpha.rpc") == 0
+
+
+async def test_packages_with_many_structs_are_searched_completely() -> None:
+    rpc = FakeRpc()
+    coin = f"{SUI_PKG}::coin::MEME"  # witness name differs from the module: sorts last
+    helpers = {"lib": [f"Struct{i}" for i in range(20)], "coin": ["MEME"]}
+    rpc.route("sui.rpc", sui_node(coins={coin: {"decimals": 9}}, packages={SUI_PKG: helpers}))
+    async with rpc.client() as http:
+        strict = SuiCoinValidator(http, "https://sui.rpc", timeout=5, tuning=FakeTuning())
+        assert await strict.is_coin_or_package(SUI_PKG)
+    assert rpc.count("sui.rpc", "suix_getCoinMetadata") == 21

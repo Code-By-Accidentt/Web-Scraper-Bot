@@ -122,3 +122,12 @@ def test_detect_chain_for_context_free_addresses() -> None:
     assert detect_chain(SUI_PKG) is Chain.SUI
     assert detect_chain(USDC_ETH) is Chain.ETHEREUM
     assert detect_chain(USDC_SOL) is Chain.SOLANA
+
+
+def test_evm_pattern_stops_before_a_sui_type_separator() -> None:
+    forty = "0x" + "ab" * 20
+    found = AddressExtractor().extract(f"Type {forty}::meme::MEME on Sui")
+    assert found == [Address(Chain.SUI, "0x" + "0" * 24 + "ab" * 20 + "::meme::MEME")]
+    assert AddressExtractor().extract(f"Wallet {forty} here") == [
+        Address(Chain.ETHEREUM, to_checksum_address(forty))
+    ]

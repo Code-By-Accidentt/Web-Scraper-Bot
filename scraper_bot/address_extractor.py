@@ -13,7 +13,8 @@ from scraper_bot.models import Address, Chain
 
 # All patterns refuse matches glued to other alphanumerics, so fragments of hashes,
 # base64 blobs and minified identifiers do not become candidates.
-EVM_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z])")
+# ``::`` after 40 digits would be a (short) Sui coin type, not an EVM address.
+EVM_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z]|::)")
 _BASE58 = "1-9A-HJ-NP-Za-km-z"
 SOLANA_ADDRESS_RE = re.compile(rf"(?<![{_BASE58}])[{_BASE58}]{{32,44}}(?![{_BASE58}])")
 # Sui names a coin by its type ``0x<package>::<module>::<NAME>``; a bare 32-byte id may

@@ -126,7 +126,11 @@ class Backend:
         if host == "api.dexscreener.com":
             if self.dex_delay:
                 await asyncio.sleep(self.dex_delay)
-            return httpx.Response(self.dex_status, json=self.pairs)
+            # Hand-encoded so that NaN/Infinity tokens (json.dumps emits them) get through.
+            body = json.dumps(self.pairs).encode()
+            return httpx.Response(
+                self.dex_status, content=body, headers={"content-type": "application/json"}
+            )
         if self.rpc_down:
             raise httpx.ConnectError("down", request=request)
         body = json.loads(request.content)
@@ -337,3 +341,21 @@ async def test_sui_package_is_resolved_to_its_coin() -> None:
     ]
     backend.sui_packages = {SUI_PKG: {"helpers": ["Config"]}}  # no coin inside
     assert await make(backend).enrich(SUI_PACKAGE_CONTRACT) == TokenInfo()
+
+
+async def test_non_finite_market_numbers_are_dropped() -> None:
+    backend = Backend()
+    odd = {**pair(), "priceUsd": "NaN", "fdv": "Infinity", "pairCreatedAt": float("nan")}
+    backend.pairs = [odd]
+    info = await make(backend).enrich(ETH_CONTRACT)
+    assert info.pair == "USDC/WETH" and info.liquidity_usd == 1000.0
+    assert (info.price_usd, info.fdv_usd, info.pair_created_at) == (None, None, None)
+
+
+def test_sui_types_match_case_sensitively_except_for_the_package() -> None:
+    from scraper_bot.enrichment import best_pair
+
+    other_case = SUI_COIN.replace("::USDC", "::Usdc")
+    assert best_pair([pair(chain="sui", base=other_case)], "sui", SUI_COIN, Chain.SUI) is None
+    shouting = "0x" + SUI_PKG[2:].upper() + "::usdc::USDC"
+    assert best_pair([pair(chain="sui", base=shouting)], "sui", SUI_COIN, Chain.SUI) is not None
