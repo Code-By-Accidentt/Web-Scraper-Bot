@@ -1,164 +1,121 @@
-# 🔍 Website Contract Monitor Bot
+# 🔍 Website Contract Monitor Bot
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue?logo=python)
 
-> **Automated Web Watcher for Smart‑Contract Addresses**
-> Tracks multiple websites (and their common sub‑pages) for Ethereum & Solana addresses, validates them over RPC, sends Telegram alerts, **auto‑pauses** when too many contracts appear, and keeps a full change‑log diff of every page.
+Telegram-controlled watcher for token launches. It renders websites in a headless
+browser, reports **confirmed changes** of their content and hunts for **smart-contract
+addresses** on EVM chains, Solana and Sui, confirming every candidate on-chain before it
+bothers you.
 
----
+## What it does
 
-## ✨ Key Features
+- **Real rendering, fast.** One shared Chromium (Playwright), pages rendered in parallel
+  tabs, network-idle detection instead of fixed sleeps. A round over a site and its
+  sub-pages takes about two seconds.
+- **Root URL plus sub-pages.** Every site is watched together with a configurable set of
+  derived pages (`app.<domain>`, `docs.<domain>`, `/dashboard`, ...); a sub-page is
+  announced once when it first appears.
+- **Change detection that does not lie.** Structural diff of the rendered DOM (text and
+  attributes), every change confirmed by a second render, whatever differs between the two
+  renders (timers, counters, banners) is ignored, elements that keep flapping are silenced.
+  Alerts say *what* changed, not only how much.
+- **Contract discovery on three chain families.** `0x…` addresses on 8 EVM networks,
+  Solana programs and SPL / Token-2022 mints, Sui coin types and packages. Candidates are
+  taken from the whole rendered page and, with deep scan, from iframes, shadow DOM and every
+  script or JSON answer the page loaded. Verdicts are cached; a rate-limited node never
+  turns a real token into a cached rejection.
+- **Alerts with token details.** Name, symbol, decimals, supply from the chain, the most
+  liquid DEX pair from DexScreener, links to the explorer, DexScreener and a swap page.
+  Every alert names exactly one token.
+- **Turbo mode.** `/turbo <url>` renders a site every 2 s, optionally from a scheduled
+  time, announces every new address immediately and confirms it the moment the contract
+  is deployed.
+- **Unverified mode.** `/unverified <url> on` announces every new address on a site at
+  once and keeps re-checking it on-chain for a day.
+- **Live settings.** `/settings` explains every tunable knob, `/set` changes it without a
+  restart, risky values ask for `confirm`.
+- **Block awareness.** 403/429/503, WAF challenges and connection resets slow the site's
+  interval down (doubling, bounded), with one warning and one recovery notice. No proxy
+  rotation, no captcha bypass.
+- **Pages that keep timing out** get one alert and a longer load timeout until they render
+  again.
+- **Persistent and supervised.** Sites, flags, snapshots and caches live under `data/` and
+  survive restarts; `rebooter.py` restarts the bot when it dies or stops heart-beating.
 
-* **Multi‑chain validation** – Ethereum (Mainnet, Base, Arbitrum, Optimism) + Solana
-* **Dynamic page rendering** with Selenium + Chrome Driver
-* **Content diff engine** – detects added/removed text & attribute changes
-* **Threshold‑based auto‑pause** – stops parsing when ≥ 5 confirmed contracts are found at once and ships a text file with all addresses
-* **Per‑site notification switch** – `/notify` & `/nonotifi` commands
-* **Persistent state** – monitored sites, diffs, caches, and rejected addresses survive restarts
-* **Thread‑pool architecture** – one global executor per root site; inner pools for sub‑URLs
-* **Telegram bot control** – add/remove/pause/resume/list sites in real time
-* **Snapshot clean‑up** – orphaned HTML snapshots are purged automatically
-
----
-
-## 📂 Repository Layout
-
-```text
-.
-├── main.py                    # Main entry‑point (this repo’s giant script)
-├── rebooter.py                # A mandatory rebooter so that the bot continues working immediately after rebooting.
-├── requirements.txt           # Exact, pinned runtime deps
-├── snapshots/                 # HTML snapshots for diffing (auto‑generated)
-├── monitored_sites.txt        # URLs added via /add (one per line)
-├── changes_count.json         # Per‑URL diff statistics (auto)
-├── found_wallets.txt          # ✅ Confirmed contracts (auto, rotates at 120)
-├── rejected_contracts.txt     # 🚫 Non‑contract Solana addresses (auto, rotates at 100)
-└── notifications_status.json  # Per‑site ON/OFF flags
-```
-
----
-
-## 🚀 Quick Start
-
-```bash
-# 1.  Clone the repo
-$ git clone https://github.com/Tomashevskyi-Vladyslav/Website_Contract_Monitor_Bot.git
-$ cd Website_Contract_Monitor_Bot
-
-# 2.  Create Python 3.10+ venv & install deps
-$ python -m venv .venv && source .venv/bin/activate
-$ pip install -r requirements.txt
-
-# 3.  Export mandatory tokens (or put them in .env)
-$ export TELEGRAM_BOT_TOKEN="123456:ABC…"
-$ export ETH_RPC_URL="https://mainnet.infura.io/v3/<KEY>"
-
-# 4.  Run the bot
-$ python bot.py
-```
-
-> **Docker?**  A minimal `Dockerfile` is included – `docker compose up -d` spins everything in one command.
-
----
-
-## ⚙️ Configuration
-
-### Environment Variables
-
-| Variable             | Required | Default                               | Description                                                              |
-| -------------------- | -------- | ------------------------------------- | ------------------------------------------------------------------------ |
-| `TELEGRAM_BOT_TOKEN` | ✅        | –                                     | Bot token from [@BotFather](https://t.me/BotFather)                      |
-| `CHAT_IDS`           | ❌        | hard‑coded list                       | Comma‑separated chat IDs that receive alerts                             |
-| `ETH_RPC_URL`        | ✅        | Infura endpoint                       | Ethereum (or compatible) full node                                       |
-| `SOLANA_RPC_URL`     | ❌        | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint                                                      |
-| `*_RPC_URL`          | ❌        | public nodes                          | **Base**, **Arbitrum**, **Optimism**, **BSC**, **Fantom**, **Avalanche** |
-
-### Thresholds & Limits
-
-| Constant                        | Purpose                           | Default |
-| ------------------------------- | --------------------------------- | ------- |
-| `CONTRACT_PAUSE_THRESHOLD`      | Max contracts before *auto‑pause* | `5`     |
-| `found_wallets.txt` rotate      | Max cached addresses before wipe  | `120`   |
-| `rejected_contracts.txt` rotate | Max pseudo‑tokens before wipe     | `100`   |
-
-Feel free to tweak those values at the top of `bot.py`.
-
----
-
-## 💬 Telegram Commands
-
-```text
-/add <url>       – start monitoring the site
-/remove <url>    – stop monitoring
-/pause <url>     – temporary pause
-/resume <url>    – resume after pause
-/list            – show sites + status
-/nonotifi <url>  – mute all diff alerts
-/notify <url>    – un‑mute alerts
-/help            – command reference (in chat)
-```
-
-> **Tip:** `/list` returns both *notification* status (ON/OFF) and *running* status (RUNNING/PAUSED) for every URL.
-
----
-
-## 🔍 How It Works
-
-1. **Listener thread** polls the Telegram Bot API ➜  handles user commands.
-2. Each **root URL** gets its own monitoring thread:
-
-   * Builds a list of common sub‑URLs (`/docs`, `/app`, `app.<domain>`, etc.)
-   * Performs a quick `HEAD` request – announces newly discovered sub‑domains.
-   * Fetches the fully rendered HTML with *headless Chrome*.
-   * Extracts potential wallets via regex ➜ validates on‑chain.
-   * Runs a **double‑pass diff** (download → wait 2 s → re‑download) to kill false positives.
-3. If ≥ `CONTRACT_PAUSE_THRESHOLD` **validated** contracts appear on **one page**:
-
-   * Sends them as a `.txt` document.
-   * Auto‑pauses the root site (and all its sub‑pages).
-4. All snapshots, counters and caches are flushed to disk every time a diff or command modifies the state.
-
----
-
-## 🛠 Development
+## Quick start
 
 ```bash
-# run linters & tests
-autopep8 -r --in‑place bot.py
-pytest -q
+git clone https://github.com/code-by-accident/Web-Scraper-Bot.git
+cd Web-Scraper-Bot
+python -m venv .venv
+.venv\Scripts\activate            # Windows      (Linux/macOS: source .venv/bin/activate)
+pip install -r requirements.txt
+playwright install chromium       # once: downloads the browser used for rendering
+copy .env.example .env            # Linux/macOS: cp .env.example .env
+#   edit .env: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS
+python main.py
 ```
 
-### Useful Make Targets
+Don't know your chat id? Start the bot with only the token set, send it `/start`, and it
+replies with the id. Keep it alive unattended with `python rebooter.py`.
 
-```makefile
-make install   # poetry install
-make run       # python bot.py
-make lint      # ruff + mypy
+## Commands
+
+```text
+/add <url>          start monitoring ("example.com" works, https is assumed)
+/remove <url>       stop monitoring and delete the site's snapshots
+/pause <url>        pause monitoring (survives restarts)
+/resume <url>       resume monitoring
+/list               sites with alert status, running state and last change
+/nonotifi <url>     mute change alerts for a site (contracts are still reported)   alias: /mute
+/notify <url>       un-mute change alerts                                         alias: /unmute
+/turbo <url> [minutes] [at HH:MM | in 10m]   turbo mode; /turbo stop <url> ends it; /turbo shows status
+/unverified <url> on|off                     announce every new address at once, confirm later
+/settings [key]                              live settings with explanations
+/set <key> <value> [confirm]                 change one live setting
+/settings reset <key|all>                    back to the .env value
+/status             uptime, browser, rounds per site, blocks, turbo, cache sizes
+/help               command list;  /start also shows your chat id
 ```
 
----
+Every command is described with its replies in [docs/commands.md](docs/commands.md).
 
-## Contributing
+## Documentation
 
-1. **Fork** the repo
-2. Create your feature branch: `git checkout -b feat/amazing`
-3. Commit your changes: `git commit -m 'feat: add amazing feature'`
-4. Push to the branch: `git push origin feat/amazing`
-5. Open a **Pull Request**
+| Page | Read it for |
+| --- | --- |
+| [docs/operations.md](docs/operations.md) | Installing, running, the supervisor, logs, **what every alert means and what to do**, the data directory, troubleshooting, upgrading |
+| [docs/configuration.md](docs/configuration.md) | Every setting with its default, meaning and live `/set` key |
+| [docs/commands.md](docs/commands.md) | Every Telegram command, its replies and who may use it |
+| [docs/architecture.md](docs/architecture.md) | How a round works, the rules behind change detection and validation, state on disk, concurrency |
+| [docs/development.md](docs/development.md) | Tests, conventions, measured performance numbers, how to add a setting, a chain, an alert or a command |
+| [SECURITY.md](SECURITY.md) | What the bot touches, who can control it, safe operation, reporting |
 
-Please run `pre‑commit` before pushing
+## Layout
 
----
+```text
+main.py, rebooter.py        entry point and supervisor
+scraper_bot/
+  app.py config.py preferences.py models.py storage.py    core and state
+  pages/        rendering, HTML normalisation, diffing, noise filter, block detection
+  chains/       address extraction, JSON-RPC, EVM / Solana / Sui validation, token details
+  monitoring/   site monitor, monitor manager, turbo mode, unverified mode
+  telegram/     Bot API client, commands, alerts, /status, HTML markup
+tests/          pytest suite mirroring the packages, offline; browser tests behind a flag
+docs/           the pages above
+data/           runtime data, git-ignored, created on first start
+```
 
-## 📜 License
+## Development
 
-Distributed under the License.  See `LICENSE` for more information.
+```bash
+pip install -r requirements-dev.txt
+pytest -q                                # offline: no network, no browser
+ruff check . && ruff format --check .
+SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/test_fetcher_browser.py   # real Chromium
+```
 
----
+## License
 
-## Acknowledgements/Additional Documentation
-
-* [web3.py](https://github.com/ethereum/web3.py)
-* [solana‑py](https://github.com/michaelhly/solana-py)
-* [Selenium](https://www.selenium.dev/documentation/) & [ChromeDriver](https://developer.chrome.com/docs/chromedriver/get-started)
-* [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/bs4/doc/)
+[PolyForm Noncommercial 1.0.0](LICENSE.md): use, run and change it for any noncommercial
+purpose; commercial use needs a separate agreement with the author.

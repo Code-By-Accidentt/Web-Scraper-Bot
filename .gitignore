@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Runtime data (state, snapshots, caches, logs)
+data/
+snapshots/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
