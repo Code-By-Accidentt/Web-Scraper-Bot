@@ -34,7 +34,7 @@ TOKEN_A = "0x" + "aa" * 20
 TOKEN_B = "0x" + "bb" * 20
 TOKEN_C = "0x" + "cc" * 20
 LAUNCH = "0x" + "dd" * 20
-WALLET = "0x" + "ee" * 20
+WALLET = "0x" + "e1" * 20  # (0xeeee...eeee is the stop-listed native-coin placeholder)
 CHALLENGE = "<html><head><title>Just a moment...</title></head><body>Checking</body></html>"
 ENV = {
     "TELEGRAM_CHAT_IDS": str(CHAT),
@@ -80,19 +80,21 @@ class FakeChain:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
-        if host == "alpha.rpc":
-            return self._evm(json.loads(request.content))
-        if host in {"sol.rpc", "sui.rpc"}:
-            return self._result({"value": None})
+        if host in {"alpha.rpc", "sol.rpc", "sui.rpc"}:
+            body = json.loads(request.content)
+            answer = self._evm if host == "alpha.rpc" else self._empty
+            if isinstance(body, list):
+                return httpx.Response(200, json=[answer(item) for item in body])
+            return httpx.Response(200, json=answer(body))
         if host == "api.dexscreener.com":
             return httpx.Response(200, json=[])
         return httpx.Response(200 if str(request.url) in self.live_pages else 404)
 
-    def _evm(self, body: dict[str, Any]) -> httpx.Response:
-        method, params = body["method"], body["params"]
+    def _evm(self, item: dict[str, Any]) -> dict[str, Any]:
+        method, params = item["method"], item["params"]
         if method == "eth_getCode":
             deployed = params[0].lower() in self.deployed
-            return self._result("0x6080604052" if deployed else "0x")
+            return self._result(item, "0x6080604052" if deployed else "0x")
         if method == "eth_call":
             answers = {
                 ERC20_NAME: abi_string("Launch Token"),
@@ -100,13 +102,18 @@ class FakeChain:
                 ERC20_DECIMALS: abi_uint(18),
                 ERC20_TOTAL_SUPPLY: abi_uint(1_000 * 10**18),
             }
-            return self._result(answers.get(params[0]["data"], "0x"))
+            return self._result(item, answers.get(params[0]["data"], "0x"))
+        if method == "eth_getTransactionCount":
+            return self._result(item, "0x0")  # nothing on this chain has sent a transaction
         error = {"code": -32601, "message": f"unknown method {method}"}
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": error})
+        return {"jsonrpc": "2.0", "id": item["id"], "error": error}
+
+    def _empty(self, item: dict[str, Any]) -> dict[str, Any]:
+        return self._result(item, {"value": None})  # no Solana account, no Sui object
 
     @staticmethod
-    def _result(value: Any) -> httpx.Response:
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": value})
+    def _result(item: dict[str, Any], value: Any) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": item["id"], "result": value}
 
 
 class Bot:
@@ -169,6 +176,24 @@ class Bot:
         pending = [text for _, text in self.telegram.messages[self._cursor :]]
         raise AssertionError(f"no alert containing {needle!r}; unread alerts: {pending}")
 
+    async def edited(self, needle: str, timeout: float = 5.0) -> str:
+        """The first edit of a sent alert that contains ``needle``."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for _, text in self.telegram.edits:
+                if needle in text:
+                    return text
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"no edit containing {needle!r}; edits: {self.telegram.edits}")
+
+    async def until(self, condition: Any, what: str, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"timed out waiting for {what}")
+
     def alerted(self, needle: str) -> bool:
         return any(needle in text for _, text in self.telegram.messages)
 
@@ -210,8 +235,10 @@ async def test_bot_lifecycle_through_telegram(tmp_path: Path) -> None:
         chain.deployed.add(TOKEN_A)
         fetcher.html(ROOT, page("Launch is live", f"Token: {TOKEN_A}"))
         found = await bot.alert("🔔 Contract found")
-        assert "Launch Token (LNCH)" in found and "18 decimals" in found
-        assert "No DEX pair listed yet" in found and "Etherscan" in found
+        assert "Etherscan" in found and "Found in page text: «Launch is live Token:»" in found
+        assert "⏱ appeared between" in found
+        details = await bot.edited("Launch Token (LNCH)")  # the details follow as an edit
+        assert "18 decimals" in details and "No DEX pair listed yet" in details
         listing = await bot.command("/list")
         assert "[alerts: OFF]" in listing and "[RUNNING]" in listing
 
@@ -233,11 +260,19 @@ async def test_bot_lifecycle_through_telegram(tmp_path: Path) -> None:
         assert (await bot.command(f"/turbo {ROOT} 1")).startswith("🚀 Turbo started")
         await bot.alert("🚀 Turbo mode on")
         fetcher.html(ROOT, page("Launch is live", TOKEN_A, TOKEN_B, TOKEN_C, f"Presale: {LAUNCH}"))
-        await bot.alert("⚠️ Unverified address")
+        # Not a token yet: nothing is announced, the address waits in the pending watch.
+        await bot.until(lambda: bot.runtime.pending.count() >= 1, "the address to be watched")
+        assert not bot.alerted("⚠️ Unverified address")
         chain.deployed.add(LAUNCH)  # the contract is deployed after its address was published
+        created = await bot.alert("🔔 Contract found", timeout=8.0)
+        # The pending watch or the next turbo cycle, whichever sees it first, announces it.
+        assert LAUNCH in created.lower()
+        # "deployed between" once a check saw it absent; the first look may already find it
+        assert any(words in created for words in ("between", "on page since"))
         finished = await bot.alert("🎯 Turbo finished", timeout=8.0)
         assert "1 confirmed contract(s)" in finished and LAUNCH in finished.lower()
-        assert bot.alerted("✅ Confirmed") or bot.alerted("🔔 Contract found")
+        launch_alerts = [t for _, t in bot.telegram.messages if "🔔" in t and LAUNCH in t.lower()]
+        assert len(launch_alerts) == 1  # one token, one alert
 
         # Unverified mode announces a plain wallet at once and remembers it.
         assert "Unverified mode ON" in await bot.command(f"/unverified {ROOT} on")

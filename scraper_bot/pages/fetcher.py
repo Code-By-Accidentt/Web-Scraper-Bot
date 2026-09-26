@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from playwright import async_api as pw
@@ -25,6 +27,40 @@ class BrowserUnavailable(RuntimeError):
 _SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
 _SCANNED_CONTENT_TYPES = ("javascript", "ecmascript", "json", "text/", "xml")
 _PER_RESPONSE_LIMIT = 3 * 1024 * 1024
+
+# Requests a page makes that the bot never needs. Next.js prefetches the pages its links
+# point to (harvestco.ai: ten per load), and analytics beacons report every render to the
+# site owner as a visit. Neither changes what the page shows. A prefetch is an ?_rsc= fetch
+# with a prefetch header, or any ?_rsc= fetch of another page: links with prefetch={true}
+# send no header (heaven.xyz). The page's own ?_rsc= fetch (router.refresh() revealing a
+# CA) passes. Vercel's own checkpoint (/.well-known/vercel/) is always let through.
+_ANALYTICS_HOSTS = (
+    "google-analytics.com",
+    "analytics.google.com",
+    "googletagmanager.com",
+    "vitals.vercel-insights.com",
+    "va.vercel-scripts.com",
+    "cloudflareinsights.com",
+    "cdn.segment.com",
+    "api.segment.io",
+    "api-js.mixpanel.com",
+    "api.mixpanel.com",
+    "api-eu.mixpanel.com",
+    "cdn.mxpnl.com",
+    "static.hotjar.com",
+    "script.hotjar.com",
+    "clarity.ms",
+    "i.posthog.com",
+    "app.posthog.com",
+    "us.posthog.com",
+    "eu.posthog.com",
+    "ingest.sentry.io",
+    "ingest.us.sentry.io",
+    "ingest.de.sentry.io",
+    "stats.g.doubleclick.net",
+)
+_ANALYTICS_PATHS = ("/_vercel/insights/", "/_vercel/speed-insights/", "/cdn-cgi/rum")
+_ALWAYS_ALLOWED = "/.well-known/vercel/"
 
 # Collects the markup of every (open) shadow root on the page, nested ones included.
 _SHADOW_ROOTS_JS = """
@@ -51,9 +87,13 @@ class FetchResult:
     html: str = ""
     error: str | None = None
     extra_texts: tuple[str, ...] = ()  # frames, shadow roots, script/JSON bodies (deep scan)
+    dom_texts: tuple[str, ...] = ()  # the frames and shadow roots among them: page content
     headers: dict[str, str] = field(default_factory=dict)  # of the main document
     retry_after: float | None = None  # seconds, from a Retry-After header
     timed_out: bool = False  # the document never arrived within the load timeout
+    # when loading began (epoch seconds), after any wait for a free tab: the page shows
+    # what the site served between this moment and the end of the render
+    started_at: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -96,6 +136,7 @@ class PlaywrightFetcher:
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_pages)
         self._launch_lock = asyncio.Lock()
         self._blocked = frozenset(settings.blocked_resource_types)
+        self._args = list(settings.browser_args)
 
     async def __aenter__(self) -> PlaywrightFetcher:
         await self.start()
@@ -146,6 +187,7 @@ class PlaywrightFetcher:
         if deep_scan:
             # Playwright wraps the handler; that breaks on a builtin like responses.append.
             page.on("response", lambda response: responses.append(response))
+        started_at = time.time()
         try:
             try:
                 response = await page.goto(
@@ -153,7 +195,11 @@ class PlaywrightFetcher:
                 )
             except pw.TimeoutError:
                 return FetchResult(
-                    url, None, error=f"timeout after {load_timeout:.0f}s", timed_out=True
+                    url,
+                    None,
+                    error=f"timeout after {load_timeout:.0f}s",
+                    timed_out=True,
+                    started_at=started_at,
                 )
             except pw.Error as exc:
                 if self._browser_gone(exc):
@@ -168,23 +214,27 @@ class PlaywrightFetcher:
             if tuning.settle_delay > 0:
                 await asyncio.sleep(tuning.settle_delay)
             html = await page.content()
-            extra = await self._deep_scan(page, responses) if deep_scan else ()
+            dom, bodies = await self._deep_scan(page, responses) if deep_scan else ((), ())
             status = response.status if response is not None else None
             headers = dict(response.headers) if response is not None else {}
             return FetchResult(
                 url,
                 status,
                 html,
-                extra_texts=extra,
+                extra_texts=dom + bodies,
+                dom_texts=dom,
                 headers=headers,
                 retry_after=_parse_retry_after(headers.get("retry-after")),
+                started_at=started_at,
             )
         finally:
             with contextlib.suppress(pw.Error):
                 await page.close()
 
-    async def _deep_scan(self, page: pw.Page, responses: list[pw.Response]) -> tuple[str, ...]:
-        """Markup of child frames and shadow roots plus scripts/JSON the page loaded."""
+    async def _deep_scan(
+        self, page: pw.Page, responses: list[pw.Response]
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """(markup of child frames and shadow roots, scripts/JSON the page loaded)."""
         budget = self._settings.deep_scan_max_bytes
         texts: list[str] = []
 
@@ -203,7 +253,10 @@ class PlaywrightFetcher:
                 take(await frame.content())
         with contextlib.suppress(pw.Error):
             take(str(await page.evaluate(_SHADOW_ROOTS_JS) or ""))
-        for response in responses:
+        dom = len(texts)
+        # In URL order, not arrival order: every render then fills the budget with the same
+        # bodies, and an address the first render skipped does not turn up later as "new".
+        for response in sorted(responses, key=lambda item: item.url):
             if budget <= 0:
                 break
             if not self._worth_scanning(response):
@@ -215,7 +268,7 @@ class PlaywrightFetcher:
             if len(body) > _PER_RESPONSE_LIMIT:
                 continue
             take(body.decode("utf-8", errors="replace"))
-        return tuple(texts)
+        return tuple(texts[:dom]), tuple(texts[dom:])
 
     @staticmethod
     def _worth_scanning(response: pw.Response) -> bool:
@@ -243,7 +296,9 @@ class PlaywrightFetcher:
         if "executable doesn't exist" in brief.lower() or "browsertype.launch" in brief.lower():
             return (
                 f"browser could not start: {brief}. "
-                "Install it with: playwright install chromium (then restart the bot)"
+                "Install it with: playwright install chromium (then restart the bot). Where "
+                "Playwright has no Chromium build (e.g. Ubuntu 20.04), install Google Chrome "
+                "and set BROWSER_CHANNEL=chrome"
             )
         return f"browser could not start: {brief}"
 
@@ -252,15 +307,20 @@ class PlaywrightFetcher:
         cfg = self._settings
         channel = cfg.browser_channel if cfg.browser_channel not in {"", "bundled"} else None
         self._browser = await self._playwright.chromium.launch(
-            headless=cfg.headless, channel=channel
+            headless=cfg.headless, channel=channel, args=self._args
         )
         self._context = await self._browser.new_context(
             viewport={"width": 1366, "height": 900},
             ignore_https_errors=True,
         )
-        if self._blocked:
-            await self._context.route("**/*", self._route)
-        log.info("browser started (%s, headless=%s)", channel or "chromium", cfg.headless)
+        # Every request passes the filter: blocked resource types, prefetches, beacons.
+        await self._context.route("**/*", self._route)
+        log.info(
+            "browser started (%s, headless=%s, args=%s)",
+            channel or "chromium",
+            cfg.headless,
+            " ".join(self._args) or "none",
+        )
 
     async def _close_browser(self) -> None:
         browser, self._browser, self._context = self._browser, None, None
@@ -269,10 +329,30 @@ class PlaywrightFetcher:
                 await browser.close()
 
     async def _route(self, route: pw.Route) -> None:
-        if route.request.resource_type in self._blocked:
+        if self._unwanted(route.request):
             await route.abort()
         else:
             await route.continue_()
+
+    def _unwanted(self, request: pw.Request) -> bool:
+        """Blocked resource types, Next.js prefetches and analytics beacons."""
+        url = request.url
+        if _ALWAYS_ALLOWED in url:
+            return False  # the checkpoint's own images and fonts included
+        if request.resource_type in self._blocked:
+            return True
+        headers = request.headers
+        if headers.get("next-router-prefetch") == "1" or "next-router-segment-prefetch" in headers:
+            return True
+        if "prefetch" in headers.get("purpose", "") or "prefetch" in headers.get("sec-purpose", ""):
+            return True
+        parts = urlsplit(url)
+        if "_rsc=" in parts.query and not _same_page(parts.path, request):
+            return True
+        host = (parts.hostname or "").lower()
+        if any(host == known or host.endswith("." + known) for known in _ANALYTICS_HOSTS):
+            return True
+        return parts.path.startswith(_ANALYTICS_PATHS)
 
     @staticmethod
     def _browser_gone(exc: pw.Error) -> bool:
@@ -287,6 +367,15 @@ class PlaywrightFetcher:
     def _brief(exc: BaseException) -> str:
         first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         return first_line[:200]
+
+
+def _same_page(path: str, request: pw.Request) -> bool:
+    """True when ``path`` is the page the request comes from, or that page is unknown."""
+    try:
+        page = urlsplit(request.frame.url).path
+    except pw.Error:  # a service worker's request has no frame
+        return True
+    return path.rstrip("/") == page.rstrip("/")
 
 
 def _parse_retry_after(value: str | None) -> float | None:

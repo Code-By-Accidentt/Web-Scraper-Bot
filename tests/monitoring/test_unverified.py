@@ -4,6 +4,7 @@ import pytest
 
 import scraper_bot.monitoring.unverified as unverified_module
 from scraper_bot.models import Address, Chain, ConfirmedContract, SiteState
+from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.unverified import UnverifiedWatcher, address_key, parse_key
 from scraper_bot.storage import AddressCache, StateStore
 from tests.conftest import FakeNotifier, FakeTuning, FakeValidator
@@ -27,6 +28,7 @@ class Harness:
         self.tuning = FakeTuning(unverified_recheck=60, unverified_watch=3600, **tuning)
         self.persist_calls = 0
         self.now = 1_000.0
+        self.registry = AlertRegistry()
 
         def persist() -> None:
             self.persist_calls += 1
@@ -38,6 +40,7 @@ class Harness:
             notifier=self.notifier,  # type: ignore[arg-type]
             persist=persist,
             tuning=self.tuning,
+            registry=self.registry,
             clock=lambda: self.now,
         )
 
@@ -89,6 +92,15 @@ async def test_confirmation_by_the_regular_monitor_is_silent(tmp_path: Path) -> 
     h = Harness(tmp_path)
     h.validator.known(A)
     await h.watcher.observe([A], PAGE)
+    await h.watcher.recheck()
+    assert h.notifier.confirmed == [] and h.site.unverified == {}
+
+
+async def test_a_token_already_announced_elsewhere_gets_no_confirmation(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.validator.confirm(A, "Base")  # the same fresh verdict the pending watch got
+    await h.watcher.observe([A], PAGE)
+    assert h.registry.claim(A)  # the pending watch sent its alert first
     await h.watcher.recheck()
     assert h.notifier.confirmed == [] and h.site.unverified == {}
 

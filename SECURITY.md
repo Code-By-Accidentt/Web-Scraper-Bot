@@ -6,7 +6,8 @@ run it safely and how to report a problem.
 ## Supported versions
 
 Only the `main` branch (version 2.x) receives fixes. The version 1 scripts are gone;
-their data files are imported once on the first start (see the README) and not
+their data files are imported once on the first start (see docs/operations.md,
+Upgrading) and not
 supported beyond that.
 
 ## Reporting a vulnerability
@@ -31,14 +32,13 @@ DexScreener. It holds no keys, signs nothing and never sends a transaction.
 
 ## Who can control the bot
 
-- With `TELEGRAM_ALLOWED_CHAT_IDS` empty (the default) **every Telegram chat that finds
-  the bot can run commands**: add or remove sites, start turbo sessions, read `/status`.
-  Set `TELEGRAM_ALLOWED_CHAT_IDS` to your own chat ids on any bot that is reachable by
-  strangers.
-- Settings (`/set`, `/settings reset`) and the unverified mode can only be changed from
-  `TELEGRAM_ALLOWED_CHAT_IDS`, or from `TELEGRAM_CHAT_IDS` when the allowlist is empty.
-  Everyone else can read the settings.
-- Commands from chats outside the allowlist are ignored and logged.
+- Commands are accepted from the chats in `TELEGRAM_ALLOWED_CHAT_IDS` or, when that list
+  is empty (the default), from the alert chats in `TELEGRAM_CHAT_IDS`. No other chat can
+  add or remove sites, start turbo sessions, read `/status` or change settings.
+- Any other chat that sends `/start` only learns its own chat id (at most once per ten
+  minutes per chat), so you can find the id to put into `.env`. Its other commands are
+  ignored and logged.
+- With both lists empty nobody can control the bot; only `/start` answers.
 
 ## Rendering untrusted pages
 
@@ -47,17 +47,17 @@ Keep these points in mind:
 
 - `/add` accepts any `http(s)` URL, including `localhost`, `127.0.0.1` and private
   ranges such as `10.x`, `192.168.x` and `169.254.x`. On a bot with open commands this
-  lets anyone make your browser fetch hosts inside your network and read what a change
-  alert or a contract alert reveals about them. This is a deliberate trade-off (monitoring
-  local staging sites is a supported use), so the protection is the chat allowlist
-  above. Do not run a bot with open commands on a machine that can reach anything
-  sensitive.
+  lets anyone who can command the bot make your browser fetch hosts inside your network
+  and read what a change alert or a contract alert reveals about them. This is a
+  deliberate trade-off (monitoring local staging sites is a supported use), so the
+  protection is the list of commanding chats above.
 - The browser is started with `ignore_https_errors=True`, so a monitored site with a
   broken or intercepted certificate still renders. The bot only reads pages, but the
   content it reports could be tampered with on the way.
-- Images, media and fonts are not downloaded; scripts run. Chromium's own sandbox
-  applies. Keep Playwright and the bundled browser current (`pip install -U playwright`
-  followed by `playwright install chromium`).
+- Images, media and fonts are not downloaded, nor are Next.js prefetches and analytics
+  beacons; scripts run. WebGL is off by default (`BROWSER_ARGS`). Chromium's own sandbox
+  applies. Keep Playwright and the bundled browser current: raise the `playwright` pin in
+  `requirements.txt`, `pip install -r requirements.txt`, then `playwright install chromium`.
 - Everything the bot sends to Telegram is HTML-escaped (`scraper_bot/telegram/markup.py`),
   so page text and URLs cannot inject markup into your chat. If Telegram still rejects a
   message, the same text is re-sent as plain text.
@@ -67,18 +67,21 @@ Keep these points in mind:
 - The public RPC endpoints in `.env` see every address the bot checks and your IP. Use
   your own endpoints if that matters.
 - DexScreener sees every confirmed contract address (token details).
-- The monitored sites see a headless Chrome with a normal desktop user agent coming from
-  your IP, at the pace set by `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`.
+- The monitored sites see a headless Chrome that says so (its user agent contains
+  `HeadlessChrome` and `navigator.webdriver` is true) coming from your IP, at the pace set
+  by `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`. Their analytics services do not: the bot
+  drops the beacons.
 
 ## What the bot never does
 
 - No captcha solving, no proxy or IP rotation, no fingerprint spoofing. When a site
-  answers 401/403/429/503, shows a challenge page or resets connections, the bot slows
+  answers 401/403/407/429/503, shows a challenge page or resets connections, the bot slows
   down (the interval doubles up to `BLOCK_MAX_BACKOFF`), tells you once, and resumes the
   normal pace when the root page answers again.
 - No writes to any blockchain, no wallets, no private keys.
 - No outbound traffic other than Telegram, the configured RPC endpoints, DexScreener and
-  the sites you asked it to watch.
+  the sites you asked it to watch, including the third-party hosts their pages load
+  (scripts, APIs, CDNs); analytics beacons are dropped.
 
 ## Operating safely
 
@@ -86,7 +89,10 @@ Keep these points in mind:
   should be readable by that user alone.
 - Rotate the token in @BotFather (`/revoke`) if it ever leaks; the bot fails fast with
   exit code 2 on a rejected token.
-- Keep dependencies current: `pip list --outdated`, then `pip install -U -r
-  requirements.txt` and `playwright install chromium`. Run `pytest -q` afterwards.
-- Watch the 🛑 alerts: they report crashed monitors, failing RPC endpoints and a
-  browser that could not start, at most once per ten minutes per problem.
+- Keep dependencies current: `requirements.txt` pins exact versions, so check `pip list
+  --outdated`, raise the pins you want, then `pip install -r requirements-dev.txt`
+  (runtime dependencies plus the test and lint tools) and `playwright install chromium`. Run `pytest -q`
+  afterwards.
+- Watch the 🛑 alerts: they report crashed monitors, failing RPC endpoints, an RPC
+  endpoint that serves another chain and a browser that could not start, at most once
+  per ten minutes per problem.

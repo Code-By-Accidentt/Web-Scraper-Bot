@@ -43,6 +43,15 @@ def test_tracking_parameters_are_stripped_from_urls() -> None:
     assert sig(html) == (node("a", "L", href="/p?id=5"), node("img", src="/i.png?w=10"))
 
 
+def test_query_strings_keep_the_encoding_stored_snapshots_have() -> None:
+    # A stored snapshot holds "%3A": encoding it differently would report every share link
+    # on the page as changed after an upgrade.
+    html = '<a href="https://x.com/intent/tweet?url=https://a.io&utm_source=x">Share</a>'
+    assert sig(html) == (
+        node("a", "Share", href="https://x.com/intent/tweet?url=https%3A%2F%2Fa.io"),
+    )
+
+
 def test_whitespace_and_nbsp_are_collapsed() -> None:
     assert sig("<p>  a \n\t b&nbsp;c​ </p>") == (node("p", "a b c"),)
 

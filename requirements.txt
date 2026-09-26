@@ -1,7 +1,9 @@
-playwright>=1.49
-httpx>=0.27
-lxml>=5.0
-base58>=2.1.1
-pycryptodome>=3.20
-python-dotenv>=1.0
-psutil>=5.9
+# Exact versions the test suite ran with; pyproject.toml states the minimums.
+playwright==1.63.0
+httpx==0.28.1
+h2==4.4.1
+lxml==6.1.3
+base58==2.1.1
+pycryptodome==3.23.0
+python-dotenv==1.2.3
+psutil==7.2.2

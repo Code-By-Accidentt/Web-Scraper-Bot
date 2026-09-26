@@ -1,7 +1,8 @@
 """Token details for a confirmed contract: on-chain metadata, DEX market data, links.
 
-Everything here is best effort and bounded by ``enrich_timeout``: a slow or failing
-source shortens the alert but never delays it past the budget or drops it.
+Everything here is best effort and bounded by ``enrich_timeout``. The alert is sent
+before any of it runs; what arrives within the budget is edited into the message, and a
+slow or failing source only leaves its lines out.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import hashlib
 import logging
 import math
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,7 +20,13 @@ import base58
 import httpx
 
 from scraper_bot.chains.address_extractor import is_sui_coin_type
-from scraper_bot.chains.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
+from scraper_bot.chains.evm import (
+    ERC20_DECIMALS,
+    ERC20_NAME,
+    ERC20_SYMBOL,
+    ERC20_TOTAL_SUPPLY,
+    is_delegated_wallet,
+)
 from scraper_bot.chains.rpc import JsonRpcClient, RpcError
 from scraper_bot.chains.solana import (
     METAPLEX_METADATA_PROGRAM,
@@ -38,7 +45,18 @@ log = logging.getLogger(__name__)
 DEXSCREENER_API = "https://api.dexscreener.com"
 _MAX_DECIMALS = 36
 _MAX_TEXT = 64
+# Token-2022 extension types (spl-token-2022 ExtensionType)
+_TRANSFER_FEE_CONFIG = 1
+_DEFAULT_ACCOUNT_STATE = 6
+_NON_TRANSFERABLE = 9
+_PERMANENT_DELEGATE = 12
+_TRANSFER_HOOK = 14
 _TOKEN_METADATA_EXTENSION = 19
+_PAUSABLE = 26
+_FROZEN = b"\x02"  # AccountState::Frozen
+# EVM age: public nodes keep ~100 blocks of state, so look 90 blocks back
+_AGE_BLOCKS = 90
+_SIGNATURE_PAGE = 1000  # Solana: one page of a mint's transactions
 
 
 # ── links ───────────────────────────────────────────────────────────────────
@@ -150,6 +168,16 @@ class TokenInfo:
     fdv_usd: float | None = None
     pair_created_at: float | None = None  # epoch seconds
     coin_type: str | None = None  # Sui: the coin found behind a bare package id
+    # Solana: who can still change the token under its holders
+    mint_authority: bool | None = None  # more can be minted
+    freeze_authority: bool | None = None  # holders' accounts can be frozen
+    risky_extensions: tuple[str, ...] = ()  # Token-2022 extensions that bind holders
+    # How old it is (public nodes keep ~100 blocks of EVM state, so the EVM answer is a bound)
+    deployed_within: float | None = None  # seconds: deployed at most this long ago
+    deployed_before: float | None = None  # seconds: deployed longer ago than this
+    created_at: float | None = None  # Solana: epoch seconds of the mint's first transaction
+    busy: bool = False  # Solana: 1000+ transactions, too many to find the first one
+    also_on: tuple[str, ...] = ()  # other EVM networks with a contract at this address
 
     @property
     def supply(self) -> float | None:
@@ -294,23 +322,59 @@ def parse_metaplex_metadata(data: bytes) -> tuple[str | None, str | None]:
     return _clean(name or ""), _clean(symbol or "")
 
 
-def parse_token2022_metadata(data: bytes) -> tuple[str | None, str | None]:
-    """(name, symbol) from the TokenMetadata extension embedded in a Token-2022 mint."""
+def token2022_extensions(data: bytes) -> Iterator[tuple[int, bytes]]:
+    """(type, body) of every extension of a Token-2022 mint, in account order."""
     if len(data) <= TOKEN_ACCOUNT_SIZE + 1 or data[TOKEN_ACCOUNT_SIZE] != TOKEN_2022_MINT_TYPE:
-        return None, None
+        return
     pos = TOKEN_ACCOUNT_SIZE + 1
     while pos + 4 <= len(data):
         kind = int.from_bytes(data[pos : pos + 2], "little")
         length = int.from_bytes(data[pos + 2 : pos + 4], "little")
-        body = data[pos + 4 : pos + 4 + length]
+        if kind == 0 and length == 0:
+            break  # padding
+        yield kind, data[pos + 4 : pos + 4 + length]
+        pos += 4 + length
+
+
+def parse_token2022_metadata(data: bytes) -> tuple[str | None, str | None]:
+    """(name, symbol) from the TokenMetadata extension embedded in a Token-2022 mint."""
+    for kind, body in token2022_extensions(data):
         if kind == _TOKEN_METADATA_EXTENSION:
             name, after = _read_borsh_string(body, 32 + 32)  # update authority, mint
             symbol, _ = _read_borsh_string(body, after)
             return _clean(name or ""), _clean(symbol or "")
-        if kind == 0 and length == 0:
-            break  # padding
-        pos += 4 + length
     return None, None
+
+
+def parse_authorities(data: bytes) -> tuple[bool, bool] | None:
+    """(mint authority kept, freeze authority kept) of a mint; each is a COption<Pubkey>."""
+    if len(data) < MINT_SIZE:
+        return None
+    return data[0:4] != bytes(4), data[46:50] != bytes(4)
+
+
+def parse_risky_extensions(data: bytes) -> tuple[str, ...]:
+    """Token-2022 extensions that let the issuer tax, freeze, seize or block holders."""
+    found: list[str] = []
+    for kind, body in token2022_extensions(data):
+        if kind == _TRANSFER_FEE_CONFIG and len(body) >= 108:
+            # older and newer fee schedules; either one taking a cut is a transfer tax
+            bps = max(
+                int.from_bytes(body[88:90], "little"), int.from_bytes(body[106:108], "little")
+            )
+            if bps:
+                found.append(f"transfer fee {bps / 100:g}%")
+        elif kind == _DEFAULT_ACCOUNT_STATE and body[:1] == _FROZEN:
+            found.append("new accounts start frozen")
+        elif kind == _NON_TRANSFERABLE:
+            found.append("non-transferable")
+        elif kind == _PERMANENT_DELEGATE and body[:32] != bytes(32):
+            found.append("permanent delegate")
+        elif kind == _TRANSFER_HOOK and body[32:64] != bytes(32):
+            found.append("transfer hook")
+        elif kind == _PAUSABLE:
+            found.append("paused" if body[32:33] == b"\x01" else "pausable")
+    return tuple(found)
 
 
 # ── DexScreener ─────────────────────────────────────────────────────────────
@@ -399,10 +463,12 @@ class TokenEnricher:
             left = max(budget - (time.monotonic() - started), 0.2)
             market = await self._bounded(self._market_details(contract, coin_type), left, "market")
         else:
-            on_chain, market = await asyncio.gather(
+            on_chain, market, provenance = await asyncio.gather(
                 self._bounded(self._chain_details(contract), budget, "chain"),
                 self._bounded(self._market_details(contract), budget, "market"),
+                self._bounded(self._provenance(contract), budget, "age"),
             )
+            on_chain = {**provenance, **on_chain}
         # What the chain says about the token wins over DexScreener's copy of it.
         return TokenInfo(**{**market, **on_chain})
 
@@ -445,7 +511,8 @@ class TokenEnricher:
         return {key: value for key, value in details.items() if value is not None}
 
     async def _solana_details(self, mint: str) -> dict[str, Any]:
-        params = {"encoding": "base64"}
+        # "confirmed", like the validator: at "finalized" a fresh mint does not exist yet.
+        params = {"encoding": "base64", "commitment": "confirmed"}
         mint_account, metadata_account = await asyncio.gather(
             self._solana.call("getAccountInfo", [mint, params]),
             self._solana.call("getAccountInfo", [metadata_address(mint), params]),
@@ -456,6 +523,12 @@ class TokenEnricher:
         parsed = parse_mint(mint_data)
         if parsed is not None:
             details["total_supply"], details["decimals"] = parsed
+        authorities = parse_authorities(mint_data)
+        if authorities is not None:
+            details["mint_authority"], details["freeze_authority"] = authorities
+        risky = parse_risky_extensions(mint_data)
+        if risky:
+            details["risky_extensions"] = risky
         name, symbol = parse_metaplex_metadata(account_data(metadata_account))
         if name is None and symbol is None:
             name, symbol = parse_token2022_metadata(mint_data)
@@ -489,6 +562,69 @@ class TokenEnricher:
         if supply is not None:
             details["total_supply"] = supply
         return details
+
+    # ── age and other networks ──────────────────────────────────────────────
+    async def _provenance(self, contract: ConfirmedContract) -> dict[str, Any]:
+        """How old the token is and where else it exists.
+
+        An old or foreign token on a launch page is worth a second look.
+        """
+        if contract.address.chain is Chain.SOLANA:
+            return await self._solana_age(contract.address.value)
+        if contract.address.chain is not Chain.ETHEREUM:
+            return {}
+        client = self._evm.get(contract.network)
+        if client is None:
+            return {}  # a network this bot does not query
+        age, others = await asyncio.gather(
+            self._evm_age(client, contract.address.value),
+            self._also_on(contract),
+            return_exceptions=True,
+        )
+        details: dict[str, Any] = {}
+        for part in (age, others):
+            if isinstance(part, dict):
+                details.update(part)
+        return details
+
+    async def _evm_age(self, client: JsonRpcClient, address: str) -> dict[str, Any]:
+        head = int(await client.call("eth_blockNumber", []), 16)
+        back = hex(max(head - _AGE_BLOCKS, 0))
+        code, block = await client.call_batch(
+            [("eth_getCode", [address, back]), ("eth_getBlockByNumber", [back, False])]
+        )
+        if not isinstance(code, str) or not isinstance(block, dict):
+            return {}  # older state is pruned on this node
+        window = max(time.time() - int(block["timestamp"], 16), 0.0)
+        if code.lower() in {"", "0x", "0x0"}:
+            return {"deployed_within": window}
+        return {"deployed_before": window}
+
+    async def _also_on(self, contract: ConfirmedContract) -> dict[str, Any]:
+        others = [(n, c) for n, c in self._evm.items() if n != contract.network]
+        codes = await asyncio.gather(
+            *(c.call("eth_getCode", [contract.address.value, "latest"]) for _, c in others),
+            return_exceptions=True,
+        )
+        found = tuple(
+            name
+            for (name, _), code in zip(others, codes, strict=True)
+            if isinstance(code, str)
+            and code.lower() not in {"", "0x", "0x0"}
+            and not is_delegated_wallet(code)
+        )
+        return {"also_on": found} if found else {}
+
+    async def _solana_age(self, mint: str) -> dict[str, Any]:
+        signatures = await self._solana.call(
+            "getSignaturesForAddress", [mint, {"limit": _SIGNATURE_PAGE, "commitment": "confirmed"}]
+        )
+        if not isinstance(signatures, list) or not signatures:
+            return {}
+        if len(signatures) >= _SIGNATURE_PAGE:
+            return {"busy": True}
+        first = signatures[-1].get("blockTime") if isinstance(signatures[-1], dict) else None
+        return {"created_at": float(first)} if isinstance(first, int | float) else {}
 
     # ── market ──────────────────────────────────────────────────────────────
     async def _market_details(

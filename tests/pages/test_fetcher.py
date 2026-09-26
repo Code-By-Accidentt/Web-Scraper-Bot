@@ -213,6 +213,7 @@ def test_explain_launch_error_points_to_playwright_install() -> None:
     text = PlaywrightFetcher._explain_launch_error(exc)
     assert text.startswith("browser could not start: BrowserType.launch: Executable doesn't exist")
     assert "playwright install chromium" in text
+    assert "BROWSER_CHANNEL=chrome" in text  # Ubuntu 20.04 has no Playwright Chromium
     assert "╔" not in text  # only the first line survives
 
 
@@ -237,8 +238,22 @@ async def test_is_connected_is_false_before_start(tmp_path: Path) -> None:
 
 # ── deep scan with duck-typed Playwright objects ────────────────────────────
 @dataclass
+class FakeFrameRef:
+    url: str
+
+
+@dataclass
 class FakeRequest:
     resource_type: str
+    url: str = URL
+    headers: dict[str, str] = field(default_factory=dict)
+    frame_url: str | None = URL  # None: a service worker's request, which has no frame
+
+    @property
+    def frame(self) -> FakeFrameRef:
+        if self.frame_url is None:
+            raise pw.Error("Service Worker requests do not have an associated frame.")
+        return FakeFrameRef(self.frame_url)
 
 
 @dataclass
@@ -248,6 +263,7 @@ class FakeResponse:
     payload: bytes = b""
     body_error: str | None = None
     body_calls: int = 0
+    url: str = URL
 
     @property
     def request(self) -> FakeRequest:
@@ -337,7 +353,10 @@ async def test_deep_scan_collects_frames_shadow_roots_and_bodies(tmp_path: Path)
     huge = FakeResponse("script", "application/javascript", b"x" * (_PER_RESPONSE_LIMIT + 1))
     empty = FakeResponse("fetch", "application/json", b"")
 
-    texts = await fetcher._deep_scan(page, [kept, json_answer, image, redirect, huge, empty])  # type: ignore[arg-type]
+    responses = [kept, json_answer, image, redirect, huge, empty]
+    dom, bodies = await fetcher._deep_scan(page, responses)  # type: ignore[arg-type]
+    texts = dom + bodies
+    assert dom == ("<p>frame one</p>", "<p>frame two</p>", "<p>shadow markup</p>")
 
     assert texts == (
         "<p>frame one</p>",
@@ -355,7 +374,7 @@ async def test_deep_scan_collects_frames_shadow_roots_and_bodies(tmp_path: Path)
 async def test_deep_scan_ignores_an_empty_shadow_result(tmp_path: Path) -> None:
     fetcher = PlaywrightFetcher(make_settings(tmp_path))
     page = FakePage(main_frame=FakeFrame("<html/>"), shadow=None)
-    assert await fetcher._deep_scan(page, []) == ()  # type: ignore[arg-type]
+    assert await fetcher._deep_scan(page, []) == ((), ())  # type: ignore[arg-type]
 
 
 async def test_deep_scan_honours_the_byte_budget(tmp_path: Path) -> None:
@@ -369,11 +388,21 @@ async def test_deep_scan_honours_the_byte_budget(tmp_path: Path) -> None:
     )
     response = FakeResponse("script", "application/javascript", b"never read")
 
-    texts = await fetcher._deep_scan(page, [response])  # type: ignore[arg-type]
+    dom, bodies = await fetcher._deep_scan(page, [response])  # type: ignore[arg-type]
+    texts = dom + bodies
 
     assert texts == ("f" * 600, "s" * 448)
     assert sum(len(text) for text in texts) == settings.deep_scan_max_bytes
     assert response.body_calls == 0  # budget exhausted before the responses
+
+
+async def test_deep_scan_reads_bodies_in_url_order_whatever_the_arrival(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path, DEEP_SCAN_MAX_MB="0.001"))
+    page = FakePage(main_frame=FakeFrame("<html/>"))
+    late = FakeResponse("script", "text/javascript", b"b" * 1048, url="https://x.io/a.js")
+    early = FakeResponse("script", "text/javascript", b"z" * 1048, url="https://x.io/z.js")
+    # z.js arrived first this time; the budget still goes to a.js, as on every render
+    assert await fetcher._deep_scan(page, [early, late]) == ((), ("b" * 1048,))  # type: ignore[arg-type]
 
 
 async def test_deep_scan_clips_a_body_to_the_remaining_budget(tmp_path: Path) -> None:
@@ -383,7 +412,8 @@ async def test_deep_scan_clips_a_body_to_the_remaining_budget(tmp_path: Path) ->
     first = FakeResponse("script", "application/javascript", b"a" * 100)
     second = FakeResponse("script", "application/javascript", b"b" * 100)
 
-    texts = await fetcher._deep_scan(page, [first, second])  # type: ignore[arg-type]
+    dom, bodies = await fetcher._deep_scan(page, [first, second])  # type: ignore[arg-type]
+    texts = dom + bodies
 
     assert texts == ("f" * 1000, "a" * 48)
     assert second.body_calls == 0
@@ -393,12 +423,15 @@ async def test_deep_scan_clips_a_body_to_the_remaining_budget(tmp_path: Path) ->
 @dataclass
 class FakeRoute:
     resource_type: str
+    url: str = URL
+    headers: dict[str, str] = field(default_factory=dict)
+    frame_url: str | None = "https://x.io/docs"  # the page the request comes from
     aborted: bool = False
     continued: bool = False
 
     @property
     def request(self) -> FakeRequest:
-        return FakeRequest(self.resource_type)
+        return FakeRequest(self.resource_type, self.url, self.headers, self.frame_url)
 
     async def abort(self) -> None:
         self.aborted = True
@@ -433,3 +466,98 @@ async def test_route_follows_the_configured_block_list(tmp_path: Path) -> None:
     await fetcher._route(stylesheet)  # type: ignore[arg-type]
     assert image.continued and not image.aborted
     assert stylesheet.aborted and not stylesheet.continued
+
+
+@pytest.mark.parametrize(
+    ("resource_type", "url", "headers", "blocked"),
+    [
+        # Next.js prefetches the pages its links point to
+        ("fetch", "https://x.io/docs?_rsc=1ld0r", {"rsc": "1", "next-router-prefetch": "1"}, True),
+        ("fetch", "https://x.io/docs", {"next-router-prefetch": "1"}, True),
+        ("fetch", "https://x.io/docs?_rsc=1", {"next-router-segment-prefetch": "/_tree"}, True),
+        ("document", "https://x.io/docs", {"sec-purpose": "prefetch;prerender"}, True),
+        ("document", "https://x.io/docs", {"purpose": "prefetch"}, True),
+        # prefetch={true} sends no header: an RSC fetch of another page is a prefetch too
+        ("fetch", "https://x.io/ideas?_rsc=rxx9e", {"rsc": "1"}, True),
+        # the page's own RSC fetch: router.refresh() revealing a CA
+        ("fetch", "https://x.io/docs/?_rsc=1ld0r", {"rsc": "1"}, False),
+        ("fetch", "https://x.io/docs", {"rsc": "1"}, False),
+        # analytics beacons
+        ("script", "https://www.googletagmanager.com/gtag/js?id=G-1", {}, True),
+        ("ping", "https://region1.google-analytics.com/g/collect?v=2", {}, True),
+        ("script", "https://static.cloudflareinsights.com/beacon.min.js", {}, True),
+        ("fetch", "https://x.io/_vercel/insights/event", {}, True),
+        ("script", "https://x.io/_vercel/speed-insights/script.js", {}, True),
+        ("fetch", "https://o1.ingest.us.sentry.io/api/1/envelope/", {}, True),
+        ("fetch", "https://o1.ingest.de.sentry.io/api/1/envelope/", {}, True),
+        ("fetch", "https://api-eu.mixpanel.com/track", {}, True),
+        ("fetch", "https://eu.posthog.com/e/", {}, True),
+        ("ping", "https://stats.g.doubleclick.net/g/collect", {}, True),
+        ("fetch", "https://x.io/cdn-cgi/rum?", {}, True),
+        # what the page needs, and Vercel's own checkpoint
+        ("document", "https://x.io/", {}, False),
+        ("script", "https://x.io/_next/static/chunks/main.js", {}, False),
+        ("fetch", "https://x.io/api/token", {}, False),
+        ("script", "https://notgoogle-analytics.com.example/x.js", {}, False),
+        ("fetch", "https://x.io/.well-known/vercel/security/request-challenge", {}, False),
+        ("fetch", "https://x.io/.well-known/vercel/x?_rsc=1", {}, False),
+        ("image", "https://x.io/.well-known/vercel/security/static/logo.png", {}, False),
+        ("font", "https://x.io/.well-known/vercel/security/static/inter.woff2", {}, False),
+    ],
+)
+async def test_route_drops_prefetches_and_beacons(
+    tmp_path: Path, resource_type: str, url: str, headers: dict[str, str], blocked: bool
+) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    route = FakeRoute(resource_type, url, headers)
+    await fetcher._route(route)  # type: ignore[arg-type]
+    assert (route.aborted, route.continued) == (blocked, not blocked)
+
+
+class FakeChromium:
+    def __init__(self) -> None:
+        self.launches: list[dict[str, object]] = []
+        self.routes: list[str] = []
+
+    async def launch(self, **kwargs: object) -> FakeChromium:
+        self.launches.append(kwargs)
+        return self
+
+    async def new_context(self, **_kwargs: object) -> FakeChromium:
+        return self
+
+    async def route(self, pattern: str, _handler: object) -> None:
+        self.routes.append(pattern)
+
+
+@dataclass
+class FakePlaywright:
+    chromium: FakeChromium = field(default_factory=FakeChromium)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, ["--disable-3d-apis", "--disable-webgl", "--disable-webgl2"]),
+        ("", []),
+        ("--lang=en-US '--window-size=1366,900'", ["--lang=en-US", "--window-size=1366,900"]),
+    ],
+)
+async def test_launch_passes_the_browser_args_and_always_installs_the_filter(
+    tmp_path: Path, value: str | None, expected: list[str]
+) -> None:
+    overrides = {} if value is None else {"BROWSER_ARGS": value}
+    fetcher = PlaywrightFetcher(make_settings(tmp_path, BLOCKED_RESOURCE_TYPES="", **overrides))
+    playwright = FakePlaywright()
+    fetcher._playwright = playwright  # type: ignore[assignment]
+    await fetcher._launch()
+    [launch] = playwright.chromium.launches
+    assert launch["args"] == expected
+    assert playwright.chromium.routes == ["**/*"]  # beacons are dropped even with no types
+
+
+async def test_a_service_worker_rsc_fetch_is_not_mistaken_for_a_prefetch(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    route = FakeRoute("fetch", "https://x.io/other?_rsc=1", {"rsc": "1"}, frame_url=None)
+    await fetcher._route(route)  # type: ignore[arg-type]
+    assert route.continued

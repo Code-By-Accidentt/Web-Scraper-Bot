@@ -75,11 +75,45 @@ async def send(commands: BotCommands, telegram: FakeTelegram, text: str, chat_id
 
 async def test_start_and_help(tmp_path: Path) -> None:
     _, telegram, commands = make(tmp_path)
-    reply = await send(commands, telegram, "/start", chat_id=77)
-    assert "chat id is 77" in reply
+    reply = await send(commands, telegram, "/start")
+    assert "chat id is 1" in reply
     assert "/add <url>" in reply
-    assert telegram.messages[-1][0] == 77
     assert "/remove <url>" in await send(commands, telegram, "/help")
+
+
+async def test_strangers_only_learn_their_chat_id_and_only_now_and_then(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    now = [1000.0]
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), clock=lambda: now[0])
+    reply = await send(commands, telegram, "/start", chat_id=77)
+    assert "chat id is 77" in reply and "cannot control the bot" in reply
+    assert "/add <url>" not in reply  # no command list for strangers
+    assert telegram.messages[-1][0] == 77
+    await commands.handle_update(update("/start", chat_id=77))
+    await commands.handle_update(update("/list", chat_id=77))
+    assert len(telegram.messages) == 1  # throttled, and other commands are ignored
+    now[0] += 601
+    await commands.handle_update(update("/start", chat_id=77))
+    assert len(telegram.messages) == 2
+
+
+async def test_the_stranger_reply_names_the_list_that_grants_commands(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    open_alerts = BotCommands(manager, telegram, alert_chat_ids=(1,))
+    assert "TELEGRAM_CHAT_IDS" in await send(open_alerts, telegram, "/start", chat_id=77)
+    with_allowlist = BotCommands(manager, telegram, allowed_chat_ids=(2,), alert_chat_ids=(1,))
+    reply = await send(with_allowlist, telegram, "/start", chat_id=78)
+    assert "TELEGRAM_ALLOWED_CHAT_IDS" in reply and "TELEGRAM_CHAT_IDS (" not in reply
+
+
+async def test_without_any_chat_ids_only_start_answers(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    nobody = BotCommands(manager, telegram)
+    await nobody.handle_update(update("/help", chat_id=5))
+    await nobody.handle_update(update("/add example.com", chat_id=5))
+    assert telegram.messages == []
+    assert "chat id is 5" in await send(nobody, telegram, "/start", chat_id=5)
+    assert manager.sites() == []
 
 
 async def test_full_site_lifecycle_through_commands(tmp_path: Path) -> None:
@@ -158,8 +192,10 @@ async def test_listener_dispatches_updates_and_advances_offset(tmp_path: Path) -
 
 async def test_status_command_uses_the_provider(tmp_path: Path) -> None:
     manager, telegram, _ = make(tmp_path)
-    with_status = BotCommands(manager, telegram, status_provider=lambda: "STATUS TEXT")
-    without = BotCommands(manager, telegram)
+    with_status = BotCommands(
+        manager, telegram, alert_chat_ids=(1,), status_provider=lambda: "STATUS TEXT"
+    )
+    without = BotCommands(manager, telegram, alert_chat_ids=(1,))
     assert await send(with_status, telegram, "/status") == "STATUS TEXT"
     assert await send(without, telegram, "/status") == "Status is not available."
     assert "/status" in await send(without, telegram, "/help")
@@ -167,14 +203,15 @@ async def test_status_command_uses_the_provider(tmp_path: Path) -> None:
 
 async def test_missing_alert_recipients_are_pointed_out(tmp_path: Path) -> None:
     manager, telegram, _ = make(tmp_path)
-    without = BotCommands(manager, telegram, alert_chat_ids=())
+    # Reachable only with an allowlist: without it, nobody could issue the command.
+    without = BotCommands(manager, telegram, allowed_chat_ids=(99,), alert_chat_ids=())
     configured = BotCommands(manager, telegram, alert_chat_ids=(1,))
     await manager.start()
     try:
         reply = await send(without, telegram, "/add example.com", chat_id=99)
         assert "TELEGRAM_CHAT_IDS is empty" in reply
         assert "chat id 99" in reply
-        assert "TELEGRAM_CHAT_IDS" not in await send(without, telegram, "/help")
+        assert "TELEGRAM_CHAT_IDS" not in await send(without, telegram, "/help", chat_id=99)
         assert "TELEGRAM_CHAT_IDS" not in await send(configured, telegram, "/list")
     finally:
         await manager.shutdown()
@@ -207,7 +244,7 @@ def make_turbo() -> TurboManager:
 async def test_turbo_commands(tmp_path: Path) -> None:
     manager, telegram, _ = make(tmp_path)
     turbo = make_turbo()
-    commands = BotCommands(manager, telegram, turbo=turbo)
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), turbo=turbo)
     try:
         assert "No turbo session" in await send(commands, telegram, "/turbo")
         assert await send(commands, telegram, "/turbo example.com 10") == (
@@ -273,15 +310,16 @@ async def test_set_validates_confirms_and_persists(tmp_path: Path) -> None:
     assert await send(commands, telegram, "/set") == strip_markup(SETTINGS_USAGE)
 
 
-async def test_settings_changes_need_an_admin_chat(tmp_path: Path) -> None:
+async def test_settings_cannot_be_read_or_changed_from_other_chats(tmp_path: Path) -> None:
     _, telegram, commands = with_preferences(tmp_path, chat_ids=(1,))
-    assert (await send(commands, telegram, "/set poll_interval_min 10", chat_id=99)).startswith(
-        "🔒"
-    )
-    assert (await send(commands, telegram, "/settings reset all", chat_id=99)).startswith("🔒")
-    assert "poll_interval_min = 4 s" in await send(commands, telegram, "/settings", chat_id=99)
+    for text in ("/set poll_interval_min 10", "/settings reset all", "/settings"):
+        await commands.handle_update(update(text, chat_id=99))
+    assert telegram.messages == []
+    assert "poll_interval_min = 4 s" in await send(commands, telegram, "/settings")
     _, telegram, nobody = with_preferences(tmp_path, chat_ids=())
-    assert "both are empty" in await send(nobody, telegram, "/set poll_interval_min 10")
+    await nobody.handle_update(update("/set poll_interval_min 10"))
+    assert telegram.messages == []
+    assert not (tmp_path / "prefs.json").exists()
 
 
 async def test_unverified_command(tmp_path: Path) -> None:
@@ -297,8 +335,10 @@ async def test_unverified_command(tmp_path: Path) -> None:
         assert "• https://example.com" in await send(commands, telegram, "/unverified")
         assert (await send(commands, telegram, "/unverified example.com off")).startswith("✅")
         assert manager.sites()[0].unverified_enabled is False
-        denied = await send(commands, telegram, "/unverified example.com on", chat_id=99)
-        assert denied.startswith("🔒")
+        replies = len(telegram.messages)
+        await commands.handle_update(update("/unverified example.com on", chat_id=99))
+        assert len(telegram.messages) == replies  # another chat is ignored
+        assert manager.sites()[0].unverified_enabled is False
         assert await send(commands, telegram, "/unverified example.com maybe") == (
             "Usage: /unverified <url> on|off"
         )
@@ -310,8 +350,10 @@ async def test_unverified_command(tmp_path: Path) -> None:
 async def test_replies_carry_html_markup_for_copyable_parts(tmp_path: Path) -> None:
     manager, telegram, commands = make(tmp_path)
     await commands.handle_update(update("/start", chat_id=77))
+    assert "<code>77</code>" in telegram.messages[-1][1]
+    await commands.handle_update(update("/start"))
     raw = telegram.messages[-1][1]
-    assert "<code>77</code>" in raw
+    assert "<code>1</code>" in raw
     assert "<code>/add &lt;url&gt;</code>" in raw
     assert "<url>" not in raw  # angle brackets are escaped, never sent raw
     await manager.start()
@@ -419,7 +461,7 @@ async def test_missing_recipients_warning_on_list_and_resume_but_not_pause(
     tmp_path: Path,
 ) -> None:
     manager, telegram, _ = make(tmp_path)
-    commands = BotCommands(manager, telegram, alert_chat_ids=())
+    commands = BotCommands(manager, telegram, allowed_chat_ids=(7,), alert_chat_ids=())
     warning = "⚠️ TELEGRAM_CHAT_IDS is empty"
     await manager.start()
     try:
@@ -508,7 +550,7 @@ async def test_generic_monitor_and_turbo_errors_fall_back_to_the_message(
 ) -> None:
     manager, telegram, _ = make(tmp_path)
     turbo = make_turbo()
-    commands = BotCommands(manager, telegram, turbo=turbo)
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), turbo=turbo)
 
     async def odd_pause(_url: str) -> SiteState:
         raise OddMonitorError("https://example.com")

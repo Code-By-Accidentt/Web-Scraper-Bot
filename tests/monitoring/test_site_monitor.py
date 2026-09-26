@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -7,14 +8,21 @@ import pytest
 
 from scraper_bot.models import (
     Address,
+    AddressKind,
     BlockSignal,
     Chain,
     ChangeCounts,
     ChangeReport,
     ConfirmedContract,
+    Observation,
     PageCheckOutcome,
     PageStatus,
+    Sighting,
+    SightingSource,
     SiteState,
+    Timeline,
+    ValidationResult,
+    ValidationStatus,
 )
 from scraper_bot.monitoring.site_monitor import _MAX_BLOCK_LEVEL, SiteMonitor
 from scraper_bot.pages.urls import SubUrlDeriver
@@ -162,7 +170,7 @@ async def test_many_contracts_send_a_document_and_pause_the_site() -> None:
 async def test_failing_check_does_not_break_the_round() -> None:
     h = Harness(statuses={APP: 404, DOCS: 200})
 
-    async def broken(page_url: str, *, load_timeout: float | None = None) -> PageCheckOutcome:
+    async def broken(page_url: str, **_: Any) -> PageCheckOutcome:
         if page_url == DOCS:
             raise RuntimeError("boom")
         return PageCheckOutcome(page_url, PageStatus.UNCHANGED)
@@ -291,7 +299,7 @@ async def test_block_level_is_capped() -> None:
 async def test_cancellation_propagates_out_of_a_round() -> None:
     h = Harness(statuses={APP: 404, DOCS: 200})
 
-    async def cancelled(page_url: str, *, load_timeout: float | None = None) -> PageCheckOutcome:
+    async def cancelled(page_url: str, **_: Any) -> PageCheckOutcome:
         if page_url == DOCS:
             raise asyncio.CancelledError
         return PageCheckOutcome(page_url, PageStatus.UNCHANGED)
@@ -311,9 +319,7 @@ async def test_stop_requested_during_a_round_skips_the_sleep() -> None:
 
     h = Harness(statuses={APP: 404, DOCS: 404}, sleep=record)
 
-    async def stop_while_checking(
-        page_url: str, *, load_timeout: float | None = None
-    ) -> PageCheckOutcome:
+    async def stop_while_checking(page_url: str, **_: Any) -> PageCheckOutcome:
         h.monitor.request_stop()  # e.g. /pause arrives while the page renders
         return PageCheckOutcome(page_url, PageStatus.UNCHANGED)
 
@@ -417,3 +423,177 @@ async def test_a_vanished_page_drops_its_streak_silently() -> None:
     h.prober.statuses[DOCS] = 404  # the sub-page disappeared for good
     await h.monitor.run_once()
     assert h.monitor.stats.timing_out == 0 and h.notifier.renders_again == []
+
+
+# ── token alerts from observations ──────────────────────────────────────────
+class ObservingChecker:
+    """Reports scripted observations per page, then an UNCHANGED outcome."""
+
+    def __init__(self) -> None:
+        self.observations: dict[str, list[Observation]] = {}
+
+    async def check(self, page_url: str, **kwargs: Any) -> PageCheckOutcome:
+        observer = kwargs.get("on_observation")
+        for observation in self.observations.pop(page_url, []):
+            await observer(observation)
+        return PageCheckOutcome(page_url, PageStatus.UNCHANGED)
+
+
+def seen(page: str, at: float, *addresses: Address, via: dict[Address, Address] | None = None):
+    """An observation of ``addresses`` in page text; tokens behind pairs through ``via``."""
+    via = via or {}
+    sightings = tuple(
+        Sighting(a, SightingSource.TEXT, f"CA {i}", True) for i, a in enumerate(addresses)
+    )
+    results = tuple(ValidationResult(a, ValidationStatus.CONFIRMED, "Base") for a in addresses)
+    results += tuple(
+        ValidationResult(token, ValidationStatus.CONFIRMED, "Base", via=pair)
+        for token, pair in via.items()
+    )
+    return Observation(page, at, sightings, results)
+
+
+def observing(
+    statuses: dict[str, int | None], threshold: int = 5
+) -> tuple[Harness, ObservingChecker]:
+    h = Harness(statuses=statuses, threshold=threshold)
+    checker = ObservingChecker()
+    h.monitor._checker = checker  # type: ignore[assignment]
+    return h, checker
+
+
+async def test_the_appearance_window_starts_when_the_previous_render_began() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    first = seen(ROOT, 100.0)
+    checker.observations = {ROOT: [dataclasses.replace(first, started_at=98.5)]}
+    await h.monitor.run_once()  # that render fetched the page at 98.5 and read it at 100
+    checker.observations = {ROOT: [seen(ROOT, 105.0, address(1))]}
+    await h.monitor.run_once()
+    [(_, timeline)] = h.notifier.contract_details
+    assert timeline == Timeline(105.0, missing_at=98.5)
+
+
+async def test_one_token_on_two_pages_is_announced_once() -> None:
+    h, checker = observing({APP: 404, DOCS: 200})
+    checker.observations = {
+        ROOT: [seen(ROOT, 10.0, address(7))],
+        DOCS: [seen(DOCS, 10.0, address(7))],
+    }
+    await h.monitor.run_once()
+    assert [c.address for c, _ in h.notifier.contracts] == [address(7)]
+
+
+async def test_the_timeline_says_when_the_address_appeared() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    checker.observations = {ROOT: [seen(ROOT, 100.0, address(1))]}
+    await h.monitor.run_once()  # the first read of the page
+    checker.observations = {ROOT: [seen(ROOT, 105.0, address(1), address(2))]}
+    await h.monitor.run_once()  # address(2) is new; address(1) was announced already
+    first, second = h.notifier.contract_details
+    assert first[1] == Timeline(100.0)  # nothing earlier to compare with
+    assert second[1] == Timeline(105.0, missing_at=100.0)
+    assert [c.address for c, _ in h.notifier.contracts] == [address(1), address(2)]
+    assert second[0] is not None and second[0].context == "CA 1"
+
+
+async def test_an_address_seen_earlier_that_confirms_now_says_since_when() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    wallet_then_token = address(3)
+    rejected = Observation(
+        ROOT,
+        50.0,
+        (Sighting(wallet_then_token, SightingSource.TEXT),),
+        (ValidationResult(wallet_then_token, ValidationStatus.REJECTED),),
+    )
+    checker.observations = {ROOT: [rejected]}
+    await h.monitor.run_once()
+    checker.observations = {ROOT: [seen(ROOT, 80.0, wallet_then_token)]}
+    await h.monitor.run_once()
+    [(_, timeline)] = h.notifier.contract_details
+    assert timeline == Timeline(80.0, on_page_since=50.0)
+
+
+async def test_a_token_behind_an_lp_pair_takes_the_pair_s_place() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    pair, token = address(8), address(9)
+    observation = Observation(
+        ROOT,
+        10.0,
+        (Sighting(pair, SightingSource.LINK, "href=https://dexscreener.com/base/"),),
+        (
+            ValidationResult(pair, ValidationStatus.REJECTED, kind=AddressKind.PAIR),
+            ValidationResult(token, ValidationStatus.CONFIRMED, "Base", via=pair),
+        ),
+    )
+    checker.observations = {ROOT: [observation]}
+    await h.monitor.run_once()
+    assert [c.address for c, _ in h.notifier.contracts] == [token]
+    [(sighting, _)] = h.notifier.contract_details
+    assert (
+        sighting is not None and sighting.address == pair and sighting.source is SightingSource.LINK
+    )
+
+
+async def test_the_threshold_counts_both_renders_of_a_page() -> None:
+    h, checker = observing({APP: 404, DOCS: 404}, threshold=3)
+    checker.observations = {
+        ROOT: [seen(ROOT, 1.0, address(1), address(2)), seen(ROOT, 3.0, address(3))]
+    }
+    await h.monitor.run_once()
+    assert [c.address for c, _ in h.notifier.contracts] == [address(1), address(2)]
+    assert [tuple(c.address for c in batch) for _, _, batch in h.notifier.batches] == [
+        (address(3),)
+    ]
+    assert h.auto_pauses == [(ROOT, ROOT)] and h.monitor.stopped
+
+
+class RecordingPending:
+    def __init__(self) -> None:
+        self.offers: list[tuple[str, str, Address, ValidationStatus]] = []
+        self.announced_tokens: list[tuple[str, Address]] = []
+
+    def offer(self, site_url, page_url, sighting, result, *, fast=False) -> bool:
+        self.offers.append((site_url, page_url, result.address, result.status))
+        return True
+
+    def announced(self, site_url: str, address: Address) -> None:
+        self.announced_tokens.append((site_url, address))
+
+
+async def test_addresses_that_are_not_a_token_yet_go_to_the_pending_watch() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    pending = RecordingPending()
+    h.monitor._pending = pending  # type: ignore[assignment]
+    wallet, token = address(4), address(5)
+    checker.observations = {
+        ROOT: [
+            Observation(
+                ROOT,
+                1.0,
+                (Sighting(wallet, SightingSource.TEXT), Sighting(token, SightingSource.TEXT)),
+                (
+                    ValidationResult(wallet, ValidationStatus.REJECTED, kind=AddressKind.NO_CODE),
+                    ValidationResult(token, ValidationStatus.CONFIRMED, "Base"),
+                ),
+            )
+        ]
+    }
+    await h.monitor.run_once()
+    assert pending.offers == [(ROOT, ROOT, wallet, ValidationStatus.REJECTED)]
+    assert [c.address for c, _ in h.notifier.contracts] == [token]
+    assert pending.announced_tokens == []  # on the page at its first check: old news to turbo
+    checker.observations = {ROOT: [seen(ROOT, 5.0, address(6))]}
+    await h.monitor.run_once()
+    assert pending.announced_tokens == [(ROOT, address(6))]  # appeared: turbo counts it
+
+
+async def test_a_token_on_a_sub_page_that_went_live_counts_for_turbo() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    pending = RecordingPending()
+    h.monitor._pending = pending  # type: ignore[assignment]
+    checker.observations = {ROOT: [seen(ROOT, 1.0)]}
+    await h.monitor.run_once()
+    h.prober.statuses[APP] = 200  # app.<domain> goes live with the launch
+    checker.observations = {ROOT: [seen(ROOT, 5.0)], APP: [seen(APP, 5.0, address(8))]}
+    await h.monitor.run_once()
+    assert pending.announced_tokens == [(ROOT, address(8))]

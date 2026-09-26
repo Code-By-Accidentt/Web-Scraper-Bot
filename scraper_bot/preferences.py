@@ -195,10 +195,10 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "contracts",
         "bool",
         "Only token-like contracts",
-        "On: an EVM contract counts only if it answers totalSupply, symbol or decimals. "
-        "Off: any contract with bytecode counts (presales, launchpads, staking, multisigs, "
-        "proxies). Plain wallets and example addresses are rejected either way, because "
-        "the bytecode check always runs.",
+        "On: an EVM contract counts only if it answers totalSupply and decimals and is "
+        "neither an LP pair (its token is checked instead) nor a vault. Off: any contract "
+        "with bytecode counts (presales, launchpads, staking, multisigs, proxies). Wallets, "
+        "EIP-7702 wallets included, and example addresses are rejected either way.",
         caution=_when(
             False, "Non-token contracts (routers, multisigs, proxies) will be reported as well."
         ),
@@ -221,16 +221,17 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "contracts",
         "float",
         "Re-check rejected addresses after",
-        "An address that had no contract is remembered as rejected for this long, then "
-        "checked again. Shorter values catch contracts deployed after their address was "
-        "published, at the price of more RPC calls. 0 = never re-check.",
+        "An address that was not a token is remembered as rejected for this long, then "
+        "checked again. Addresses published before deployment are re-checked by the "
+        "pending watch on its own; this decides when anything else (a proxy initialised "
+        "later, an address the watch gave up on) is looked at again. 0 = never re-check.",
         0,
         168,
         "h",
         scale=3600,
         caution=_when(
             0.0,
-            "Addresses published before deployment will never be confirmed by the regular monitor.",
+            "Rejected addresses (e.g. a proxy initialised later) will never be re-checked.",
         ),
     ),
     PreferenceSpec(
@@ -240,10 +241,14 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "bool",
         "Deep address scan",
         "Also search iframes, shadow DOM and the scripts and JSON answers the page loaded. "
-        "Costs about 0.02 s per render and no extra requests.",
+        "What the scripts carried when deep scan first saw a page is ignored until the page "
+        "itself shows it (wallet-connect bundles hold dozens of well-known addresses); later "
+        "ones are checked like any other. No extra requests, but several MB of scripts per "
+        "render cost CPU (0.8 s per 5 MB on a desktop CPU, per 2.5 MB on a 4-core VPS).",
         caution=_when(
-            False,
-            "Addresses hidden in scripts, API answers, iframes and shadow DOM will be missed.",
+            True,
+            "App pages carry many infrastructure addresses in their scripts, and each render "
+            "costs noticeably more CPU on a small server.",
         ),
     ),
     PreferenceSpec(
@@ -299,9 +304,10 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "alerts",
         "float",
         "Time budget for token details",
-        "How long a contract alert may wait for the token's name, supply and DEX market "
-        "data (on-chain calls and DexScreener) before it is sent without them. 0 turns the "
-        "lookups off; the explorer and DEX links stay.",
+        "A contract alert goes out at once; the token's name, supply, age and DEX market "
+        "data (on-chain calls and DexScreener) are looked up afterwards for at most this "
+        "long and edited into the same message. 0 turns the lookups off; the explorer and "
+        "DEX links stay.",
         0,
         30,
         "s",
@@ -338,8 +344,8 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "turbo",
         "float",
         "Turbo: seconds between renders",
-        "Pause between full renders of a site in turbo mode. Each render takes about 1 s "
-        "on top of this.",
+        "Seconds from the start of one turbo cycle to the start of the next; a cycle that "
+        "takes longer starts the next one at once.",
         1,
         60,
         "s",
@@ -402,15 +408,22 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "Root page plus live sub-pages rendered in every turbo cycle, root included.",
         1,
         10,
-        caution=_above(8, "More pages than browser tabs (8) makes every cycle wait."),
+        caution=_above(
+            8,
+            "More pages than browser tabs (MAX_CONCURRENT_PAGES, 8 by default) makes "
+            "every cycle wait.",
+        ),
     ),
     PreferenceSpec(
         "turbo_recheck_interval",
         "turbo_recheck_interval",
         "turbo",
         "float",
-        "Turbo: on-chain re-check interval",
-        "How often an unverified address found in turbo mode is checked on-chain again.",
+        "Turbo: on-chain check interval",
+        "How often the addresses of a site in turbo mode that are not a token yet are checked "
+        "on-chain (the watch for tokens published before deployment). Elsewhere an address "
+        "the page names as the CA is checked every second for 15 min, then every 5 s, then "
+        "every 30 s; any other address every 30 s.",
         1,
         60,
         "s",

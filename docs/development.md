@@ -10,7 +10,7 @@ playwright install chromium              # only for the opt-in browser tests
 ## Checks
 
 ```bash
-pytest -q                                # ~510 tests, offline, about 6 s
+pytest -q                                # ~750 tests, offline, about 9 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
 SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/test_fetcher_browser.py   # real Chromium
 ```
@@ -19,14 +19,16 @@ Tests never touch the network, the real `.env` or `data/`: settings are built wi
 `tests.conftest.make_settings(tmp_path, ...)`, HTTP goes through `httpx.MockTransport`,
 the browser is `FakeFetcher`, Telegram is `FakeTelegram`. `tests/` mirrors the package
 layout (`tests/chains`, `tests/pages`, `tests/monitoring`, `tests/telegram`) plus the
-root-level tests for `app`, `config`, `preferences`, `storage`, `rebooter` and the
-end-to-end scenario.
+root-level tests for `app`, `config`, `preferences`, `storage`, `rebooter`, the guards that
+keep the test fakes in line with the real classes (`test_guards.py`) and the end-to-end
+scenario.
 
 `tests/test_end_to_end.py` assembles the real bot with `build_runtime()` on fakes and
 drives it through Telegram commands: add, sub-page discovery, a confirmed change, muted
-alerts, a contract with token details, `/set` plus auto-pause, resume, `/status`, a
-turbo session with a late-deployed contract, unverified mode, a restart with restored
-state, a 403 block with recovery and a timeout streak. It runs in about 1.5 s.
+alerts, a token alert edited with its details, `/set` plus auto-pause, resume, `/status`,
+a turbo session with a token deployed after its address was shown, unverified mode, a
+restart with restored state, a 403 block with recovery and a timeout streak. It runs in
+well under a second.
 
 Coverage sits at about 97% of lines. The browser path of `pages/fetcher.py` and
 `Application.run()` itself are covered only by the opt-in browser tests and real runs.
@@ -42,7 +44,8 @@ Coverage sits at about 97% of lines. The browser path of `pages/fetcher.py` and
   never build HTML by hand.
 - Comments explain *why*; the code says what. Section banners `# ── name ──` only in the
   long files, as a table of contents.
-- Line length 100, `from __future__ import annotations` everywhere, Python 3.11+.
+- Line length 100, `from __future__ import annotations` everywhere in `scraper_bot/` and
+  `rebooter.py`, Python 3.11+.
 
 ## Measured numbers (2026-09, 16-core machine, real sites and public nodes)
 
@@ -55,7 +58,7 @@ Coverage sits at about 97% of lines. The browser path of `pages/fetcher.py` and
 | 12 heavy pages | 6 tabs 2.7 s, 8 tabs 2.6 s, 12 tabs 1.7 s |
 | JSON-RPC call, any of the 10 endpoints | 44–72 ms median, 316 ms worst |
 | Full validation of a new address | wallet on 8 EVM networks 88 ms, ERC-20 token 122 ms, Solana 55 ms, Sui 47 ms |
-| Token details for an alert | 50–90 ms, all fields |
+| Token details for an alert | 50–300 ms, all fields |
 | CPU per changed page | 800 nodes 30 ms, 8 000 nodes 0.4 s, 20 000 nodes 1.6 s (runs in a thread) |
 | Address extraction | 1 MB of JS 160 ms, 5 MB 0.8 s |
 

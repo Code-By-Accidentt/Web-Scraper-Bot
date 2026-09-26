@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -54,7 +55,16 @@ TRACKING_PARAMS = frozenset(
 
 _WS_RE = re.compile(r"\s+")
 _INVISIBLE_RE = re.compile(r"[​-‏⁠﻿]")
-_PARSER = lxml_html.HTMLParser(encoding="utf-8", remove_comments=True, remove_pis=True)
+# Pages are parsed in worker threads; an lxml parser must not be shared between threads.
+_PARSERS = threading.local()
+
+
+def _parser() -> lxml_html.HTMLParser:
+    parser = getattr(_PARSERS, "parser", None)
+    if parser is None:
+        parser = lxml_html.HTMLParser(encoding="utf-8", remove_comments=True, remove_pis=True)
+        _PARSERS.parser = parser
+    return parser
 
 
 class HtmlNormalizer:
@@ -90,7 +100,7 @@ class HtmlNormalizer:
         if not text:
             return None
         try:
-            return lxml_html.document_fromstring(text.encode("utf-8"), parser=_PARSER)
+            return lxml_html.document_fromstring(text.encode("utf-8"), parser=_parser())
         except (etree.ParserError, etree.XMLSyntaxError, ValueError, TypeError):
             return None
 

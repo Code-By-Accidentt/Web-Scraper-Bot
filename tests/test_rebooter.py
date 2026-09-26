@@ -176,6 +176,16 @@ def test_terminate_does_not_kill_a_cooperative_process(tmp_path: Path) -> None:
     assert supervisor._process is None
 
 
+def test_stop_gives_the_bot_time_to_shut_down_then_exits(tmp_path: Path) -> None:
+    supervisor = make(tmp_path)
+    process = RecordingProcess()
+    supervisor._process = process  # type: ignore[assignment]
+    with pytest.raises(SystemExit) as info:
+        supervisor.stop()
+    assert info.value.code == 0
+    assert process.calls == ["terminate", f"wait({rebooter.STOP_GRACE})"]
+
+
 def test_terminate_tolerates_a_vanished_process(tmp_path: Path) -> None:
     supervisor = make(tmp_path)
     process = RecordingProcess(terminate_error=psutil.NoSuchProcess(4242))

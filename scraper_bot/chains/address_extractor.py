@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Container, Iterable
 from typing import ClassVar
 
 import base58
@@ -26,6 +26,9 @@ SUI_COIN_TYPE_RE = re.compile(
 )
 SUI_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{64}(?![0-9A-Za-z])")
 SUI_CONTEXT_RE = re.compile(r"\bsui\b|suiscan|suivision|cetus|bluefin|turbos|movepump", re.I)
+
+# No address fits in fewer characters: the shortest is a Sui coin type such as 0x10000::a::B.
+_SHORTEST_ADDRESS = 13
 
 _EVM_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SUI_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
@@ -121,7 +124,7 @@ def detect_chain(raw: str) -> Chain | None:
 
 
 class AddressExtractor:
-    """Scans text for addresses of the configured chains."""
+    """Scans text for addresses of the configured chains, skipping the stop-list."""
 
     _PATTERNS: ClassVar[dict[Chain, tuple[re.Pattern[str], ...]]] = {
         Chain.ETHEREUM: (EVM_ADDRESS_RE,),
@@ -129,12 +132,40 @@ class AddressExtractor:
         Chain.SUI: (SUI_COIN_TYPE_RE, SUI_ADDRESS_RE),
     }
 
-    def __init__(self, chains: Iterable[Chain] = (Chain.ETHEREUM, Chain.SOLANA, Chain.SUI)) -> None:
+    def __init__(
+        self,
+        chains: Iterable[Chain] = (Chain.ETHEREUM, Chain.SOLANA, Chain.SUI),
+        *,
+        stoplist: Container[Address] = (),
+    ) -> None:
         self._chains = tuple(chains)
+        self._stoplist = stoplist
 
     def extract(self, text: str) -> list[Address]:
         """Unique, syntactically valid addresses in order of first appearance."""
         return self.extract_many((text,))
+
+    def locate(self, text: str, *, sui_context: bool | None = None) -> list[tuple[Address, int]]:
+        """Every valid address in ``text`` with its start offset, in text order.
+
+        ``sui_context`` says whether the page talks about Sui (bare 64-hex ids only count
+        then); by default ``text`` itself decides.
+        """
+        if len(text) < _SHORTEST_ADDRESS:
+            return []
+        if sui_context is None:
+            sui_context = SUI_CONTEXT_RE.search(text) is not None
+        found: list[tuple[Address, int]] = []
+        for chain in self._chains:
+            for pattern in self._PATTERNS[chain]:
+                if pattern is SUI_ADDRESS_RE and not sui_context:
+                    continue
+                for match in pattern.finditer(text):
+                    address = canonical_address(chain, match.group(0))
+                    if address is not None and address not in self._stoplist:
+                        found.append((address, match.start()))
+        found.sort(key=lambda item: item[1])
+        return found
 
     def extract_many(self, texts: Iterable[str]) -> list[Address]:
         """Like :meth:`extract` over several texts (page HTML, frames, scripts, API bodies)."""
@@ -147,7 +178,7 @@ class AddressExtractor:
                         continue
                     for match in pattern.finditer(text):
                         address = canonical_address(chain, match.group(0))
-                        if address is not None:
+                        if address is not None and address not in self._stoplist:
                             found.setdefault(address, None)
         return _drop_packages_of_coins(list(found))
 

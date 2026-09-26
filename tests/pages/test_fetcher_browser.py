@@ -115,9 +115,12 @@ async def test_deep_scan_finds_addresses_outside_the_dom(site: str, tmp_path: Pa
 async def test_deep_scan_can_be_disabled(site: str, tmp_path: Path) -> None:
     settings = make_settings(tmp_path, SETTLE_DELAY="0.5", DEEP_SCAN="false")
     async with PlaywrightFetcher(settings) as fetcher:
+        before = time.time()
         result = await fetcher.fetch(site)
-    assert result.extra_texts == ()
+        after = time.time()
+    assert result.extra_texts == () and result.dom_texts == ()
     assert result.scan_texts == (result.html,)
+    assert result.started_at is not None and before <= result.started_at <= after
 
 
 async def test_load_timeout_override_is_reported(site: str, tmp_path: Path) -> None:

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from scraper_bot.chains.address_extractor import AddressExtractor
-from scraper_bot.models import Address, Chain, ConfirmedContract, PageStatus
+from scraper_bot.models import Address, Chain, ConfirmedContract, Observation, PageStatus
 from scraper_bot.pages.change_detector import ChangeDetector
 from scraper_bot.pages.fetcher import FetchResult
 from scraper_bot.pages.html_normalizer import HtmlNormalizer
@@ -11,6 +11,7 @@ from tests.conftest import FakeFetcher, FakeTuning, FakeValidator, node
 
 URL = "https://example.com"
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 PAGE_A = "<html><body><h1>Title</h1><p>Hello</p><a href='/x'>Link</a></body></html>"
 PAGE_B = PAGE_A.replace("Hello", "Goodbye")
 TIMER = "<html><body><h1>Title</h1><span class='t'>{}</span></body></html>"
@@ -165,14 +166,75 @@ async def test_flapping_element_is_silenced_after_two_alerts(tmp_path: Path) -> 
     assert (await h.checker.check(URL)).status is PageStatus.CHANGED
 
 
-async def test_deep_scan_texts_are_searched_for_addresses(tmp_path: Path) -> None:
+BUNDLE = (f"window.KIT={{usdc:'{USDC_ETH}'}}",)
+
+
+async def test_deep_scan_skips_what_the_first_round_found_only_in_scripts(tmp_path: Path) -> None:
     h = Harness(tmp_path)
-    address = Address(Chain.ETHEREUM, USDC_ETH)
-    h.validator.confirm(address, "Base")
-    h.fetcher.html(URL, PAGE_A, extra=(f"window.CONFIG={{token:'{USDC_ETH}'}}",))
+    launch = Address(Chain.ETHEREUM, WETH)
+    h.validator.confirm(launch, "Base")
+    h.fetcher.html(URL, PAGE_A, extra=BUNDLE)
+    h.fetcher.html(URL, PAGE_A, extra=(f"window.KIT={{usdc:'{USDC_ETH}',ca:'{WETH}'}}",))
+    first = await h.checker.check(URL)
+    assert first.status is PageStatus.BASELINE and first.candidates == ()
+    assert h.validator.calls == []  # the wallet kit's tokens are not launches
+    assert h.snapshots.load(URL).deep_seen == {USDC_ETH}
+    second = await h.checker.check(URL)
+    assert second.status is PageStatus.UNCHANGED
+    assert second.contracts == (ConfirmedContract(launch, "Base"),)  # new in the scripts
+    assert h.validator.calls == [[launch]]
+    assert h.snapshots.load(URL).deep_seen == {USDC_ETH}  # only the first round is recorded
+
+
+async def test_a_ca_inside_a_shadow_root_counts_on_the_first_deep_round(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    token = Address(Chain.ETHEREUM, USDC_ETH)
+    h.validator.confirm(token, "Base")
+    shadow = f"<div><p>CA: {USDC_ETH}</p></div>"  # page content, not a script
+    h.fetcher.script(URL, FetchResult(URL, 200, PAGE_A, extra_texts=(shadow,), dom_texts=(shadow,)))
     outcome = await h.checker.check(URL)
-    assert outcome.contracts == (ConfirmedContract(address, "Base"),)
-    assert h.snapshots.load(URL).signature == h.signature(PAGE_A)
+    assert outcome.contracts == (ConfirmedContract(token, "Base"),)
+    assert h.snapshots.load(URL).deep_seen == frozenset()  # not taken for a wallet-kit address
+
+
+async def test_a_skipped_script_address_counts_once_the_page_shows_it(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    token = Address(Chain.ETHEREUM, USDC_ETH)
+    h.validator.confirm(token, "Base")
+    shown = PAGE_A.replace("Hello", f"CA: {USDC_ETH}")
+    h.fetcher.html(URL, PAGE_A, PAGE_A, shown, shown, extra=BUNDLE)
+    await h.checker.check(URL)
+    assert (await h.checker.check(URL)).contracts == ()
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.CHANGED
+    assert outcome.contracts == (ConfirmedContract(token, "Base"),)
+    assert h.validator.calls == [[token]]
+
+
+async def test_a_page_stored_without_deep_scan_records_its_scripts_once(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A)
+    h.fetcher.html(URL, PAGE_A, extra=BUNDLE)
+    await h.checker.check(URL)
+    assert h.snapshots.load(URL).deep_seen is None  # deep scan off: nothing to record
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.UNCHANGED and outcome.candidates == ()
+    assert h.snapshots.load(URL).deep_seen == {USDC_ETH}  # saved although nothing changed
+    assert h.validator.calls == []
+
+
+async def test_the_confirming_render_of_the_first_deep_round_is_recorded_too(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A)
+    h.fetcher.html(URL, PAGE_B, extra=BUNDLE)
+    h.fetcher.html(URL, PAGE_B, extra=(f"a='{USDC_ETH}' b='{WETH}'",))
+    await h.checker.check(URL)
+    outcome = await h.checker.check(URL)
+    assert outcome.status is PageStatus.CHANGED and outcome.candidates == ()
+    assert h.snapshots.load(URL).deep_seen == {USDC_ETH, WETH}
+    assert h.validator.calls == []
 
 
 CHALLENGE = "<html><head><title>Just a moment...</title></head><body>Checking</body></html>"
@@ -208,7 +270,6 @@ async def test_first_fetch_error_without_block_is_unavailable(tmp_path: Path) ->
     assert h.validator.calls == [] and h.sleeps == []
 
 
-WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 
@@ -225,7 +286,7 @@ async def test_candidates_carry_every_valid_address_from_both_renders(tmp_path: 
     assert outcome.status is PageStatus.CHANGED
     assert outcome.candidates == (usdc, sol, weth)  # rejected ones included, no duplicates
     assert outcome.contracts == (ConfirmedContract(weth, "Base"),)
-    assert h.validator.calls == [[usdc, sol], [usdc, weth]]
+    assert h.validator.calls == [[usdc, sol], [weth]]  # the second render checks only news
 
 
 async def test_block_on_the_confirming_render_keeps_the_snapshot(tmp_path: Path) -> None:
@@ -259,3 +320,75 @@ async def test_timeout_on_the_confirming_render_is_flagged_too(tmp_path: Path) -
     assert outcome.status is PageStatus.UNAVAILABLE and outcome.timed_out
     assert h.fetcher.timeouts == [None, None, None]
     assert h.snapshots.load(URL).signature == h.signature(PAGE_A)
+
+
+async def test_addresses_are_reported_before_the_confirming_render(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    token = Address(Chain.ETHEREUM, USDC_ETH)
+    h.validator.confirm(token, "Base")
+    with_token = PAGE_B.replace("</body>", f"<p>CA: {USDC_ETH}</p></body>")
+    h.fetcher.html(URL, PAGE_A, with_token, with_token)
+    await h.checker.check(URL)  # the baseline
+    events: list[str] = []
+    original = h.fetcher.fetch
+
+    async def fetch(url: str, *, timeout: float | None = None) -> FetchResult:
+        events.append("fetch")
+        return await original(url, timeout=timeout)
+
+    async def observe(observation: Observation) -> None:
+        events.append("observe")
+        [sighting] = observation.sightings
+        assert sighting.context == "CA:" and sighting.hinted
+        assert [r.contract for r in observation.results] == [ConfirmedContract(token, "Base")]
+        assert observation.seen_at == h.now
+
+    h.fetcher.fetch = fetch  # type: ignore[method-assign]
+    outcome = await h.checker.check(URL, on_observation=observe)
+    assert outcome.status is PageStatus.CHANGED
+    assert events == ["fetch", "observe", "fetch"]  # the alert does not wait for render two
+
+
+async def test_an_observation_says_when_its_render_began_and_ended(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A.replace("</body>", f"<p>{USDC_ETH}</p></body>"))
+    original = h.fetcher.fetch
+
+    async def slow_fetch(url: str, *, timeout: float | None = None) -> FetchResult:
+        h.now += 1.5  # the render takes 1.5 s
+        return await original(url, timeout=timeout)
+
+    h.fetcher.fetch = slow_fetch  # type: ignore[method-assign]
+    observed: list[Observation] = []
+
+    async def observe(observation: Observation) -> None:
+        observed.append(observation)
+
+    await h.checker.check(URL, on_observation=observe)
+    [observation] = observed
+    assert (observation.started_at, observation.seen_at) == (1_000.0, 1_001.5)
+
+
+async def test_the_render_start_excludes_the_wait_for_a_free_tab(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    html = PAGE_A.replace("</body>", f"<p>{USDC_ETH}</p></body>")
+    h.fetcher.script(URL, FetchResult(URL, 200, html, started_at=1_001.0))
+    observed: list[Observation] = []
+
+    async def observe(observation: Observation) -> None:
+        observed.append(observation)
+
+    await h.checker.check(URL, on_observation=observe)
+    assert observed[0].started_at == 1_001.0  # loading began after a second in the queue
+
+
+async def test_a_failing_observer_does_not_break_the_check(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, PAGE_A.replace("</body>", f"<p>{USDC_ETH}</p></body>"))
+
+    async def broken(_observation: Observation) -> None:
+        raise RuntimeError("telegram exploded")
+
+    outcome = await h.checker.check(URL, on_observation=broken)
+    assert outcome.status is PageStatus.BASELINE
+    assert outcome.candidates == (Address(Chain.ETHEREUM, USDC_ETH),)

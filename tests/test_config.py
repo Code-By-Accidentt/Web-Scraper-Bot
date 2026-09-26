@@ -4,13 +4,17 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
+from scraper_bot import config as config_module
 from scraper_bot.config import (
     DEFAULT_EVM_NETWORKS,
     FALSE_WORDS,
     TRUE_WORDS,
+    ChangedDefault,
     ConfigError,
     Settings,
     _EnvReader,
+    find_outdated_defaults,
+    split_arguments,
 )
 from tests.conftest import MINIMAL_ENV, make_settings
 
@@ -25,7 +29,8 @@ def test_minimal_environment_is_enough(tmp_path) -> None:
     assert cfg.rejected_ttl == 6 * 3600
     assert cfg.sub_url_patterns[0] == "https://app.{domain}"
     assert (cfg.network_idle_timeout, cfg.settle_delay, cfg.confirm_delay) == (2.0, 0.25, 2.0)
-    assert cfg.deep_scan is True and cfg.deep_scan_max_bytes == 5 * 1024 * 1024
+    assert cfg.deep_scan is False and cfg.deep_scan_max_bytes == 5 * 1024 * 1024
+    assert cfg.browser_args == ("--disable-3d-apis", "--disable-webgl", "--disable-webgl2")
     assert cfg.flap_window == 24 * 3600 and cfg.flap_threshold == 2
 
 
@@ -117,9 +122,17 @@ def test_flags_accept_every_spelling(tmp_path) -> None:
         for raw in (word, word.upper(), word.capitalize(), f"  {word} "):
             assert make_settings(tmp_path, HEADLESS=raw).headless is False, raw
     assert make_settings(tmp_path, HEADLESS="").headless is True  # empty: the default
-    assert make_settings(tmp_path, DEEP_SCAN=" ").deep_scan is True
+    assert make_settings(tmp_path, DEEP_SCAN=" ").deep_scan is False
     with pytest.raises(ConfigError, match="DEEP_SCAN must be a boolean, got 'y'"):
         make_settings(tmp_path, DEEP_SCAN="y")
+
+
+def test_browser_args_are_split_like_a_shell_does(tmp_path) -> None:
+    custom = make_settings(tmp_path, BROWSER_ARGS=" --lang=en '--window-size=1366,900' ")
+    assert custom.browser_args == ("--lang=en", "--window-size=1366,900")
+    assert make_settings(tmp_path, BROWSER_ARGS="").browser_args == ()  # empty: no switches
+    with pytest.raises(ConfigError, match="BROWSER_ARGS is not a valid argument list"):
+        make_settings(tmp_path, BROWSER_ARGS="--lang='en")
 
 
 def test_every_key_in_env_example_is_read_by_settings(tmp_path, monkeypatch) -> None:
@@ -158,6 +171,91 @@ def test_paths_and_log_settings(tmp_path) -> None:
     assert make_settings(tmp_path, LOG_FILE="   ").log_file is None
     with pytest.raises(ConfigError, match="HEARTBEAT_INTERVAL must be >= 1"):
         make_settings(tmp_path, HEARTBEAT_INTERVAL="0.5")
+
+
+CHANGES = (
+    ChangedDefault("DEEP_SCAN", "true", "false"),
+    ChangedDefault("RPC_RETRY_DELAY", "600", "10"),
+    ChangedDefault("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", "https://x.rpc"),
+)
+
+
+def test_outdated_defaults_are_recognised_whatever_the_spelling() -> None:
+    old = {
+        "DEEP_SCAN": " On ",
+        "RPC_RETRY_DELAY": "600.0",
+        "SOLANA_RPC_URL": "https://API.mainnet-beta.solana.com/",
+    }
+    found = find_outdated_defaults(old, CHANGES)
+    assert [change.key for change in found] == [change.key for change in CHANGES]
+    assert found[0].previous == "On"  # named as the .env spells it
+    chosen = {"DEEP_SCAN": "false", "RPC_RETRY_DELAY": "60", "SOLANA_RPC_URL": "https://x.rpc"}
+    assert find_outdated_defaults(chosen, CHANGES) == ()
+    assert find_outdated_defaults({}, CHANGES) == ()  # an absent key uses the new default
+    assert [c.key for c in find_outdated_defaults({"DEEP_SCAN": "1"}, CHANGES)] == ["DEEP_SCAN"]
+
+
+def test_older_releases_are_recognised_too(tmp_path: Path) -> None:
+    cfg = make_settings(tmp_path, POLL_INTERVAL_MIN="5", NETWORK_IDLE_TIMEOUT="4", SETTLE_DELAY="1")
+    assert {(c.key, c.current) for c in cfg.outdated_defaults} == {
+        ("POLL_INTERVAL_MIN", "4"),
+        ("NETWORK_IDLE_TIMEOUT", "2"),
+        ("SETTLE_DELAY", "0.25"),
+    }
+
+
+def test_windows_paths_keep_their_backslashes() -> None:
+    assert split_arguments(r"--user-data-dir=C:\bot\prof --lang=en", windows=True) == (
+        r"--user-data-dir=C:\bot\prof",
+        "--lang=en",
+    )
+    assert split_arguments(r"'--user-data-dir=C:\a b'", windows=True) == (
+        r"--user-data-dir=C:\a b",
+    )
+    assert split_arguments(r"--x=a\ b", windows=False) == ("--x=a b",)  # POSIX escapes
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("RPC_TIMEOUT", "nan"), ("PAGE_LOAD_TIMEOUT", "inf"), ("POLL_INTERVAL_MIN", "NaN")],
+)
+def test_numbers_must_be_finite(tmp_path: Path, key: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=f"{key} must be a finite number"):
+        make_settings(tmp_path, **{key: value})
+
+
+def test_log_level_is_checked_and_empty_values_mean_the_default(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="LOG_LEVEL must be one of"):
+        make_settings(tmp_path, LOG_LEVEL="verbose")
+    assert make_settings(tmp_path, LOG_LEVEL="debug").log_level == "DEBUG"
+    blank = make_settings(tmp_path, LOG_LEVEL="", SOLANA_RPC_URL=" ", SUI_RPC_URL="", DATA_DIR="")
+    assert blank.data_dir == Path("data")
+    assert blank.log_level == "INFO"
+    assert blank.solana_rpc_url.startswith("https://") and blank.sui_rpc_url.startswith("https://")
+
+
+def test_this_release_flags_the_old_solana_endpoint_and_retry_delay(tmp_path: Path) -> None:
+    cfg = make_settings(
+        tmp_path, SOLANA_RPC_URL="https://api.mainnet-beta.solana.com", RPC_RETRY_DELAY="600"
+    )
+    assert {change.key for change in cfg.outdated_defaults} == {
+        "SOLANA_RPC_URL",
+        "RPC_RETRY_DELAY",
+    }
+    fresh = make_settings(tmp_path)
+    assert fresh.outdated_defaults == ()
+    assert fresh.solana_rpc_url == "https://solana-rpc.publicnode.com"
+    assert fresh.rpc_retry_delay == 10 and fresh.http2 is True
+    assert make_settings(tmp_path, HTTP2="off").http2 is False
+
+
+def test_settings_carry_the_outdated_defaults_of_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(config_module, "CHANGED_DEFAULTS", CHANGES)
+    cfg = make_settings(tmp_path, DEEP_SCAN="true", RPC_RETRY_DELAY="30")
+    assert cfg.outdated_defaults == (CHANGES[0],)
+    assert make_settings(tmp_path).outdated_defaults == ()
 
 
 def test_env_example_values_are_the_code_defaults(tmp_path: Path) -> None:

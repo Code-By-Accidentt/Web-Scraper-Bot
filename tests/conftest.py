@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,15 +18,20 @@ from scraper_bot.models import (
     ChangeReport,
     ConfirmedContract,
     Node,
+    Observation,
     PageCheckOutcome,
     PageStatus,
+    Sighting,
+    SightingSource,
     SiteState,
+    Timeline,
     ValidationResult,
     ValidationStatus,
 )
 from scraper_bot.monitoring.site_monitor import MonitorStats
 from scraper_bot.monitoring.turbo import TurboStats
 from scraper_bot.pages.fetcher import FetchResult, ProbeResult
+from scraper_bot.telegram.client import SentMessage
 
 
 @dataclass
@@ -123,6 +129,7 @@ class FakeValidator:
         self.verdicts: dict[Address, list[ValidationResult]] = {}
         self.calls: list[list[Address]] = []
         self.negative_cache_calls: list[bool] = []
+        self.options: list[tuple[tuple[str, ...] | None, bool]] = []  # (networks, urgent)
 
     def confirm(self, address: Address, network: str = "Ethereum") -> None:
         self.verdicts[address] = [ValidationResult(address, ValidationStatus.CONFIRMED, network)]
@@ -137,15 +144,32 @@ class FakeValidator:
     def known(self, address: Address) -> None:
         self.verdicts[address] = [ValidationResult(address, ValidationStatus.ALREADY_KNOWN)]
 
-    async def validate(self, address: Address, *, negative_cache: bool = True) -> ValidationResult:
-        return (await self.validate_many([address], negative_cache=negative_cache))[0]
+    async def validate(
+        self,
+        address: Address,
+        *,
+        negative_cache: bool = True,
+        networks: Collection[str] | None = None,
+        urgent: bool = False,
+    ) -> ValidationResult:
+        results = await self.validate_many(
+            [address], negative_cache=negative_cache, networks=networks, urgent=urgent
+        )
+        return results[0]
 
     async def validate_many(
-        self, addresses: Iterable[Address], *, negative_cache: bool = True
+        self,
+        addresses: Iterable[Address],
+        *,
+        negative_cache: bool = True,
+        follow_pairs: bool = True,
+        networks: Collection[str] | None = None,
+        urgent: bool = False,
     ) -> list[ValidationResult]:
         batch = list(addresses)
         self.calls.append(batch)
         self.negative_cache_calls.append(negative_cache)
+        self.options.append((None if networks is None else tuple(networks), urgent))
         results: list[ValidationResult] = []
         for address in batch:
             queue = self.verdicts.get(address)
@@ -176,6 +200,7 @@ class FakeNotifier:
         self.timing_out: list[tuple[str, int, str, float]] = []
         self.renders_again: list[tuple[str, float]] = []
         self.contracts: list[tuple[ConfirmedContract, str]] = []
+        self.contract_details: list[tuple[Sighting | None, Timeline | None]] = []
         self.batches: list[tuple[str, str, tuple[ConfirmedContract, ...]]] = []
         self.paused: list[tuple[str, str, int]] = []
         self.turbo_started_calls: list[tuple[str, int, float, float, int]] = []
@@ -202,8 +227,16 @@ class FakeNotifier:
     async def page_renders_again(self, page_url: str, timeout: float) -> None:
         self.renders_again.append((page_url, timeout))
 
-    async def contract_found(self, contract: ConfirmedContract, page_url: str) -> None:
+    async def contract_found(
+        self,
+        contract: ConfirmedContract,
+        page_url: str,
+        *,
+        sighting: Sighting | None = None,
+        timeline: Timeline | None = None,
+    ) -> None:
         self.contracts.append((contract, page_url))
+        self.contract_details.append((sighting, timeline))
 
     async def contracts_batch(
         self, site_url: str, page_url: str, contracts: Sequence[ConfirmedContract]
@@ -265,28 +298,62 @@ class FakeNotifier:
 
 
 class FakeChecker:
-    """Scripted stand-in for PageChecker."""
+    """Scripted stand-in for PageChecker.
+
+    Like the real one it reports the outcome's addresses to ``on_observation`` first:
+    its contracts as CONFIRMED, the other candidates as REJECTED, all seen in page text.
+    """
 
     def __init__(self) -> None:
         self.outcomes: dict[str, PageCheckOutcome] = {}
         self.calls: list[str] = []
         self.timeouts: list[float | None] = []  # the ``load_timeout`` passed to each check
 
-    async def check(self, page_url: str, *, load_timeout: float | None = None) -> PageCheckOutcome:
+    async def check(
+        self,
+        page_url: str,
+        *,
+        load_timeout: float | None = None,
+        on_observation: Callable[[Observation], Awaitable[None]] | None = None,
+    ) -> PageCheckOutcome:
         self.calls.append(page_url)
         self.timeouts.append(load_timeout)
-        return self.outcomes.get(page_url, PageCheckOutcome(page_url, PageStatus.UNCHANGED))
+        outcome = self.outcomes.get(page_url, PageCheckOutcome(page_url, PageStatus.UNCHANGED))
+        confirmed = {contract.address: contract for contract in outcome.contracts}
+        addresses = list(dict.fromkeys([*outcome.candidates, *confirmed]))
+        if on_observation is not None and addresses:
+            results = tuple(
+                ValidationResult(a, ValidationStatus.CONFIRMED, confirmed[a].network)
+                if a in confirmed
+                else ValidationResult(a, ValidationStatus.REJECTED)
+                for a in addresses
+            )
+            sightings = tuple(Sighting(a, SightingSource.TEXT) for a in addresses)
+            await on_observation(Observation(page_url, time.time(), sightings, results))
+        return outcome
 
 
 class FakeTelegram:
+    """Records what the bot sends; an edit replaces the recorded text of its message."""
+
     def __init__(self) -> None:
         self.messages: list[tuple[int, str]] = []
         self.documents: list[tuple[int, str, bytes, str]] = []
         self.updates: list[list[dict[str, Any]] | None] = []
         self.offsets: list[int | None] = []
+        self.edits: list[tuple[int, str]] = []
 
     async def send_message(self, chat_id: int, text: str) -> bool:
         self.messages.append((chat_id, text))
+        return True
+
+    async def send_tracked(self, chat_id: int, text: str) -> SentMessage | None:
+        self.messages.append((chat_id, text))
+        return SentMessage(chat_id, len(self.messages) - 1)
+
+    async def edit_message_text(self, message: SentMessage, text: str) -> bool:
+        self.edits.append((message.chat_id, text))
+        self.messages[message.message_id] = (message.chat_id, text)
         return True
 
     async def broadcast(self, chat_ids: Iterable[int], text: str) -> None:
@@ -348,6 +415,7 @@ class StubTurboSession:
         self.duration = duration
         self.limits = limits
         self.stats = TurboStats()
+        self.pending_count = 0
         self.stop_reason: str | None = None
         self._stop = asyncio.Event()
 

@@ -22,6 +22,7 @@ _CHALLENGE_MARKERS = (
     "request blocked",
     "captcha",
     "cf-chl",
+    "vercel security checkpoint",
 )
 _CONNECTION_ERRORS = (
     "err_connection_reset",
@@ -39,7 +40,13 @@ class BlockDetector:
 
     def inspect(self, result: FetchResult) -> BlockSignal | None:
         headers = {key.lower(): value for key, value in result.headers.items()}
-        challenged = headers.get("cf-mitigated", "").lower() == "challenge"
+        # Cloudflare and Vercel mark the answers of their firewalls, even a 200 checkpoint.
+        mitigated = None
+        if headers.get("cf-mitigated", "").lower() == "challenge":
+            mitigated = "cf-mitigated"
+        elif headers.get("x-vercel-mitigated", "").lower() in {"challenge", "deny"}:
+            mitigated = "x-vercel-mitigated"
+        challenged = mitigated is not None
         if result.status in _BLOCK_STATUSES:
             marker = self._marker(result.html, title_only=False)
             detail = f"HTTP {result.status}"
@@ -54,7 +61,7 @@ class BlockDetector:
         marker = self._marker(result.html, title_only=True)
         if challenged or marker:
             return BlockSignal(
-                f"challenge page ({marker or 'cf-mitigated'}) with HTTP {result.status or 200}"
+                f"challenge page ({marker or mitigated}) with HTTP {result.status or 200}"
             )
         return None
 

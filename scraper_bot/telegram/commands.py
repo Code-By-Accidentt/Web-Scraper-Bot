@@ -46,7 +46,10 @@ COMMAND_HELP: tuple[tuple[str, str], ...] = (
     ("/list", "monitored sites with their status"),
     ("/nonotifi <url>", "mute change alerts for a site"),
     ("/notify <url>", "un-mute change alerts for a site"),
-    ("/turbo <url> [minutes] [at HH:MM | in 10m]", "render every 2s until a contract appears"),
+    (
+        "/turbo <url> [minutes] [at HH:MM | in 10m]",
+        "render every few seconds until its token appears",
+    ),
     ("/turbo stop <url>", "end turbo mode; /turbo alone shows turbo status"),
     ("/unverified <url> on|off", "announce every new address at once, confirm later"),
     ("/settings [key]", "live settings with explanations; /set <key> <value> changes one"),
@@ -72,6 +75,10 @@ SETTINGS_USAGE = "Usage:\n" + "\n".join(
 
 _DELAY_RE = re.compile(r"^(\d+)([mh])$", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+# An unauthorised chat learns its chat id from /start at most this often (seconds).
+_STRANGER_REPLY_INTERVAL = 600.0
+_STRANGER_MEMORY = 1000
 
 
 def usage(command: str) -> str:
@@ -154,17 +161,20 @@ class BotCommands:
         status_provider: Callable[[], str] | None = None,
         turbo: TurboManager | None = None,
         preferences: Preferences | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._manager = manager
         self._telegram = telegram
-        self._allowed = frozenset(allowed_chat_ids)
         self._alerts_configured = bool(alert_chat_ids)
-        # Settings may be changed from the command allowlist, or from the alert chats
-        # when no allowlist is configured; never from arbitrary chats.
-        self._admins = frozenset(allowed_chat_ids) or frozenset(alert_chat_ids)
+        # Commands come from the allowlist or, when it is empty, from the alert chats;
+        # any other chat can only learn its chat id with /start.
+        self._allowlist = frozenset(allowed_chat_ids)
+        self._commanders = self._allowlist or frozenset(alert_chat_ids)
         self._status_provider = status_provider
         self._turbo = turbo
         self._preferences = preferences
+        self._clock = clock
+        self._stranger_replies: dict[int, float] = {}
         self._handlers: dict[str, Handler] = {
             "start": self._start,
             "help": self._help,
@@ -195,8 +205,8 @@ class BotCommands:
         command = parse_command(text)
         if command is None:
             return
-        if self._allowed and chat_id not in self._allowed:
-            log.warning("ignoring /%s from unauthorised chat %s", command.name, chat_id)
+        if chat_id not in self._commanders:
+            await self._answer_stranger(chat_id, command.name)
             return
         reply = await self.execute(chat_id, command)
         if not self._alerts_configured and command.name in {"add", "list", "resume"}:
@@ -227,6 +237,36 @@ class BotCommands:
                 f"⚠️ Internal error while running {code('/' + command.name)}: {code(detail)}\n"
                 f"The bot keeps running; details are in the log."
             )
+
+    async def _answer_stranger(self, chat_id: int, name: str) -> None:
+        """An unauthorised chat gets its chat id for /start (rate limited), nothing else."""
+        if name != "start":
+            log.warning("ignoring /%s from unauthorised chat %s", name, chat_id)
+            return
+        now = self._clock()
+        last = self._stranger_replies.get(chat_id)
+        if last is not None and now - last < _STRANGER_REPLY_INTERVAL:
+            return
+        if len(self._stranger_replies) >= _STRANGER_MEMORY:
+            self._stranger_replies = {
+                chat: at
+                for chat, at in self._stranger_replies.items()
+                if now - at < _STRANGER_REPLY_INTERVAL
+            }
+        self._stranger_replies[chat_id] = now
+        if self._allowlist:
+            # With an allowlist only that list commands; TELEGRAM_CHAT_IDS would not help.
+            where = "TELEGRAM_ALLOWED_CHAT_IDS"
+        else:
+            where = (
+                "TELEGRAM_CHAT_IDS (alerts and commands) or TELEGRAM_ALLOWED_CHAT_IDS "
+                "(commands only)"
+            )
+        await self._telegram.send_message(
+            chat_id,
+            f"👋 Your chat id is {code(chat_id)}. This chat cannot control the bot: add the id "
+            f"to {where} in .env and restart the bot.",
+        )
 
     # ── handlers ────────────────────────────────────────────────────────────
     async def _start(self, chat_id: int, _argument: str) -> str:
@@ -269,29 +309,13 @@ class BotCommands:
         )
 
     # ── settings ────────────────────────────────────────────────────────────
-    def _admin_only(self, chat_id: int) -> str | None:
-        if not self._admins:
-            return (
-                "🔒 Settings can only be changed from chats listed in "
-                "TELEGRAM_ALLOWED_CHAT_IDS or TELEGRAM_CHAT_IDS; both are empty."
-            )
-        if chat_id not in self._admins:
-            return (
-                "🔒 Only chats listed in TELEGRAM_ALLOWED_CHAT_IDS (or TELEGRAM_CHAT_IDS) "
-                "can change settings."
-            )
-        return None
-
-    async def _settings(self, chat_id: int, argument: str) -> str:
+    async def _settings(self, _chat_id: int, argument: str) -> str:
         if self._preferences is None:
             return "Settings are not available."
         tokens = argument.split()
         if not tokens:
             return self._preferences.overview()
         if tokens[0].lower() == "reset":
-            denied = self._admin_only(chat_id)
-            if denied:
-                return denied
             target = tokens[1] if len(tokens) > 1 else "all"
             changes = self._preferences.reset(None if target.lower() == "all" else target)
             if not changes:
@@ -306,12 +330,9 @@ class BotCommands:
             return "\n".join(lines)
         return self._preferences.describe(tokens[0])
 
-    async def _set(self, chat_id: int, argument: str) -> str:
+    async def _set(self, _chat_id: int, argument: str) -> str:
         if self._preferences is None:
             return "Settings are not available."
-        denied = self._admin_only(chat_id)
-        if denied:
-            return denied
         tokens = argument.split()
         if len(tokens) < 2:
             return SETTINGS_USAGE
@@ -330,7 +351,7 @@ class BotCommands:
             f"To apply anyway, repeat: {code(f'/set {exc.spec.key} {value} confirm')}"
         )
 
-    async def _unverified(self, chat_id: int, argument: str) -> str:
+    async def _unverified(self, _chat_id: int, argument: str) -> str:
         tokens = argument.split()
         if not tokens:
             sites = [s for s in self._manager.sites() if s.unverified_enabled]
@@ -341,9 +362,6 @@ class BotCommands:
                     "on-chain until it is confirmed."
                 )
             return "Unverified mode is on for:\n" + "\n".join(f"• {escape(s.url)}" for s in sites)
-        denied = self._admin_only(chat_id)
-        if denied:
-            return denied
         if len(tokens) < 2 or tokens[1].lower() not in {"on", "off"}:
             return usage("/unverified <url> on|off")
         enabled = tokens[1].lower() == "on"
@@ -367,7 +385,7 @@ class BotCommands:
             stats = session.stats
             lines.append(
                 f"🚀 {escape(session.url)}: {stats.cycles} cycles, {stats.renders} renders, "
-                f"{len(stats.found)} confirmed, {stats.unverified} unverified, "
+                f"{len(stats.found)} confirmed, {session.pending_count} pending, "
                 f"{format_duration(session.seconds_left)} left; "
                 f"stop with {code(f'/turbo stop {session.url}')}"
             )

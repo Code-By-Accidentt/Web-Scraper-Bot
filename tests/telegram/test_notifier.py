@@ -1,12 +1,25 @@
 import asyncio
 import re
+from typing import Any
+
+import pytest
 
 from scraper_bot.chains.address_extractor import sui_package
 from scraper_bot.chains.enrichment import TokenInfo
-from scraper_bot.models import Address, Chain, ChangeReport, ConfirmedContract
+from scraper_bot.config import ChangedDefault
+from scraper_bot.models import (
+    Address,
+    Chain,
+    ChangeReport,
+    ConfirmedContract,
+    Sighting,
+    SightingSource,
+    Timeline,
+)
 from scraper_bot.pages.urls import url_to_filename
 from scraper_bot.telegram.markup import strip_markup
 from scraper_bot.telegram.notifier import Notifier
+from scraper_bot.telegram.timefmt import format_precise, format_utc_offset
 from tests.conftest import FakeTelegram, node
 
 ADDRESS = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
@@ -20,11 +33,30 @@ def make(chat_ids=(1,), **kwargs) -> tuple[Notifier, FakeTelegram]:
 async def test_addresses_and_commands_are_monospace() -> None:
     notifier, telegram = make()
     await notifier.contract_found(ConfirmedContract(ADDRESS, "Base"), "https://x.io/a?b=1&c=2")
+    await notifier.drain()
     text = telegram.messages[-1][1]
     assert f"<code>{ADDRESS.value}</code>" in text
     assert "https://x.io/a?b=1&amp;c=2" in text  # escaped, not raw
     await notifier.site_auto_paused("https://x.io", "https://x.io/app", 5, ["https://x.io"])
     assert "<code>/resume https://x.io</code>" in telegram.messages[-1][1]
+
+
+class SlowTelegram(FakeTelegram):
+    """Token alerts take a moment to leave, like a real Telegram round trip."""
+
+    async def send_tracked(self, chat_id, text):
+        await asyncio.sleep(0.02)
+        return await super().send_tracked(chat_id, text)
+
+
+async def test_turbo_summary_never_overtakes_the_alerts_it_lists() -> None:
+    telegram = SlowTelegram()
+    notifier = Notifier(telegram, [1])  # type: ignore[arg-type]
+    contract = ConfirmedContract(ADDRESS, "Base")
+    await notifier.contract_found(contract, "https://x.io")
+    await notifier.turbo_finished("https://x.io", "found 1 confirmed contract(s)", [contract], 7, 4)
+    await notifier.drain()
+    assert [text[0] for _, text in telegram.messages] == ["🔔", "🎯"]
 
 
 async def test_change_report_quotes_examples_in_a_pre_block() -> None:
@@ -39,6 +71,19 @@ async def test_change_report_quotes_examples_in_a_pre_block() -> None:
     assert '<pre>+ &lt;a href="/x?a=1&amp;b=2"&gt; Buy</pre>' in text
     assert "<pre>~ &lt;p&gt; t: id: 1 -&gt; 2</pre>" in text
     assert strip_markup(Notifier.format_report(report, 0)).count("\n") == 5
+
+
+async def test_outdated_defaults_are_listed_with_their_new_values() -> None:
+    notifier, telegram = make()
+    await notifier.outdated_defaults(
+        [
+            ChangedDefault("DEEP_SCAN", "true", "false"),
+            ChangedDefault("RPC_RETRY_DELAY", "600", "10"),
+        ]
+    )
+    raw = telegram.messages[-1][1]
+    assert "<code>DEEP_SCAN=true</code> → the default is now <code>false</code>" in raw
+    assert "<code>RPC_RETRY_DELAY=600</code>" in raw and "Delete these lines" in raw
 
 
 async def test_problem_reports_are_rate_limited_per_key() -> None:
@@ -62,6 +107,7 @@ async def test_started_and_dropped_alerts() -> None:
     )
     silent, quiet = make(chat_ids=())
     await silent.contract_found(ConfirmedContract(ADDRESS, "Base"), "https://x.io")
+    await silent.drain()
     assert quiet.messages == []
 
 
@@ -94,6 +140,8 @@ async def test_contract_alert_carries_token_details_and_links() -> None:
     )
     notifier, telegram = make(enricher=FakeEnricher(info), clock=lambda: 4_600.0)
     await notifier.contract_found(ConfirmedContract(ADDRESS, "Ethereum"), "https://x.io")
+    await notifier.drain()
+    assert len(telegram.edits) == 1  # sent first, the details were edited in
     text = telegram.messages[-1][1]
     plain = strip_markup(text)
     assert "Token: USD Coin (USDC) · 6 decimals · supply 50M" in plain
@@ -109,12 +157,14 @@ async def test_contract_alert_carries_token_details_and_links() -> None:
 async def test_no_pair_and_failed_lookups_still_produce_an_alert() -> None:
     notifier, telegram = make(enricher=FakeEnricher(TokenInfo(market_checked=True)))
     await notifier.address_confirmed(ConfirmedContract(ADDRESS, "Base"), "https://x.io")
+    await notifier.drain()
     plain = strip_markup(telegram.messages[-1][1])
-    assert "No DEX pair listed yet." in plain and "Basescan" in plain
-    assert "Token:" not in plain
+    assert "Basescan" in plain and "Token:" not in plain
+    assert telegram.edits == []  # "no DEX pair yet" alone is not worth an edit
 
     broken, telegram = make(enricher=FakeEnricher(error=RuntimeError("api down")))
     await broken.contract_found(ConfirmedContract(ADDRESS, "Ethereum"), "https://x.io")
+    await broken.drain()
     plain = strip_markup(telegram.messages[-1][1])
     assert plain.startswith("🔔 Contract found") and "Links: Etherscan" in plain
 
@@ -138,6 +188,7 @@ async def test_an_alert_names_exactly_one_token() -> None:
     )
     notifier, telegram = make(enricher=FakeEnricher(info))
     await notifier.contract_found(ConfirmedContract(ADDRESS, "Ethereum"), "https://x.io")
+    await notifier.drain()
     text = telegram.messages[-1][1]
     assert pair_address not in text
     assert set(ANY_ID_RE.findall(text)) == {ADDRESS.value}
@@ -150,6 +201,7 @@ async def test_an_alert_names_exactly_one_token() -> None:
     await notifier.contract_found(
         ConfirmedContract(Address(Chain.SUI, package), "Sui"), "https://x.io"
     )
+    await notifier.drain()
     text = telegram.messages[-1][1]
     plain = strip_markup(text)
     assert f"Coin type: {coin}" in plain and "Token: MEME" in plain
@@ -161,6 +213,7 @@ async def test_broken_token_details_do_not_drop_the_alert() -> None:
     weird = TokenInfo(market_checked=True, pair_url="https://x", pair_created_at=float("nan"))
     notifier, telegram = make(enricher=FakeEnricher(weird))
     await notifier.contract_found(ConfirmedContract(ADDRESS, "Ethereum"), "https://x.io")
+    await notifier.drain()
     plain = strip_markup(telegram.messages[-1][1])
     assert plain.startswith("🔔 Contract found") and "Links: Etherscan" in plain
 
@@ -232,6 +285,7 @@ async def test_contracts_batch_sends_a_sorted_tab_separated_document() -> None:
     )
     notifier, telegram = make(chat_ids=(1, 2))
     await notifier.contracts_batch(site, page, [sol, ConfirmedContract(ADDRESS, "Base")])
+    await notifier.drain()  # delivered from the notifier's own task
     assert [chat for chat, *_ in telegram.documents] == [1, 2]
     _, filename, content, caption = telegram.documents[0]
     assert re.fullmatch(rf"contracts_{re.escape(url_to_filename(site))}_\d+\.txt", filename)
@@ -308,3 +362,122 @@ async def test_render_timeout_alerts() -> None:
     assert telegram.messages[-1][1] == (
         "✅ https://x.io/docs renders again; load timeout back to 30s."
     )
+
+
+T0 = 1_790_000_000.0  # a realistic moment: Windows cannot place tiny timestamps locally
+
+
+async def test_a_token_alert_says_where_it_was_found_and_when() -> None:
+    notifier, telegram = make(clock=lambda: T0 + 0.30)
+    sighting = Sighting(ADDRESS, SightingSource.TEXT, "Official CA:", True)
+    timeline = Timeline(T0 + 0.10, missing_at=T0 - 0.20)
+    await notifier.contract_found(
+        ConfirmedContract(ADDRESS, "Base"), "https://x.io", sighting=sighting, timeline=timeline
+    )
+    await notifier.drain()
+    plain = strip_markup(telegram.messages[-1][1]).splitlines()
+    assert plain[3] == "Found in page text: «Official CA:»"
+    assert plain[4] == (
+        f"⏱ appeared between {format_precise(T0 - 0.20)} and {format_precise(T0 + 0.10)} · "
+        f"sent {format_precise(T0 + 0.30)} ({format_utc_offset(T0)})"
+    )
+    assert plain[5].startswith("Links: Basescan")
+
+
+@pytest.mark.parametrize(
+    ("timeline", "expected"),
+    [
+        (Timeline(T0 + 20), "found {20} on the first check of the page"),
+        (Timeline(T0 + 20, on_page_since=T0 + 5), "on page since {5} · confirmed {20}"),
+        (
+            Timeline(T0 + 20, missing_at=T0 + 19, on_page_since=T0 + 5, deployed=True),
+            "on page since {5} · deployed between {19} and {20}",
+        ),
+    ],
+)
+async def test_timeline_lines(timeline: Timeline, expected: str) -> None:
+    notifier, telegram = make(clock=lambda: T0 + 21)
+    await notifier.contract_found(
+        ConfirmedContract(ADDRESS, "Base"), "https://x.io", timeline=timeline
+    )
+    await notifier.drain()
+    lines = strip_markup(telegram.messages[-1][1]).splitlines()
+    line = next(text for text in lines if text.startswith("⏱"))
+    wanted = re.sub(r"\{(\d+)\}", lambda m: format_precise(T0 + float(m.group(1))), expected)
+    assert line.startswith(f"⏱ {wanted} · sent {format_precise(T0 + 21)}")
+
+
+async def test_a_token_found_through_its_lp_pair_says_so_without_naming_the_pair() -> None:
+    notifier, telegram = make()
+    pair = Address(Chain.ETHEREUM, "0x" + "b" * 40)
+    sighting = Sighting(pair, SightingSource.LINK, "href=https://dexscreener.com/base/")
+    await notifier.contract_found(
+        ConfirmedContract(ADDRESS, "Base"), "https://x.io", sighting=sighting
+    )
+    await notifier.drain()
+    text = telegram.messages[-1][1]
+    assert "Found via an LP pair in link: «href=https://dexscreener.com/base/»" in strip_markup(
+        text
+    )
+    assert pair.value not in text
+
+
+def test_risk_age_and_network_lines() -> None:
+    from scraper_bot.telegram.notifier import describe_token
+
+    solana = TokenInfo(
+        symbol="MEME",
+        mint_authority=False,
+        freeze_authority=True,
+        risky_extensions=("transfer hook", "transfer fee 2.5%"),
+        created_at=T0 - 125,
+    )
+    assert describe_token(solana, T0) == [
+        "Token: MEME",
+        "⚠️ Authority kept: freeze",
+        "⚠️ Token-2022: transfer hook, transfer fee 2.5%",
+        "🆕 Created 2m 5s ago",
+    ]
+    safe = TokenInfo(mint_authority=False, freeze_authority=False, busy=True)
+    assert describe_token(safe, T0) == [
+        "Authorities: mint and freeze revoked ✅",
+        "Active token: 1000+ transactions",
+    ]
+    evm = TokenInfo(deployed_within=170.0, also_on=("Base", "BSC"))
+    assert describe_token(evm, T0) == ["🆕 Deployed within the last 2m 50s", "Also on: Base, BSC"]
+    assert describe_token(TokenInfo(deployed_before=1_080.0), T0) == [
+        "Deployed more than 18m 0s ago"
+    ]
+    # A public node keeps days of history, not all of it: an older first transaction is
+    # only the oldest one it still has (a 31-day-old token looked 1d 19h old).
+    assert describe_token(TokenInfo(created_at=T0 - 7_200), T0) == ["Created more than 2h 0m ago"]
+    assert describe_token(TokenInfo(created_at=T0 - 3_599), T0) == ["🆕 Created 59m 59s ago"]
+
+
+async def test_a_cancelled_round_does_not_lose_the_document_and_the_pause_waits() -> None:
+    notifier, telegram = make()
+    uploading = asyncio.Event()
+    original = telegram.broadcast_document
+    order: list[str] = []
+
+    async def slow_upload(*args: Any, **kwargs: Any) -> None:
+        await uploading.wait()  # Telegram takes its time with the file
+        await original(*args, **kwargs)
+        order.append("document")
+
+    telegram.broadcast_document = slow_upload  # type: ignore[method-assign]
+    contracts = [ConfirmedContract(ADDRESS, "Base")]
+    monitor = asyncio.create_task(
+        notifier.contracts_batch("https://x.io", "https://x.io", contracts)
+    )
+    await monitor
+    monitor.cancel()  # /pause or shutdown while the upload is still running
+    pause = asyncio.create_task(
+        notifier.site_auto_paused("https://x.io", "https://x.io", 1, ["https://x.io"])
+    )
+    await asyncio.sleep(0.05)
+    assert telegram.messages == []  # the pause message waits for the document
+    uploading.set()
+    await pause
+    order.append("pause")
+    assert order == ["document", "pause"] and len(telegram.documents) == 1

@@ -39,6 +39,27 @@ def test_challenge_with_200_is_recognised_by_title_or_header_only() -> None:
     assert inspect(status=200, html=LOGIN) is None  # "captcha" only in the body
 
 
+VERCEL = (
+    "<html><head><title>Vercel Security Checkpoint</title></head>"
+    "<body><p>We're verifying your browser</p></body></html>"
+)
+
+
+def test_vercel_checkpoint_is_recognised_by_title_or_header() -> None:
+    page = inspect(status=200, html=VERCEL)
+    assert page is not None
+    assert page.reason == "challenge page (vercel security checkpoint) with HTTP 200"
+    limited = inspect(status=429, html=VERCEL, headers={"x-vercel-mitigated": "challenge"})
+    assert limited is not None and limited.reason == "HTTP 429 (vercel security checkpoint)"
+    header = inspect(status=200, html=NORMAL, headers={"X-Vercel-Mitigated": "Challenge"})
+    assert header is not None and header.reason == (
+        "challenge page (x-vercel-mitigated) with HTTP 200"
+    )
+    denied = inspect(status=403, html="", headers={"x-vercel-mitigated": "deny"})
+    assert denied is not None and denied.reason == "HTTP 403 (challenge)"
+    assert inspect(status=200, html=NORMAL, headers={"x-vercel-id": "fra1::abc"}) is None
+
+
 def test_connection_resets_are_signals() -> None:
     signal = inspect(status=None, html="", error="Page.goto: net::ERR_CONNECTION_RESET at x")
     assert signal is not None and "ERR_CONNECTION_RESET" in signal.reason

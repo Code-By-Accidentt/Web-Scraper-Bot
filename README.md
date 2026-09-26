@@ -10,8 +10,8 @@ bothers you.
 ## What it does
 
 - **Real rendering, fast.** One shared Chromium (Playwright), pages rendered in parallel
-  tabs, network-idle detection instead of fixed sleeps. A round over a site and its
-  sub-pages takes about two seconds.
+  tabs, network-idle detection instead of fixed sleeps; Next.js prefetches and analytics
+  beacons are dropped. A round over a site and its sub-pages takes about two seconds.
 - **Root URL plus sub-pages.** Every site is watched together with a configurable set of
   derived pages (`app.<domain>`, `docs.<domain>`, `/dashboard`, ...); a sub-page is
   announced once when it first appears.
@@ -19,22 +19,30 @@ bothers you.
   attributes), every change confirmed by a second render, whatever differs between the two
   renders (timers, counters, banners) is ignored, elements that keep flapping are silenced.
   Alerts say *what* changed, not only how much.
-- **Contract discovery on three chain families.** `0x…` addresses on 8 EVM networks,
-  Solana programs and SPL / Token-2022 mints, Sui coin types and packages. Candidates are
-  taken from the whole rendered page and, with deep scan, from iframes, shadow DOM and every
-  script or JSON answer the page loaded. Verdicts are cached; a rate-limited node never
-  turns a real token into a cached rejection.
-- **Alerts with token details.** Name, symbol, decimals, supply from the chain, the most
-  liquid DEX pair from DexScreener, links to the explorer, DexScreener and a swap page.
-  Every alert names exactly one token.
+- **Token discovery on three chain families.** ERC-20 tokens on 8 EVM networks, SPL /
+  Token-2022 mints on Solana, Sui coins. An LP pair leads to its token; wallets
+  (EIP-7702 included), NFTs, vaults, programs, stablecoins and wrapped natives never
+  count. Candidates are taken from the whole rendered page and, with deep scan (off by
+  default), from iframes, shadow DOM and every script or JSON answer the page loaded.
+  Verdicts are cached; a rate-limited node never turns a real token into a cached
+  rejection.
+- **Alerts first, details second.** A token alert leaves the moment a render shows the
+  token: where it stood on the page, the words in front of it and when it appeared. A
+  second later the same message gains the name, supply, Solana authorities and risky
+  extensions, the token's age, other networks and the DEX pair. One alert per token,
+  across pages, sites and modes.
+- **Addresses published before their token.** An address that is on the page before
+  its contract exists is watched (every second at first, then every 5 and 30 s, when the
+  page names it as the CA or in turbo) and announced once it is deployed.
 - **Turbo mode.** `/turbo <url>` renders a site every 2 s, optionally from a scheduled
-  time, announces every new address immediately and confirms it the moment the contract
-  is deployed.
+  time, and announces every new token at once; an address that is not a token yet is
+  checked every second.
 - **Unverified mode.** `/unverified <url> on` announces every new address on a site at
   once and keeps re-checking it on-chain for a day.
 - **Live settings.** `/settings` explains every tunable knob, `/set` changes it without a
   restart, risky values ask for `confirm`.
-- **Block awareness.** 403/429/503, WAF challenges and connection resets slow the site's
+- **Block awareness.** 401/403/407/429/503, WAF challenges (Cloudflare, Vercel) and connection
+  resets slow the site's
   interval down (doubling, bounded), with one warning and one recovery notice. No proxy
   rotation, no captcha bypass.
 - **Pages that keep timing out** get one alert and a longer load timeout until they render
@@ -51,13 +59,15 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows      (Linux/macOS: source .venv/bin/activate)
 pip install -r requirements.txt
 playwright install chromium       # once: downloads the browser used for rendering
-copy .env.example .env            # Linux/macOS: cp .env.example .env
-#   edit .env: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS
+#   create .env with TELEGRAM_BOT_TOKEN=... and TELEGRAM_CHAT_IDS=...
 python main.py
 ```
 
-Don't know your chat id? Start the bot with only the token set, send it `/start`, and it
-replies with the id. Keep it alive unattended with `python rebooter.py`.
+Put only the keys you change into `.env`; `.env.example` lists all of them with their
+defaults. Don't know your chat id? Start the bot with only the token set, send it
+`/start`, and it replies with the id. Keep it alive unattended with `python
+rebooter.py`. On Ubuntu 20.04 use Google Chrome (`BROWSER_CHANNEL=chrome`); see
+[docs/operations.md](docs/operations.md) for that, a dedicated user and a systemd unit.
 
 ## Commands
 
@@ -97,9 +107,12 @@ Every command is described with its replies in [docs/commands.md](docs/commands.
 main.py, rebooter.py        entry point and supervisor
 scraper_bot/
   app.py config.py preferences.py models.py storage.py    core and state
-  pages/        rendering, HTML normalisation, diffing, noise filter, block detection
-  chains/       address extraction, JSON-RPC, EVM / Solana / Sui validation, token details
-  monitoring/   site monitor, monitor manager, turbo mode, unverified mode
+  pages/        rendering, HTML normalisation, diffing, noise filter, block detection,
+                where on a page an address stands (sightings)
+  chains/       address extraction, stop-list, JSON-RPC, EVM / Solana / Sui validation,
+                token details, connection warm-up
+  monitoring/   site monitor, monitor manager, turbo mode, unverified mode, pending watch
+                (addresses published before deployment), alert registry
   telegram/     Bot API client, commands, alerts, /status, HTML markup
 tests/          pytest suite mirroring the packages, offline; browser tests behind a flag
 docs/           the pages above

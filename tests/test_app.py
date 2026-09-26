@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
+import signal
+import sys
 import time
 from collections.abc import Iterator
 from logging.handlers import RotatingFileHandler
@@ -31,7 +34,7 @@ from scraper_bot.app import (
     configure_logging,
     main,
 )
-from scraper_bot.config import ConfigError, Settings
+from scraper_bot.config import ChangedDefault, ConfigError, Settings
 from scraper_bot.pages.fetcher import BrowserUnavailable
 from scraper_bot.preferences import Preferences
 from scraper_bot.storage import LegacyStateImporter
@@ -53,7 +56,10 @@ def restore_logging() -> Iterator[None]:
     """Undo what ``configure_logging`` (``basicConfig(force=True)``) did to the root logger."""
     root = logging.getLogger()
     saved_level, saved_handlers = root.level, list(root.handlers)
-    noisy = {name: logging.getLogger(name).level for name in ("httpx", "httpcore", "asyncio")}
+    noisy = {
+        name: logging.getLogger(name).level
+        for name in ("httpx", "httpcore", "asyncio", "hpack", "h2")
+    }
     yield
     for handler in list(root.handlers):
         if handler not in saved_handlers:
@@ -82,7 +88,8 @@ def test_configure_logging_with_a_log_file(tmp_path: Path, restore_logging: None
     assert Path(handler.baseFilename).resolve() == log_file.resolve()
     assert handler.maxBytes == 5_000_000 and handler.backupCount == 3
     assert any(isinstance(h, logging.StreamHandler) and h is not handler for h in root.handlers)
-    for name in ("httpx", "httpcore", "asyncio"):
+    # hpack would log the request path of every HTTP/2 call: the bot token is in it
+    for name in ("httpx", "httpcore", "asyncio", "hpack", "h2"):
         assert logging.getLogger(name).level == logging.WARNING
 
     logging.getLogger("scraper_bot.test_app").debug("hello from the test")
@@ -145,6 +152,7 @@ def test_main_returns_2_on_a_configuration_error(
         (BrowserUnavailable("browser could not start"), 3),
         (RuntimeError("boom"), 1),
         (KeyboardInterrupt(), 0),
+        (asyncio.CancelledError(), 0),  # SIGTERM
         (None, 0),
     ],
 )
@@ -153,6 +161,27 @@ def test_main_exit_codes(
 ) -> None:
     monkeypatch.setattr(app_module.Application, "run", run_raising(exc))
     assert main() == code
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Windows event loop takes no signals")
+async def test_sigterm_shuts_the_bot_down_like_ctrl_c() -> None:
+    started, cleaned = asyncio.Event(), []
+
+    class Bot:
+        async def run(self) -> None:
+            started.set()
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                cleaned.append("alerts drained")
+
+    serving = asyncio.create_task(app_module._serve(Bot()))  # type: ignore[arg-type]
+    await started.wait()
+    signal.raise_signal(signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await serving
+    assert cleaned == ["alerts drained"]
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL  # a second SIGTERM kills
 
 
 def test_main_logs_the_failure_reason(
@@ -185,6 +214,24 @@ def test_main_warns_when_no_chat_ids_are_configured(
     assert main() == 0
     assert "TELEGRAM_CHAT_IDS is empty" in caplog.text
     assert not silent.data_dir.exists()  # Application.run was stubbed: nothing on disk
+
+
+def test_main_warns_about_defaults_of_an_earlier_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="scraper_bot.app")
+    outdated = dataclasses.replace(
+        make_settings(tmp_path),
+        outdated_defaults=(ChangedDefault("DEEP_SCAN", "true", "false"),),
+    )
+    monkeypatch.setattr(
+        app_module.Settings, "from_env", classmethod(lambda cls, *args, **kwargs: outdated)
+    )
+    monkeypatch.setattr(app_module, "configure_logging", lambda settings: None)
+    monkeypatch.setattr(app_module.Application, "run", run_raising(None))
+    assert main() == 0
+    assert "DEEP_SCAN=true is the default of an earlier release" in caplog.text
+    assert "the default is now false" in caplog.text
 
 
 def test_main_is_quiet_about_chat_ids_when_they_are_set(
@@ -476,3 +523,73 @@ async def test_runtime_serve_can_be_cancelled(wired: Wired) -> None:
     assert replies[0].startswith("🤖 Bot started")
     assert f"✅ {SITE} added to monitoring." in replies
     assert runtime.turbo.active() == [] and runtime.turbo.scheduled() == []
+
+
+async def test_a_stop_during_the_start_still_shuts_everything_down(wired: Wired) -> None:
+    runtime = wired.runtime
+
+    async def hanging_check() -> list[str]:
+        await asyncio.Event().wait()  # SIGTERM arrives during the chain-id check
+        return []
+
+    runtime.warmer.wrong_chains = hanging_check  # type: ignore[method-assign]
+    task = asyncio.create_task(runtime.serve())
+    await wired.wait_for(lambda: bool(wired.telegram.messages), "the start message")
+    assert runtime._pending_task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert runtime._pending_task is None  # shutdown() ran: the watch stopped and saved
+    assert (wired.settings.data_dir / app_module.PENDING_FILE).is_file()
+
+
+async def test_a_hanging_shutdown_step_is_bounded_and_pending_is_saved_first(
+    wired: Wired, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_module, "SHUTDOWN_STEP", 0.05)
+    runtime = wired.runtime
+    await runtime.start()
+
+    saved_before: list[bool] = []
+
+    async def hanging() -> None:
+        saved_before.append((wired.settings.data_dir / app_module.PENDING_FILE).is_file())
+        await asyncio.Event().wait()  # Telegram does not answer the turbo summary
+
+    runtime.turbo.shutdown = hanging  # type: ignore[method-assign]
+    await asyncio.wait_for(runtime.shutdown(), timeout=5)
+    assert saved_before == [True]  # saved before the step that hung
+
+
+def test_http2_falls_back_when_h2_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = make_settings(tmp_path)
+    assert app_module._http2(settings) is True
+    assert app_module._http2(make_settings(tmp_path, HTTP2="false")) is False
+    monkeypatch.setitem(sys.modules, "h2", None)  # an update without pip install
+    with caplog.at_level(logging.WARNING):
+        assert app_module._http2(settings) is False
+    assert "h2 package is missing" in caplog.text
+
+
+def test_old_env_values_reach_the_chat_once_per_set(tmp_path: Path) -> None:
+    marker = tmp_path / "outdated.txt"
+    old = (ChangedDefault("DEEP_SCAN", "true", "false"),)
+    assert app_module.outdated_notice_due(marker, old) is True
+    assert app_module.outdated_notice_due(marker, old) is True  # not delivered: ask again
+    app_module.remember_outdated_notice(marker, old)
+    assert app_module.outdated_notice_due(marker, old) is False  # a restart: log only
+    more = (*old, ChangedDefault("RPC_RETRY_DELAY", "600", "10"))
+    assert app_module.outdated_notice_due(marker, more) is True
+    assert app_module.outdated_notice_due(marker, ()) is False and not marker.exists()
+    assert app_module.outdated_notice_due(marker, old) is True  # fixed, then back again
+    marker.write_bytes("DEEP_SCAN=true\n".encode("utf-16"))  # re-saved by Notepad
+    assert app_module.outdated_notice_due(marker, old) is True  # no crash
+
+
+async def test_the_outdated_notice_counts_as_sent_only_when_a_chat_got_it() -> None:
+    old = (ChangedDefault("DEEP_SCAN", "true", "false"),)
+    telegram = FakeTelegram()
+    assert await Notifier(telegram, (1,)).outdated_defaults(old) is True  # type: ignore[arg-type]
+    assert await Notifier(telegram, ()).outdated_defaults(old) is False  # type: ignore[arg-type]

@@ -11,12 +11,18 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
 from scraper_bot.models import (
+    Address,
     ConfirmedContract,
     LastChange,
+    Observation,
     PageCheckOutcome,
     PageStatus,
+    Sighting,
     SiteState,
+    Timeline,
 )
+from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pending import PendingWatch
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
 from scraper_bot.pages.fetcher import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
@@ -61,15 +67,18 @@ class _PageHealth:
 
 _MAX_BLOCK_LEVEL = 8
 _MAX_TIMEOUT_FACTOR = 3
+_FIRST_SEEN_MEMORY = 20_000  # (page, address) pairs remembered for "on page since"
 
 
 class SiteMonitor:
     """Runs rounds of checks for one site until asked to stop.
 
-    A round probes the sub-pages, checks the live ones concurrently, announces new
-    pages, changes and contracts, feeds the unverified watcher and auto-pauses the
-    site when one page yields ``contract_pause_threshold`` contracts. Tuning is
-    re-read every round, so /set changes apply at once.
+    A round probes the sub-pages and checks the live ones concurrently. Tokens are
+    announced as soon as a render's addresses are validated (``on_observation``); other
+    addresses that may still become a token go to the pending watch. New pages and
+    changes are announced after the comparison, and the unverified watcher is fed. The
+    site auto-pauses when one page yields ``contract_pause_threshold`` newly announced
+    tokens in one round. Tuning is re-read every round, so /set changes apply at once.
     """
 
     def __init__(
@@ -84,6 +93,8 @@ class SiteMonitor:
         on_auto_pause: AutoPauseCallback,
         tuning: Tuning,
         watcher: UnverifiedWatcher | None = None,
+        registry: AlertRegistry | None = None,
+        pending: PendingWatch | None = None,
         rng: random.Random | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         page_load_timeout: float = 30.0,
@@ -97,6 +108,8 @@ class SiteMonitor:
         self._on_auto_pause = on_auto_pause
         self._tuning = tuning
         self._watcher = watcher
+        self._registry = registry or AlertRegistry()
+        self._pending = pending
         self._rng = rng or random.Random()
         self._sleep = sleep  # tests replace the stop-aware wait with an instant one
         self._page_load_timeout = page_load_timeout
@@ -104,6 +117,9 @@ class SiteMonitor:
         self._stats = MonitorStats()
         self._planned_delay: float | None = None
         self._health: dict[str, _PageHealth] = {}
+        self._last_read: dict[str, float] = {}  # page -> when it was last read successfully
+        self._first_seen: dict[tuple[str, Address], float] = {}  # (page, address) -> first seen
+        self._round_tokens: dict[str, int] = {}  # page -> tokens announced this round
 
     @property
     def stats(self) -> MonitorStats:
@@ -130,6 +146,7 @@ class SiteMonitor:
     async def run_once(self) -> list[PageCheckOutcome]:
         """One round over every live page; each outcome is handled as soon as it arrives."""
         started = time.perf_counter()
+        self._round_tokens = {}
         pages = await self._live_pages()
         results = await asyncio.gather(
             *(self._check_and_handle(url) for url in pages), return_exceptions=True
@@ -187,10 +204,88 @@ class SiteMonitor:
         stretched = None
         if health is not None and health.factor > 1:
             stretched = self._page_load_timeout * health.factor
-        outcome = await self._checker.check(page_url, load_timeout=stretched)
+        outcome = await self._checker.check(
+            page_url, load_timeout=stretched, on_observation=self._observed
+        )
         await self._handle(outcome)
         await self._track_timeouts(outcome)
         return outcome
+
+    async def _observed(self, observation: Observation) -> None:
+        """Announce the tokens a render showed, before the page is even compared."""
+        page, seen_at = observation.page_url, observation.seen_at
+        missing_at = self._last_read.get(page)
+        # A sub-page first seen after the first round went live meanwhile (app.<domain> at a
+        # launch): what it shows is news, although the monitor never read it before.
+        site = self._site
+        new_page = page != site.url and page not in site.announced_pages and self._stats.rounds > 0
+        # A render shows the page as it was at some moment between its start and end, so
+        # the next appearance window opens at the render's start and always contains it.
+        started = observation.started_at
+        self._last_read[page] = started if started is not None else seen_at
+        if len(self._first_seen) > _FIRST_SEEN_MEMORY:
+            self._first_seen.clear()
+        for sighting in observation.sightings:
+            self._first_seen.setdefault((page, sighting.address), seen_at)
+        sightings = {sighting.address: sighting for sighting in observation.sightings}
+        found: list[tuple[ConfirmedContract, Sighting | None, Timeline]] = []
+        for result in observation.results:
+            # A token behind an LP pair borrows the pair's place on the page.
+            spot = result.via or result.address
+            sighting = sightings.get(spot)
+            contract = result.contract
+            if contract is None:
+                if self._pending is not None:  # it may still become a token: watch it
+                    self._pending.offer(self._site.url, page, sighting, result)
+                continue
+            first = self._first_seen.get((page, spot), seen_at)
+            if first < seen_at:
+                timeline = Timeline(seen_at, on_page_since=first)
+            else:
+                timeline = Timeline(seen_at, missing_at=missing_at)
+            found.append((contract, sighting, timeline))
+        if found:
+            await self._announce(page, found, new_page=new_page)
+
+    async def _announce(
+        self,
+        page_url: str,
+        found: Sequence[tuple[ConfirmedContract, Sighting | None, Timeline]],
+        *,
+        new_page: bool = False,
+    ) -> None:
+        """Announce the tokens no other page or turbo announced yet, one message each.
+
+        When a page reaches ``contract_pause_threshold`` tokens in one round, they go out as
+        a document instead and the site is paused.
+        """
+        new = [item for item in found if self._registry.claim(item[0].address)]
+        if not new:
+            return
+        if self._pending is not None:
+            for contract, _, timeline in new:
+                # A turbo session on this site counts a token that appeared between two
+                # renders or on a page that went live; one already there at the page's first
+                # check is old news to it.
+                if timeline.missing_at is not None or new_page:
+                    self._pending.announced(self._site.url, contract.address)
+        count = self._round_tokens.get(page_url, 0) + len(new)
+        self._round_tokens[page_url] = count
+        if count < self._tuning.contract_pause_threshold:
+            for contract, sighting, timeline in new:
+                await self._notifier.contract_found(
+                    contract, page_url, sighting=sighting, timeline=timeline
+                )
+            return
+        site = self._site
+        await self._notifier.contracts_batch(site.url, page_url, [c for c, _, _ in new])
+        if self._stop.is_set():
+            return  # another page of this round already paused the site
+        self.request_stop()
+        await self._notifier.site_auto_paused(
+            site.url, page_url, count, self._deriver.pages(site.url)
+        )
+        await self._on_auto_pause(site.url, page_url)
 
     async def _track_timeouts(self, outcome: PageCheckOutcome) -> None:
         """Count load timeouts in a row per page; stretch its timeout and tell the user once."""
@@ -232,8 +327,7 @@ class SiteMonitor:
             log.info("[%s] %s: %s", site.url, outcome.url, outcome.status.value)
             await self._announce_if_new(outcome.url)
 
-        if outcome.contracts:
-            await self._handle_contracts(outcome.url, outcome.contracts)
+        # Tokens were announced by _observed as soon as the renders showed them.
         if self._watcher is not None and outcome.candidates:
             await self._watcher.observe(outcome.candidates, outcome.url)
 
@@ -256,23 +350,6 @@ class SiteMonitor:
         site.announced_pages.add(page_url)
         self._persist()
         await self._notifier.page_discovered(page_url)
-
-    async def _handle_contracts(
-        self, page_url: str, contracts: Sequence[ConfirmedContract]
-    ) -> None:
-        site = self._site
-        if len(contracts) < self._tuning.contract_pause_threshold:
-            for contract in contracts:
-                await self._notifier.contract_found(contract, page_url)
-            return
-        await self._notifier.contracts_batch(site.url, page_url, contracts)
-        if self._stop.is_set():
-            return  # another page of this round already paused the site
-        self.request_stop()
-        await self._notifier.site_auto_paused(
-            site.url, page_url, len(contracts), self._deriver.pages(site.url)
-        )
-        await self._on_auto_pause(site.url, page_url)
 
     async def _update_block_state(self, outcomes: Sequence[PageCheckOutcome]) -> None:
         """Slow down on block signals; restore the pace (and tell the user) on recovery."""
