@@ -13,6 +13,7 @@ from collections.abc import Callable, Sequence
 
 from scraper_bot.chains.contract_validators import ContractValidator
 from scraper_bot.models import Address, Chain, SiteState, ValidationStatus
+from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.preferences import Tuning
 from scraper_bot.storage import AddressCache
 from scraper_bot.telegram.notifier import Notifier
@@ -48,6 +49,7 @@ class UnverifiedWatcher:
         notifier: Notifier,
         persist: Callable[[], None],
         tuning: Tuning,
+        registry: AlertRegistry | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._site = site
@@ -56,6 +58,7 @@ class UnverifiedWatcher:
         self._notifier = notifier
         self._persist = persist
         self._tuning = tuning
+        self._registry = registry if registry is not None else AlertRegistry()
         self._clock = clock
         self._pages: dict[str, str] = {}
         self._last_check: dict[str, float] = {}
@@ -119,9 +122,11 @@ class UnverifiedWatcher:
             key = address_key(result.address)
             self._last_check[key] = now
             if result.status is ValidationStatus.CONFIRMED and result.contract is not None:
-                await self._notifier.address_confirmed(
-                    result.contract, self._pages.get(key, self._site.url)
-                )
+                # The pending watch may have confirmed it in the same instant: one alert only.
+                if self._registry.claim(result.contract.address):
+                    await self._notifier.address_confirmed(
+                        result.contract, self._pages.get(key, self._site.url)
+                    )
                 self._forget(key)
                 changed = True
             elif result.status is ValidationStatus.ALREADY_KNOWN:

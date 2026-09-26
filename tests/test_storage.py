@@ -110,6 +110,19 @@ def test_snapshot_keeps_noise_memory_and_reads_version_1_files(tmp_path: Path) -
     old = store.load("https://old.io")
     assert old is not None
     assert old.signature == (node("p", "x"),) and old.noise == {}
+    assert old.deep_seen is None
+
+
+def test_snapshot_keeps_the_deep_scan_memory_only_once_recorded(tmp_path: Path) -> None:
+    store = SnapshotStore(tmp_path / "snaps")
+    signature = (node("p", "text"),)
+    store.save("https://a.io", Snapshot(signature, deep_seen=frozenset({"0xB", "0xA"})))
+    assert store.load("https://a.io").deep_seen == {"0xA", "0xB"}
+    store.save("https://b.io", Snapshot(signature, deep_seen=frozenset()))
+    assert store.load("https://b.io").deep_seen == frozenset()  # recorded, nothing found
+    store.save("https://c.io", Snapshot(signature))
+    assert "deep_seen" not in store.path_for("https://c.io").read_text(encoding="utf-8")
+    assert store.load("https://c.io").deep_seen is None
 
 
 def test_corrupt_snapshot_is_treated_as_missing(tmp_path: Path) -> None:

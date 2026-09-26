@@ -8,6 +8,7 @@ from typing import Protocol
 
 from scraper_bot.models import SiteState
 from scraper_bot.monitoring.monitor_manager import MonitorManager
+from scraper_bot.monitoring.pending import PendingWatch
 from scraper_bot.monitoring.turbo import TurboManager
 from scraper_bot.storage import AddressCache
 from scraper_bot.telegram.markup import escape
@@ -30,6 +31,8 @@ class StatusReporter:
         cache: AddressCache,
         browser: BrowserHealth,
         turbo: TurboManager | None = None,
+        pending: PendingWatch | None = None,
+        rpc_health: Callable[[], list[tuple[str, float]]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._version = version
@@ -37,6 +40,8 @@ class StatusReporter:
         self._cache = cache
         self._browser = browser
         self._turbo = turbo
+        self._pending = pending
+        self._rpc_health = rpc_health  # (endpoint, seconds without an answer)
         self._clock = clock
         self._started_at = clock()
 
@@ -48,8 +53,14 @@ class StatusReporter:
         lines = [
             f"🤖 scraper-bot {self._version}, up {format_duration(now - self._started_at)}",
             f"Browser: {'connected' if self._browser.is_connected else 'DISCONNECTED'}",
-            f"Sites: {len(sites)} total, {running} running, {paused} paused",
         ]
+        failing = self._rpc_health() if self._rpc_health is not None else []
+        if failing:
+            listed = ", ".join(
+                f"{escape(name)} for {format_duration(age)}" for name, age in failing
+            )
+            lines.append(f"⚠️ RPC not answering: {listed}")
+        lines.append(f"Sites: {len(sites)} total, {running} running, {paused} paused")
         for site in sites:
             lines.append(f"• {escape(site.url)}: {self._describe(site, now)}")
         if self._turbo is not None:
@@ -58,13 +69,17 @@ class StatusReporter:
                 lines.append(
                     f"🚀 Turbo {escape(session.url)}: {stats.cycles} cycles, "
                     f"{len(stats.found)} confirmed, "
-                    f"{stats.unverified} unverified, {format_duration(session.seconds_left)} left"
+                    f"{session.pending_count} pending, {format_duration(session.seconds_left)} left"
                 )
             for plan in self._turbo.scheduled():
                 lines.append(
                     f"⏰ Turbo {escape(plan.url)}: scheduled at "
                     f"{format_clock(plan.start_at, date=False)} for {plan.minutes:.0f} min"
                 )
+        if self._pending is not None and self._pending.count():
+            lines.append(
+                f"⏳ {self._pending.count()} address(es) watched until they become a token"
+            )
         lines.append(
             f"Address cache: {self._cache.known_count} known contract(s), "
             f"{self._cache.rejected_count} rejected"

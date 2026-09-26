@@ -5,8 +5,11 @@ Knobs that may change at runtime are layered on top by :mod:`scraper_bot.prefere
 
 from __future__ import annotations
 
+import dataclasses
+import math
 import os
 import re
+import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +41,20 @@ DEFAULT_EVM_NETWORKS: tuple[tuple[str, str, str], ...] = (
     ("Avalanche", "AVAX_RPC_URL", "https://avalanche-c-chain-rpc.publicnode.com"),
 )
 
+# eth_chainId of each network; a mismatch at start means the URL points at another chain.
+EXPECTED_CHAIN_IDS: dict[str, int] = {
+    "Ethereum": 1,
+    "Base": 8453,
+    "Arbitrum": 42161,
+    "Optimism": 10,
+    "BSC": 56,
+    "Fantom": 250,
+    "Sonic": 146,
+    "Avalanche": 43114,
+}
+
+DEFAULT_SOLANA_RPC_URL = "https://solana-rpc.publicnode.com"
+
 DEFAULT_SUB_URL_PATTERNS: tuple[str, ...] = (
     "https://app.{domain}",
     "https://app.{domain}/leaderboard",
@@ -61,12 +78,53 @@ DEFAULT_IGNORED_ATTRIBUTES: tuple[str, ...] = (
 )
 
 DEFAULT_BLOCKED_RESOURCE_TYPES: tuple[str, ...] = ("image", "media", "font")
+# Without a GPU a 3D scene renders in software and starves the browser: flutch.fun took
+# 33-38 s per page with WebGL and 5.5 s without on a 4-core VPS.
+DEFAULT_BROWSER_ARGS = "--disable-3d-apis --disable-webgl --disable-webgl2"
 
 _LIST_SEPARATOR_RE = re.compile(r"[,;\s]+")
 
 # Accepted spellings of booleans in .env and /set
 TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedDefault:
+    """A built-in default that changed since an earlier release."""
+
+    key: str
+    previous: str  # the old default, as older .env.example files spell it
+    current: str
+
+
+# .env.example spells out every default, so a .env copied from an older release pins the
+# old values. A key still set to a previous default is reported at start-up.
+CHANGED_DEFAULTS: tuple[ChangedDefault, ...] = (
+    # 2.1 ─ api.mainnet-beta answered 60 of 100 parallel getAccountInfo calls with HTTP 429
+    ChangedDefault("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", DEFAULT_SOLANA_RPC_URL),
+    # a 10-minute pause after one failed check could hide a launch
+    ChangedDefault("RPC_RETRY_DELAY", "600", "10"),
+    # the pending watch checks a turbo site's addresses every second
+    ChangedDefault("TURBO_RECHECK_INTERVAL", "5", "1"),
+    # scripts and JSON of wallet-connect apps carry dozens of infrastructure addresses
+    ChangedDefault("DEEP_SCAN", "true", "false"),
+    # 2.0 ─ measured on real sites before the 2.0 merge (docs/development.md)
+    ChangedDefault("POLL_INTERVAL_MIN", "5", "4"),
+    ChangedDefault("POLL_INTERVAL_MAX", "15", "10"),
+    ChangedDefault("MAX_CONCURRENT_PAGES", "6", "8"),
+    ChangedDefault("PAGE_LOAD_TIMEOUT", "30", "20"),
+    ChangedDefault("NETWORK_IDLE_TIMEOUT", "6", "2"),
+    ChangedDefault("NETWORK_IDLE_TIMEOUT", "4", "2"),
+    ChangedDefault("SETTLE_DELAY", "1.0", "0.25"),
+    ChangedDefault("SETTLE_DELAY", "0.5", "0.25"),
+    ChangedDefault("RPC_TIMEOUT", "8", "5"),
+    ChangedDefault("ENRICH_TIMEOUT", "3", "2"),
+    ChangedDefault("DEEP_SCAN_MAX_MB", "10", "5"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +176,10 @@ class Settings:
     browser_channel: str
     headless: bool
     blocked_resource_types: tuple[str, ...]
+    browser_args: tuple[str, ...]  # extra Chromium command-line switches
 
     # Blockchain
+    http2: bool  # RPC and Telegram over HTTP/2: parallel calls share one warm connection
     evm_networks: tuple[EvmNetwork, ...]
     solana_rpc_url: str
     sui_rpc_url: str
@@ -134,6 +194,9 @@ class Settings:
     log_level: str
     log_file: Path | None
     heartbeat_interval: float
+
+    # Keys still set to a default of an earlier release (see CHANGED_DEFAULTS)
+    outdated_defaults: tuple[ChangedDefault, ...] = ()
 
     @classmethod
     def from_env(
@@ -188,7 +251,7 @@ class Settings:
             enrich_timeout=reader.number("ENRICH_TIMEOUT", 2.0, minimum=0.0),
             flap_window=reader.number("FLAP_WINDOW_HOURS", 24.0, minimum=0.0) * 3600.0,
             flap_threshold=reader.integer("FLAP_THRESHOLD", 2, minimum=1),
-            deep_scan=reader.flag("DEEP_SCAN", True),
+            deep_scan=reader.flag("DEEP_SCAN", False),
             deep_scan_max_bytes=int(
                 reader.number("DEEP_SCAN_MAX_MB", 5.0, minimum=0.0) * 1024 * 1024
             ),
@@ -198,7 +261,7 @@ class Settings:
             turbo_stop_after=reader.integer("TURBO_STOP_AFTER", 1, minimum=0),
             turbo_max_sites=reader.integer("TURBO_MAX_SITES", 1, minimum=1),
             turbo_max_pages=reader.integer("TURBO_MAX_PAGES", 4, minimum=1),
-            turbo_recheck_interval=reader.number("TURBO_RECHECK_INTERVAL", 5.0, minimum=1.0),
+            turbo_recheck_interval=reader.number("TURBO_RECHECK_INTERVAL", 1.0, minimum=1.0),
             block_max_backoff=reader.number("BLOCK_MAX_BACKOFF", 600.0, minimum=1.0),
             unverified_recheck=reader.number("UNVERIFIED_RECHECK_MINUTES", 5.0, minimum=1.0) * 60,
             unverified_watch=reader.number("UNVERIFIED_WATCH_HOURS", 24.0, minimum=1.0) * 3600,
@@ -208,19 +271,63 @@ class Settings:
             blocked_resource_types=reader.text_list(
                 "BLOCKED_RESOURCE_TYPES", DEFAULT_BLOCKED_RESOURCE_TYPES
             ),
+            browser_args=reader.arguments("BROWSER_ARGS", DEFAULT_BROWSER_ARGS),
+            http2=reader.flag("HTTP2", True),
             evm_networks=networks,
-            solana_rpc_url=reader.text("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
-            sui_rpc_url=reader.text("SUI_RPC_URL", "https://sui-rpc.publicnode.com"),
+            # (an empty EVM URL skips that network; Solana and Sui cannot be skipped)
+            solana_rpc_url=reader.text_or_default("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
+            sui_rpc_url=reader.text_or_default("SUI_RPC_URL", "https://sui-rpc.publicnode.com"),
             require_erc20=reader.flag("REQUIRE_ERC20", True),
             rpc_timeout=reader.number("RPC_TIMEOUT", 5.0, minimum=1.0),
             max_concurrent_rpc=reader.integer("MAX_CONCURRENT_RPC", 8, minimum=1),
             rejected_ttl=reader.number("REJECTED_TTL_HOURS", 6.0, minimum=0.0) * 3600.0,
-            rpc_retry_delay=reader.number("RPC_RETRY_DELAY", 600.0, minimum=0.0),
-            data_dir=Path(reader.text("DATA_DIR", "data")),
-            log_level=reader.text("LOG_LEVEL", "INFO").upper(),
+            rpc_retry_delay=reader.number("RPC_RETRY_DELAY", 10.0, minimum=0.0),
+            data_dir=Path(reader.text_or_default("DATA_DIR", "data")),
+            log_level=reader.choice("LOG_LEVEL", "INFO", LOG_LEVELS),
             log_file=Path(log_file) if log_file else None,
             heartbeat_interval=reader.number("HEARTBEAT_INTERVAL", 15.0, minimum=1.0),
+            outdated_defaults=find_outdated_defaults(merged),
         )
+
+
+def find_outdated_defaults(
+    values: Mapping[str, str], changes: tuple[ChangedDefault, ...] | None = None
+) -> tuple[ChangedDefault, ...]:
+    """The changed defaults (``CHANGED_DEFAULTS``) that ``values`` still set to the old value.
+
+    ``previous`` of each result is the value as ``values`` spell it (``on`` for ``true``).
+    """
+    return tuple(
+        dataclasses.replace(change, previous=values[change.key].strip())
+        for change in (CHANGED_DEFAULTS if changes is None else changes)
+        if change.key in values and _same_setting(values[change.key], change.previous)
+    )
+
+
+def _same_setting(value: str, previous: str) -> bool:
+    """Equal when read as ``previous``'s type: ``on`` == ``true``, ``600`` == ``600.0``."""
+    text, old = value.strip().lower(), previous.strip().lower()
+    if old in {"true", "false"}:
+        return (text in TRUE_WORDS) if old == "true" else (text in FALSE_WORDS)
+    try:
+        return float(text) == float(old)
+    except ValueError:
+        return text.rstrip("/") == old.rstrip("/")
+
+
+def split_arguments(
+    text: str, key: str = "value", *, windows: bool | None = None
+) -> tuple[str, ...]:
+    """``text`` split into command-line arguments, quotes removed."""
+    lexer = shlex.shlex(text, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    if os.name == "nt" if windows is None else windows:
+        lexer.escape = ""  # a backslash in a Windows path is a separator, not an escape
+    try:
+        return tuple(lexer)
+    except ValueError as exc:
+        raise ConfigError(f"{key} is not a valid argument list: {exc}") from exc
 
 
 class _EnvReader:
@@ -231,6 +338,16 @@ class _EnvReader:
 
     def text(self, key: str, default: str = "") -> str:
         return self._values.get(key, default).strip()
+
+    def text_or_default(self, key: str, default: str) -> str:
+        """Like :meth:`text`, but an empty value also means the default."""
+        return self.text(key) or default
+
+    def choice(self, key: str, default: str, allowed: frozenset[str]) -> str:
+        value = self.text_or_default(key, default).upper()
+        if value not in allowed:
+            raise ConfigError(f"{key} must be one of {', '.join(sorted(allowed))}, got {value!r}")
+        return value
 
     def flag(self, key: str, default: bool) -> bool:
         raw = self.text(key)
@@ -263,6 +380,8 @@ class _EnvReader:
             value = float(raw)
         except ValueError as exc:
             raise ConfigError(f"{key} must be a number, got {raw!r}") from exc
+        if not math.isfinite(value):
+            raise ConfigError(f"{key} must be a finite number, got {raw!r}")
         if minimum is not None and value < minimum:
             raise ConfigError(f"{key} must be >= {minimum}")
         return value
@@ -274,6 +393,14 @@ class _EnvReader:
             return default
         items = (item.strip().strip("'\"") for item in _LIST_SEPARATOR_RE.split(raw))
         return tuple(item for item in items if item)
+
+    def arguments(self, key: str, default: str) -> tuple[str, ...]:
+        """Command-line switches split like a shell does, so ``--x=a,b`` stays whole.
+
+        Only an absent key gets ``default``; an empty value means no switches at all. On
+        Windows backslashes are path separators, not escapes (``--user-data-dir=C:\\x``).
+        """
+        return split_arguments(self.text(key, default), key)
 
     def int_list(self, key: str) -> tuple[int, ...]:
         items = self.text_list(key)

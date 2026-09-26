@@ -106,6 +106,9 @@ class Backend:
         self.sol_accounts: dict[str, bytes] = {}
         self.sui_coins: dict[str, dict[str, Any]] = {}
         self.sui_packages: dict[str, dict[str, list[str]]] = {}
+        self.fresh = False  # EVM: no code 90 blocks ago
+        self.block_age = 180  # EVM: seconds since the block 90 blocks back
+        self.sol_signatures: Any = []
 
     def sui(self, method: str, params: list[Any]) -> Any:
         target = params[0]
@@ -136,26 +139,42 @@ class Backend:
         if self.rpc_down:
             raise httpx.ConnectError("down", request=request)
         body = json.loads(request.content)
-        params = body["params"]
+        items = body if isinstance(body, list) else [body]
+        answers = []
+        for item in items:
+            try:
+                result = self.answer(host, item["method"], item["params"])
+            except LookupError:
+                raise httpx.ConnectError("unknown host", request=request) from None
+            answers.append({"jsonrpc": "2.0", "id": item["id"], "result": result})
+        return httpx.Response(200, json=answers if isinstance(body, list) else answers[0])
+
+    def answer(self, host: str, method: str, params: list[Any]) -> Any:
         if host == "alpha.rpc":
-            result = {
+            if method == "eth_blockNumber":
+                return hex(10_000)
+            if method == "eth_getBlockByNumber":
+                return {"timestamp": hex(int(time.time()) - self.block_age)}
+            if method == "eth_getCode":
+                return "0x" if self.fresh else "0x6080"
+            return {
                 "0x06fdde03": abi_string("USD Coin"),
                 "0x95d89b41": abi_bytes32("USDC"),
                 "0x313ce567": abi_uint(6),
                 "0x18160ddd": abi_uint(50_000_000 * 10**6),
             }[params[0]["data"]]
-        elif host == "sol.rpc":
+        if host == "sol.rpc":
+            if method == "getSignaturesForAddress":
+                return self.sol_signatures
             data = self.sol_accounts.get(params[0])
             value = None
             if data is not None:
                 encoded = base64.b64encode(data).decode()
                 value = {"executable": False, "owner": "x", "data": [encoded, "base64"]}
-            result = {"context": {"slot": 1}, "value": value}
-        elif host == "sui.rpc":
-            result = self.sui(body["method"], params)
-        else:
-            raise httpx.ConnectError("unknown host", request=request)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+            return {"context": {"slot": 1}, "value": value}
+        if host == "sui.rpc":
+            return self.sui(method, params)
+        raise LookupError(host)
 
 
 def make(backend: Backend, **tuning: Any) -> TokenEnricher:
@@ -247,7 +266,9 @@ async def test_evm_enrichment_combines_chain_and_market_data() -> None:
     assert (info.price_usd, info.liquidity_usd, info.fdv_usd) == (1.0, 500.0, 5e9)
     assert info.pair_created_at == 1000.0
     assert ("GET", "api.dexscreener.com", f"/tokens/v1/ethereum/{USDC_ETH}") in backend.calls
-    assert sum(1 for _, host, _ in backend.calls if host == "alpha.rpc") == 4
+    # four ERC-20 calls, then the age: the head block and one batch 90 blocks back
+    assert sum(1 for _, host, _ in backend.calls if host == "alpha.rpc") == 6
+    assert info.deployed_before is not None and 170 <= info.deployed_before <= 190
 
 
 async def test_solana_enrichment_reads_mint_and_metaplex_metadata() -> None:
@@ -440,3 +461,87 @@ async def test_unexpected_exceptions_in_a_source_are_swallowed(
     info = await make(backend).enrich(ETH_CONTRACT)
     assert info.decimals == 6 and info.name == "USD Coin"
     assert not info.market_checked and info.pair is None
+
+
+# ── risk flags, age and other networks ──────────────────────────────────────
+def extension(kind: int, body: bytes) -> bytes:
+    return kind.to_bytes(2, "little") + len(body).to_bytes(2, "little") + body
+
+
+def t22_mint(*extensions: bytes, authorities: bool = False) -> bytes:
+    mint = bytearray(MINT)
+    if authorities:
+        mint[0:4] = (1).to_bytes(4, "little")  # mint authority kept
+        mint[46:50] = (1).to_bytes(4, "little")  # freeze authority kept
+    return bytes(mint).ljust(165, b"\x00") + b"\x01" + b"".join(extensions)
+
+
+def fee(bps: int) -> bytes:
+    older = bytes(16) + (0).to_bytes(2, "little")
+    newer = bytes(16) + bps.to_bytes(2, "little")
+    return bytes(72) + older + newer
+
+
+def test_risky_token_2022_extensions_are_named() -> None:
+    from scraper_bot.chains.enrichment import parse_authorities, parse_risky_extensions
+
+    data = t22_mint(
+        extension(1, fee(250)),
+        extension(6, b"\x02"),
+        extension(9, b""),
+        extension(12, b"\x07" * 32),
+        extension(14, bytes(32) + b"\x05" * 32),
+        extension(26, bytes(32) + b"\x01"),
+        authorities=True,
+    )
+    assert parse_risky_extensions(data) == (
+        "transfer fee 2.5%",
+        "new accounts start frozen",
+        "non-transferable",
+        "permanent delegate",
+        "transfer hook",
+        "paused",
+    )
+    assert parse_authorities(data) == (True, True)
+    harmless = t22_mint(
+        extension(1, fee(0)),
+        extension(6, b"\x01"),
+        extension(12, bytes(32)),
+        extension(14, b"\x05" * 32 + bytes(32)),
+    )
+    assert parse_risky_extensions(harmless) == ()
+    assert parse_authorities(MINT) == (False, False)
+    assert parse_authorities(b"short") is None
+
+
+async def test_solana_details_carry_authorities_flags_and_age() -> None:
+    backend = Backend()
+    backend.sol_accounts = {USDC_SOL: t22_mint(extension(12, b"\x07" * 32), authorities=True)}
+    backend.sol_signatures = [{"blockTime": 1_790_000_100}, {"blockTime": 1_790_000_000}]
+    info = await make(backend).enrich(SOL_CONTRACT)
+    assert (info.mint_authority, info.freeze_authority) == (True, True)
+    assert info.risky_extensions == ("permanent delegate",)
+    assert info.created_at == 1_790_000_000.0 and not info.busy
+
+    backend.sol_signatures = [{"blockTime": 1}] * 1000  # too many to find the first one
+    assert (await make(backend).enrich(SOL_CONTRACT)).busy
+
+
+async def test_evm_age_and_other_networks() -> None:
+    backend = Backend()
+    backend.fresh = True  # no code 90 blocks ago: deployed within that window
+    info = await make(backend).enrich(ETH_CONTRACT)
+    assert info.deployed_within is not None and info.deployed_before is None
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(backend.handler))
+    networks = (*NETWORKS, EvmNetwork("Base", "https://alpha.rpc"))
+    enricher = TokenEnricher(
+        http,
+        networks,
+        "https://sol.rpc",
+        timeout=5,
+        tuning=FakeTuning(),
+        sui_rpc_url="https://sui.rpc",
+    )
+    backend.fresh = False
+    assert (await enricher.enrich(ETH_CONTRACT)).also_on == ("Base",)

@@ -2,6 +2,8 @@
 
 It starts the bot if no instance is running, and restarts it when the process
 dies or when the heartbeat file written by the bot goes stale (a hung process).
+A SIGTERM to the supervisor (systemd) is passed on to the bot, which gets time to send
+the alerts already on their way.
 
     python rebooter.py            # defaults: main.py next to this file, data/heartbeat
 """
@@ -9,12 +11,16 @@ dies or when the heartbeat file written by the bot goes stale (a hung process).
 from __future__ import annotations
 
 import argparse
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import psutil
+
+# Seconds a stopping bot gets to send the alerts on their way and close the browser.
+STOP_GRACE = 30.0
 
 
 class Supervisor:
@@ -71,14 +77,20 @@ class Supervisor:
         self._process = subprocess.Popen([self._python, str(self._script)], cwd=self._script.parent)
         self._started_at = time.time()
 
-    def _terminate(self) -> None:
+    def stop(self, _signum: int = 0, _frame: object = None) -> None:
+        """SIGTERM handler: stop the bot gracefully, then exit."""
+        self._log("stopping the bot")
+        self._terminate(grace=STOP_GRACE)
+        raise SystemExit(0)
+
+    def _terminate(self, grace: float = 10) -> None:
         proc = self._process
         self._process = None
         if proc is None:
             return
         try:
             proc.terminate()
-            proc.wait(10)
+            proc.wait(grace)
         except (subprocess.TimeoutExpired, psutil.TimeoutExpired):
             proc.kill()
         except psutil.Error:
@@ -124,13 +136,15 @@ def main() -> None:
     parser.add_argument("--stale-after", type=float, default=300.0, help="seconds")
     parser.add_argument("--interval", type=float, default=5.0, help="seconds between checks")
     args = parser.parse_args()
-    Supervisor(
+    supervisor = Supervisor(
         args.script,
         python=sys.executable,
         heartbeat=args.heartbeat,
         stale_after=args.stale_after,
         check_interval=args.interval,
-    ).run()
+    )
+    signal.signal(signal.SIGTERM, supervisor.stop)
+    supervisor.run()
 
 
 if __name__ == "__main__":

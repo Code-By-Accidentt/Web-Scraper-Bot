@@ -140,7 +140,7 @@ async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None
     try:
         session = await turbo.start("https://a.io", 10)
         assert isinstance(session, StubTurboSession)
-        session.stats.cycles, session.stats.unverified = 3, 2
+        session.stats.cycles, session.pending_count = 3, 2
         session.stats.found.append(
             ConfirmedContract(Address(Chain.ETHEREUM, f"0x{1:040x}"), "Ethereum")
         )
@@ -151,7 +151,7 @@ async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None
         await turbo.shutdown()
     lines = text.splitlines()
     assert lines[2] == "Sites: 0 total, 0 running, 0 paused"
-    assert lines[3] == "🚀 Turbo https://a.io: 3 cycles, 1 confirmed, 2 unverified, 10m 0s left"
+    assert lines[3] == "🚀 Turbo https://a.io: 3 cycles, 1 confirmed, 2 pending, 10m 0s left"
     assert lines[4] == (
         f"⏰ Turbo https://b.io: scheduled at {format_clock(starts_at, date=False)} for 5 min"
     )
@@ -179,3 +179,50 @@ async def test_status_counts_pages_timing_out(tmp_path: Path) -> None:
     finally:
         await manager.shutdown()
     assert "; 🐢 2 page(s) timing out" in text
+
+
+class CountingPending:
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    def count(self, site_url: str | None = None) -> int:
+        return self._count
+
+
+async def test_status_says_how_many_addresses_wait_for_deployment(tmp_path: Path) -> None:
+    manager = MonitorManager(
+        state_store=StateStore(tmp_path / "state.json"),
+        snapshot_store=SnapshotStore(tmp_path / "snaps"),
+        deriver=SubUrlDeriver(()),
+        monitor_factory=StubMonitor,
+        restart_delay=0,
+    )
+    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    for count, shown in ((3, True), (0, False)):
+        reporter = StatusReporter(
+            version="1",
+            manager=manager,
+            cache=cache,
+            browser=Browser(True),
+            pending=CountingPending(count),  # type: ignore[arg-type]
+        )
+        text = reporter.render()
+        assert ("⏳ 3 address(es) watched until they become a token" in text) is shown
+
+
+async def test_status_names_rpc_endpoints_that_do_not_answer(tmp_path: Path) -> None:
+    manager = MonitorManager(
+        state_store=StateStore(tmp_path / "state.json"),
+        snapshot_store=SnapshotStore(tmp_path / "snaps"),
+        deriver=SubUrlDeriver(()),
+        monitor_factory=StubMonitor,
+        restart_delay=0,
+    )
+    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    failing: list[tuple[str, float]] = [("Sui", 425.0)]
+    reporter = StatusReporter(
+        version="1", manager=manager, cache=cache, browser=Browser(True), rpc_health=lambda: failing
+    )
+    assert "⚠️ RPC not answering: Sui for 7m 5s" in reporter.render()
+    failing.clear()
+    assert "RPC not answering" not in reporter.render()

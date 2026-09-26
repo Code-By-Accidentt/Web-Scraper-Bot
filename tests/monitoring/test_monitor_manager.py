@@ -356,3 +356,19 @@ async def test_legacy_import_skipped_when_state_file_exists_but_is_empty(tmp_pat
         assert h.state.load() == {}
     finally:
         await h.manager.shutdown()
+
+
+async def test_pause_state_and_removal_are_reported_to_the_pending_watch(tmp_path: Path) -> None:
+    removed: list[str] = []
+    h = Harness(tmp_path)
+    h.manager._on_removed = removed.append
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        assert not h.manager.is_paused(ROOT)
+        await h.manager.pause_site(ROOT)
+        assert h.manager.is_paused(ROOT) and not h.manager.is_paused("https://other.io")
+        await h.manager.remove_site(ROOT)
+        assert removed == [ROOT]  # its watched addresses are forgotten with it
+    finally:
+        await h.manager.shutdown()

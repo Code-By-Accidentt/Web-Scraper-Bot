@@ -1,8 +1,11 @@
 """Turbo mode: render one site every few seconds to catch a launch as it happens.
 
-Sessions only hunt addresses (change alerts stay with the regular monitor): anything
-new after the first cycle is announced as *unverified* and re-checked on-chain until
-confirmed. A session ends on ``stop_after`` contracts, timeout, /turbo stop or a block.
+Sessions only hunt tokens (change alerts stay with the regular monitor) and announce
+only confirmed ones. An address a page shows on its first good render that already
+exists is old news. One that does not exist yet, and any later address that is not a
+token yet, goes to the pending watch, which checks it at the turbo pace and announces
+it once deployed. A session ends on ``stop_after`` tokens, timeout, /turbo stop or a
+block.
 """
 
 from __future__ import annotations
@@ -11,14 +14,25 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 from scraper_bot.chains.address_extractor import AddressExtractor
 from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.models import Address, BlockSignal, ConfirmedContract, ValidationStatus
+from scraper_bot.models import (
+    Address,
+    BlockSignal,
+    ConfirmedContract,
+    Sighting,
+    Timeline,
+    ValidationStatus,
+)
+from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pending import PendingWatch
 from scraper_bot.pages.blocking import BlockDetector
-from scraper_bot.pages.fetcher import HttpProber, PageFetcher
+from scraper_bot.pages.fetcher import FetchResult, HttpProber, PageFetcher
+from scraper_bot.pages.html_normalizer import HtmlNormalizer
+from scraper_bot.pages.sightings import find_sightings
 from scraper_bot.pages.urls import SubUrlDeriver, normalize_url
 from scraper_bot.preferences import Tuning
 from scraper_bot.storage import AddressCache
@@ -55,14 +69,12 @@ class TurboLimits:
     stop_after: int  # confirmed contracts that end the session; 0 = never
     max_sites: int  # concurrent (running or scheduled) sessions
     max_pages: int  # pages rendered per cycle, the root page included
-    recheck_interval: float  # seconds between on-chain re-checks of unverified addresses
 
 
 # A session takes either fixed limits or a callable returning the current ones, so that
 # /set changes reach sessions that are already running.
 LimitsSource = TurboLimits | Callable[[], TurboLimits]
 
-_MAX_WATCH = 50  # unverified addresses tracked per session
 _MANUAL_STOP = "stopped manually"
 
 
@@ -72,7 +84,7 @@ class TurboStats:
     deadline: float | None = None
     cycles: int = 0
     renders: int = 0
-    unverified: int = 0
+    pending: int = 0  # addresses found after a page's first cycle and newly watched
     found: list[ConfirmedContract] = field(default_factory=list)
     stop_reason: str | None = None
 
@@ -85,7 +97,7 @@ class ScheduledTurbo:
 
 
 class TurboSession:
-    """One site rendered in a tight loop until a contract appears or the time is up."""
+    """One site rendered in a tight loop until its token appears or the time is up."""
 
     def __init__(
         self,
@@ -100,6 +112,9 @@ class TurboSession:
         block_detector: BlockDetector,
         limits: LimitsSource,
         duration: float,
+        pending: PendingWatch,
+        registry: AlertRegistry,
+        normalizer: HtmlNormalizer | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
@@ -107,19 +122,21 @@ class TurboSession:
         self._pages = list(pages)
         self._fetcher = fetcher
         self._extractor = extractor
+        self._normalizer = normalizer or HtmlNormalizer()
         self._validator = validator
         self._cache = cache
         self._notifier = notifier
         self._blocks = block_detector
         self._limits_source = limits
         self._duration = duration
+        self._pending = pending
+        self._registry = registry
         self._clock = clock
         self._sleep = sleep  # tests replace the stop-aware pause with an instant one
         self._stats = TurboStats()
         self._stop = asyncio.Event()
         self._seen: set[Address] = set()
-        self._watch: dict[Address, float] = {}  # address -> last on-chain check (0 = never)
-        self._page_of: dict[Address, str] = {}
+        self._last_read: dict[str, float] = {}  # page -> when the previous cycle began
 
     @property
     def url(self) -> str:
@@ -140,6 +157,11 @@ class TurboSession:
         return self._stats
 
     @property
+    def pending_count(self) -> int:
+        """Addresses of this site the pending watch checks at the turbo pace."""
+        return self._pending.count(self._url)
+
+    @property
     def seconds_left(self) -> float:
         if self._stats.deadline is None:
             return self._duration
@@ -157,6 +179,7 @@ class TurboSession:
             self._url, len(self._pages), limits.interval, self._duration / 60, limits.stop_after
         )
         reason: str | None = None
+        self._pending.start_turbo(self._url, self._deployed)
         try:
             while True:
                 if self._stop.is_set():
@@ -179,6 +202,7 @@ class TurboSession:
             reason = "bot is shutting down"
             raise
         finally:
+            self._pending.stop_turbo(self._url, self._deployed)
             stats.stop_reason = reason or _MANUAL_STOP
             log.info("turbo finished for %s: %s", self._url, stats.stop_reason)
             with contextlib.suppress(Exception):
@@ -192,60 +216,76 @@ class TurboSession:
         return stats
 
     async def _cycle(self) -> BlockSignal | None:
+        started = self._clock()
         results = await asyncio.gather(*(self._fetcher.fetch(page) for page in self._pages))
+        seen_at = self._clock()
         self._stats.cycles += 1
         self._stats.renders += len(results)
         for result in results:
             signal = self._blocks.inspect(result)
             if signal is not None:
                 return signal
-        baseline = self._stats.cycles == 1
-        for result in results:
+        # Pages read before go first: an address a late page shows on its baseline render is
+        # then already known from them as news, not taken for old news.
+        for result in sorted(results, key=lambda r: r.url not in self._last_read):
             if not result.ok:
                 continue
-            for address in self._extractor.extract_many(result.scan_texts):
-                await self._consider(address, result.url, baseline)
-        await self._recheck()
+            # A page's first good render is its baseline, even when an earlier cycle failed.
+            baseline = result.url not in self._last_read
+            fresh = [s for s in await self._sightings(result) if s.address not in self._seen]
+            self._seen.update(sighting.address for sighting in fresh)
+            # Known tokens (a trending list, an old token, one the regular monitor just
+            # announced and the pending watch passed on) are not news for this session.
+            fresh = [s for s in fresh if not self._cache.is_known(s.address)]
+            if baseline:
+                # Already on the page when it was first read: news only if it does not exist.
+                for sighting in fresh:
+                    self._pending.offer_baseline(self._url, result.url, sighting)
+            elif fresh:
+                await self._check(result.url, fresh, seen_at)
+            # What this cycle read may predate its end, so the next window opens at its start.
+            self._last_read[result.url] = result.started_at or started
         return None
 
-    async def _consider(self, address: Address, page_url: str, baseline: bool) -> None:
-        """Track an address seen on a page; announce it unless it was there from the start."""
-        if address in self._seen or self._cache.is_known(address):
-            return
-        self._seen.add(address)
-        if len(self._watch) >= _MAX_WATCH:
-            log.warning("turbo %s: watch list is full, ignoring %s", self._url, address)
-            return
-        self._watch[address] = 0.0
-        self._page_of[address] = page_url
-        if not baseline:
-            self._stats.unverified += 1
-            await self._notifier.unverified_address(address, page_url, self.limits.recheck_interval)
+    async def _sightings(self, result: FetchResult) -> list[Sighting]:
+        signature = await asyncio.to_thread(self._normalizer.signature, result.html)
+        return await asyncio.to_thread(
+            find_sightings,
+            self._extractor,
+            signature,
+            result.html,
+            result.extra_texts,
+            result.dom_texts,
+        )
 
-    async def _recheck(self) -> None:
-        now = self._clock()
-        due = [
-            address
-            for address, last in self._watch.items()
-            if last == 0.0 or now - last >= self.limits.recheck_interval
-        ]
-        if not due:
+    async def _check(self, page_url: str, sightings: Sequence[Sighting], seen_at: float) -> None:
+        """A new address: announce it if it is a token, else let the pending watch wait."""
+        results = await self._validator.validate_many(
+            [s.address for s in sightings], negative_cache=False
+        )
+        by_address = {sighting.address: sighting for sighting in sightings}
+        for result in results:
+            sighting = by_address.get(result.via or result.address)
+            if result.contract is not None:
+                self._deployed(result.contract.address)
+                if self._registry.claim(result.contract.address):
+                    timeline = Timeline(seen_at, missing_at=self._last_read.get(page_url))
+                    await self._notifier.contract_found(
+                        result.contract, page_url, sighting=sighting, timeline=timeline
+                    )
+            elif result.status is ValidationStatus.ALREADY_KNOWN and result.via is None:
+                # announced by the regular monitor meanwhile (an old token behind a new LP
+                # pair is not this launch)
+                self._deployed(result.address)
+            elif self._pending.offer(self._url, page_url, sighting, result, fast=True):
+                self._stats.pending += 1
+
+    def _deployed(self, address: Address) -> None:
+        """A token of this site: found by the session or by the pending watch."""
+        if any(contract.address == address for contract in self._stats.found):
             return
-        for result in await self._validator.validate_many(due, negative_cache=False):
-            address = result.address
-            if result.status is ValidationStatus.CONFIRMED and result.contract is not None:
-                self._watch.pop(address, None)
-                self._stats.found.append(result.contract)
-                await self._notifier.address_confirmed(
-                    result.contract, self._page_of.get(address, self._url)
-                )
-            elif result.status is ValidationStatus.ALREADY_KNOWN:
-                # Confirmed (and announced) by the regular monitor in the meantime.
-                self._watch.pop(address, None)
-                network = self._cache.known_network(address) or "unknown network"
-                self._stats.found.append(ConfirmedContract(address, network))
-            else:
-                self._watch[address] = now
+        network = self._cache.known_network(address) or "unknown network"
+        self._stats.found.append(ConfirmedContract(address, network))
 
     async def _pause(self, seconds: float) -> None:
         if self._sleep is not None:
@@ -298,7 +338,6 @@ class TurboManager:
             stop_after=tuning.turbo_stop_after,
             max_sites=tuning.turbo_max_sites,
             max_pages=tuning.turbo_max_pages,
-            recheck_interval=tuning.turbo_recheck_interval,
         )
 
     def active(self) -> list[TurboSession]:

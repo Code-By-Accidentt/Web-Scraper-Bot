@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 import pytest
 
-from scraper_bot.chains.rpc import JsonRpcClient, RpcError
+from scraper_bot.chains.rpc import NO_RETRY, JsonRpcClient, RpcError
 from scraper_bot.chains.sui import (
     COIN_CHECK_BATCH,
     MAX_COIN_CANDIDATES,
@@ -45,7 +45,7 @@ class FakeSui:
 
     def client(self) -> JsonRpcClient:
         http = httpx.AsyncClient(transport=httpx.MockTransport(self.handler))
-        return JsonRpcClient(http, "https://sui.rpc", timeout=5)
+        return JsonRpcClient(http, "https://sui.rpc", timeout=5, retry=NO_RETRY)
 
     def count(self, method: str) -> int:
         return sum(1 for name, _ in self.calls if name == method)

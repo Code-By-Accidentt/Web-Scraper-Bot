@@ -46,7 +46,7 @@ def test_set_parses_validates_and_applies_scale(tmp_path: Path) -> None:
     assert (change.old, change.new) == (6.0, 12.0)
     assert prefs.rejected_ttl == 12 * 3600
     assert prefs.set("contract_pause_threshold", "3").new == 3
-    assert prefs.set("deep_scan", "ON").new is True
+    assert prefs.set("deep_scan", "ON", confirmed=True).new is True
     with pytest.raises(PreferenceError, match="takes an integer"):
         prefs.set("contract_pause_threshold", "3.5")
     with pytest.raises(PreferenceError, match="at least 1"):
@@ -177,7 +177,7 @@ CAUTION_BOUNDARIES: dict[str, tuple[str, str]] = {
     "poll_interval_min": ("2.99", "3"),
     "require_erc20": ("off", "on"),
     "rejected_ttl_hours": ("0", "0.5"),
-    "deep_scan": ("off", "on"),
+    "deep_scan": ("on", "off"),
     "flap_window_hours": ("0", "0.5"),
     "turbo_interval": ("1.99", "2"),
     "turbo_max_sites": ("2", "1"),

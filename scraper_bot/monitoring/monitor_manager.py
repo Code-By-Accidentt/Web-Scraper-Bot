@@ -59,6 +59,7 @@ class MonitorManager:
         legacy_importer: LegacyStateImporter | None = None,
         restart_delay: float = 30.0,
         notifier: Notifier | None = None,
+        on_removed: Callable[[str], None] | None = None,
     ) -> None:
         self._state_store = state_store
         self._snapshot_store = snapshot_store
@@ -67,6 +68,7 @@ class MonitorManager:
         self._legacy_importer = legacy_importer
         self._restart_delay = restart_delay
         self._notifier = notifier
+        self._on_removed = on_removed
         self._sites: dict[str, SiteState] = {}
         self._monitors: dict[str, SiteMonitor] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -98,6 +100,10 @@ class MonitorManager:
         task = self._tasks.get(url)
         return task is not None and not task.done()
 
+    def is_paused(self, url: str) -> bool:
+        site = self._sites.get(url)
+        return site is not None and site.paused
+
     def stats(self, url: str) -> MonitorStats | None:
         monitor = self._monitors.get(url)
         return monitor.stats if monitor is not None else None
@@ -119,6 +125,8 @@ class MonitorManager:
         await self._stop_monitor(url)
         self._snapshot_store.delete_many(self._deriver.pages(url))
         self.persist()
+        if self._on_removed is not None:
+            self._on_removed(url)
         return site
 
     async def pause_site(self, raw_url: str) -> SiteState:

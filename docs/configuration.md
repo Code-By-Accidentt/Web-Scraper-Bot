@@ -8,6 +8,13 @@ Every setting is an environment variable. Precedence, highest first:
 3. The `.env` file in the working directory.
 4. The built-in default shown below (identical to `.env.example`; a test keeps them in sync).
 
+Put into `.env` only the values you want to differ from the default. A `.env` copied whole
+from an older `.env.example` pins that release's defaults. The bot names each key still
+set to a default of 2.0 (`SOLANA_RPC_URL`, `RPC_RETRY_DELAY`, `TURBO_RECHECK_INTERVAL`,
+`DEEP_SCAN`) or of the builds before it (polling, rendering, RPC and token-detail
+timings, tab count, deep-scan budget), in the log at
+every start and in one Telegram message per set of such values.
+
 Durations are seconds unless the name says otherwise. Live knobs are changed with
 `/set <live key> <value>`; the live key is shown in the last column. Everything else
 needs a restart.
@@ -18,7 +25,7 @@ needs a restart.
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | – | **Required.** Token from @BotFather. Rejected token = exit code 2. | – |
 | `TELEGRAM_CHAT_IDS` | – | Chats that receive alerts, comma separated. Empty = alerts are dropped with a warning; `/start` tells you your chat id. | – |
-| `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Chats allowed to run commands. Empty = every chat. Settings and the unverified mode can be changed from these chats, or from `TELEGRAM_CHAT_IDS` when this is empty. | – |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Chats allowed to run commands. Empty = the alert chats in `TELEGRAM_CHAT_IDS`. Any other chat only learns its chat id from `/start`. | – |
 
 ## Monitoring and rendering
 
@@ -35,21 +42,21 @@ needs a restart.
 | `SUB_URL_PATTERNS` | 7 patterns | Sub-pages derived from every root URL; `{domain}` is the host without `www.`. Probed every round, rendered when they exist. | – |
 | `IGNORED_ATTRIBUTES` | nonce, integrity, csrf tokens, ... | HTML attributes never compared. | – |
 | `MAX_CHANGE_EXAMPLES` | 5 | Removed / added / changed elements quoted per category in a change alert. 0 = counts only. | `max_change_examples` |
-| `ENRICH_TIMEOUT` | 2 | Time budget for token details in a contract alert (name, symbol, decimals, supply, DEX pair). Measured 0.05–0.2 s. 0 = links only. | `enrich_timeout` |
+| `ENRICH_TIMEOUT` | 2 | Time budget for the token details edited into a token alert after it went out (name, symbol, decimals, supply, Solana authorities and risky extensions, age, other networks, DEX pair). The alert itself never waits for them. Measured 0.05–0.2 s. 0 = links only. | `enrich_timeout` |
 | `FLAP_WINDOW_HOURS` / `FLAP_THRESHOLD` | 24 / 2 | An element that alerted `FLAP_THRESHOLD` times within the window is silenced while it keeps changing. 0 hours = off. | `flap_window_hours`, `flap_threshold` |
-| `DEEP_SCAN` | true | Also search iframes, shadow DOM and every script or JSON answer the page loaded. No extra requests. | `deep_scan` |
+| `DEEP_SCAN` | false | Also search iframes, shadow DOM and every script or JSON answer the page loaded. No extra requests. Off by default: wallet kits ship dozens of token addresses in their bundles. When on, an address a page's deep sources carried on its first deep round is ignored until the page itself shows it. | `deep_scan` |
 | `DEEP_SCAN_MAX_MB` | 5 | Byte budget per render for the deep scan (5 MB of JS take about 0.8 s to scan). | – |
 
 ## Turbo mode and blocking
 
 | Variable | Default | Meaning | Live key |
 | --- | --- | --- | --- |
-| `TURBO_INTERVAL` | 2 | Seconds between full renders in a turbo session (minimum 1). A render takes about 1 s on top. | `turbo_interval` |
+| `TURBO_INTERVAL` | 2 | Seconds from the start of one turbo cycle to the start of the next (minimum 1); a cycle that takes longer starts the next one at once. | `turbo_interval` |
 | `TURBO_DEFAULT_MINUTES` / `TURBO_MAX_MINUTES` | 30 / 180 | Session length without an explicit duration, and the cap for any requested duration. | `turbo_default_minutes`, `turbo_max_minutes` |
 | `TURBO_STOP_AFTER` | 1 | Confirmed contracts that end a session. 0 = only the timer or `/turbo stop`. | `turbo_stop_after` |
 | `TURBO_MAX_SITES` | 1 | Sites in turbo (running or scheduled) at the same time. | `turbo_max_sites` |
 | `TURBO_MAX_PAGES` | 4 | Pages rendered per cycle, the root page included. | `turbo_max_pages` |
-| `TURBO_RECHECK_INTERVAL` | 5 | Seconds between on-chain re-checks of the addresses a session watches. | `turbo_recheck_interval` |
+| `TURBO_RECHECK_INTERVAL` | 1 | Seconds between on-chain checks of a turbo site's addresses that are not a token yet (the pending watch). Elsewhere an address the page names as the CA is checked every second for 15 min, then every 5 s up to an hour, then every 30 s; any other address every 30 s. | `turbo_recheck_interval` |
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot. The pause doubles per blocked round up to this value and honours `Retry-After`. | `block_max_backoff` |
 
 ## Unverified mode
@@ -66,37 +73,43 @@ needs a restart.
 | --- | --- | --- |
 | `BROWSER_CHANNEL` | chromium | `chromium` (bundled, `playwright install chromium` once) or an installed `chrome` / `msedge`. |
 | `HEADLESS` | true | Set to false to watch the browser. |
-| `BLOCKED_RESOURCE_TYPES` | image,media,font | Resource types the browser never downloads. |
+| `BLOCKED_RESOURCE_TYPES` | image,media,font | Resource types the browser never downloads. Next.js prefetches (`Next-Router-Prefetch`, `Next-Router-Segment-Prefetch`, `(Sec-)Purpose: prefetch`, and `_rsc=` fetches of other pages, which links with `prefetch={true}` send without a header; the page's own `_rsc=` fetches pass) and analytics beacons (Google Analytics and Tag Manager, Vercel Insights, Cloudflare Web Analytics, Segment, Mixpanel, Hotjar, Clarity, PostHog, Sentry) are always dropped; Vercel's checkpoint (`/.well-known/vercel/`) always passes. |
+| `BROWSER_ARGS` | `--disable-3d-apis --disable-webgl --disable-webgl2` | Extra Chromium switches, split like a shell does (`'--x=a,b'` stays whole). The default turns 3D off: without a GPU, WebGL is drawn by the CPU. An empty value passes none. |
 
 ## Blockchain RPC
 
 | Variable | Default | Meaning | Live key |
 | --- | --- | --- | --- |
 | `ETH_RPC_URL`, `BASE_RPC_URL`, `ARB_RPC_URL`, `OPT_RPC_URL`, `BSC_RPC_URL`, `FANTOM_RPC_URL`, `SONIC_RPC_URL`, `AVAX_RPC_URL` | public nodes | EVM endpoints checked in parallel for every `0x` address. An empty value skips that network; at least one must remain. | – |
-| `SOLANA_RPC_URL` | api.mainnet-beta.solana.com | `getAccountInfo` for base58 addresses: programs and SPL / Token-2022 mints count. | – |
+| `SOLANA_RPC_URL` | solana-rpc.publicnode.com | `getAccountInfo` (at `confirmed` commitment) for base58 addresses: SPL / Token-2022 mints count; programs, wallets and NFTs (decimals 0, supply 1) do not. | – |
 | `SUI_RPC_URL` | sui-rpc.publicnode.com | Coin metadata for `0x…::module::NAME` coin types; a bare 64-hex id must be a package that defines a coin. | – |
-| `REQUIRE_ERC20` | true | An EVM contract counts only if it answers `totalSupply`, `symbol` or `decimals`. Off = any bytecode counts (routers, multisigs, proxies too). Turning it off asks for `confirm`. | `require_erc20` |
-| `RPC_TIMEOUT` | 5 | Per JSON-RPC call. Every public node answered in 0.05–0.3 s when measured. | – |
-| `MAX_CONCURRENT_RPC` | 8 | Address checks in flight at once (each check is 8–11 requests). | – |
+| `REQUIRE_ERC20` | true | An EVM contract counts only if it answers `totalSupply` and `decimals` and is neither an LP pair or pool (its non-quote token is checked instead) nor an ERC-4626 vault. Off = any bytecode counts (routers, multisigs, proxies too). EIP-7702 wallets never count. Turning it off asks for `confirm`. | `require_erc20` |
+| `RPC_TIMEOUT` | 5 | Per JSON-RPC call, retries included: HTTP 429 (honouring `Retry-After`), 500/502/503/504, refused or reset connections, HTTP/2 protocol errors and rate-limit errors are retried after 0.25 s and 1 s; a timeout is not. Every public node answered in 0.05–0.3 s when measured. | – |
+| `MAX_CONCURRENT_RPC` | 8 | Address checks in flight at once (each is one `eth_getCode` per network plus, where code exists, one batch: the bytecode again and five `eth_call` probes). | – |
+| `HTTP2` | true | RPC and Telegram over HTTP/2, so the parallel calls of a check share one warm connection. Sub-page probes always use HTTP/1.1. `false` = HTTP/1.1 everywhere. | – |
 | `REJECTED_TTL_HOURS` | 6 | How long an address that had no contract stays rejected before it is checked again. 0 = never (asks for `confirm`). | `rejected_ttl_hours` |
-| `RPC_RETRY_DELAY` | 600 | Seconds before an address whose check failed on some endpoint is retried. | – |
+| `RPC_RETRY_DELAY` | 10 | Seconds before an address whose check failed on some endpoint is checked again. An endpoint that stays silent for 5 minutes is reported with one 🛑. | – |
 
 ## Misc
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DATA_DIR` | data | Where state, snapshots, caches and the heartbeat live. |
-| `LOG_LEVEL` | INFO | Python logging level. |
+| `DATA_DIR` | data | Where state, snapshots, caches and the heartbeat live. With another directory start the supervisor with `--heartbeat <DATA_DIR>/heartbeat`. |
+| `LOG_LEVEL` | INFO | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
 | `LOG_FILE` | empty | Optional rotating log file (5 MB, 3 backups). Empty = console only. |
 | `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes; `rebooter.py` restarts the bot after 300 s without one. |
 
 ## Validation at start
 
 Wrong values stop the bot with exit code 2 and a message naming the variable:
-non-numeric numbers, values below their minimum, booleans that are not one of
+non-numeric or non-finite (`nan`, `inf`) numbers, values below their minimum, an unknown
+`LOG_LEVEL`, booleans that are not one of
 `1/true/yes/on/0/false/no/off`, `POLL_INTERVAL_MAX` below `POLL_INTERVAL_MIN`, no EVM
-endpoint left, a chat id list that is not integers. Lists tolerate brackets, quotes,
-semicolons and spaces.
+endpoint left, a chat id list that is not integers, a `BROWSER_ARGS` value with unbalanced
+quotes. Lists tolerate brackets, quotes,
+semicolons and spaces. An empty `SOLANA_RPC_URL`, `SUI_RPC_URL`, `DATA_DIR` or `LOG_LEVEL`
+means the default (only an empty EVM URL skips its network); in `BROWSER_ARGS` on Windows a
+backslash is part of a path, not an escape.
 
 ## Changing settings from Telegram
 
@@ -105,6 +118,7 @@ from `.env`), `/settings <key>` explains one knob with its range and default, `/
 <value>` changes it at once, `/settings reset <key|all>` goes back to `.env`. Values are
 type- and range-checked, related pairs stay consistent (`poll_interval_min` never above
 `poll_interval_max`, `turbo_default_minutes` never above `turbo_max_minutes`), and risky
-values (polling below 3 s, `require_erc20 off`, `deep_scan off`, a rejected TTL of 0,
+values (polling below 3 s, `require_erc20 off`, `deep_scan on`, a rejected TTL of 0,
+`flap_window_hours 0`,
 `turbo_interval` below 2 s, more than one turbo site, more than 8 turbo pages, a block
 backoff below 60 s) must be repeated with `confirm`.

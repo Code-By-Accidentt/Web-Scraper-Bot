@@ -158,7 +158,9 @@ class SnapshotStore:
                 str(key): NoiseEntry(int(count), float(last_seen))
                 for key, (count, last_seen) in raw_noise.items()
             }
-            return Snapshot(signature, noise)
+            raw_deep = data.get("deep_seen")
+            deep_seen = frozenset(str(v) for v in raw_deep) if isinstance(raw_deep, list) else None
+            return Snapshot(signature, noise, deep_seen)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("snapshot %s is unreadable (%s); it will be rebuilt", path.name, exc)
             return None
@@ -171,6 +173,8 @@ class SnapshotStore:
             "nodes": [[node.tag, list(node.attrs), node.text] for node in snapshot.signature],
             "noise": {key: [entry.count, entry.last_seen] for key, entry in snapshot.noise.items()},
         }
+        if snapshot.deep_seen is not None:
+            payload["deep_seen"] = sorted(snapshot.deep_seen)
         atomic_write_text(self.path_for(url), json.dumps(payload, ensure_ascii=False))
 
     def delete(self, url: str) -> None:

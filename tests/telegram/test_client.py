@@ -4,7 +4,7 @@ import re
 import httpx
 import pytest
 
-from scraper_bot.telegram.client import TelegramClient
+from scraper_bot.telegram.client import SentMessage, TelegramClient
 
 
 def make_client(handler):
@@ -48,6 +48,20 @@ async def test_rate_limit_is_retried_once() -> None:
     async with http:
         assert await client.send_message(1, "hi") is True
     assert calls == 2
+
+
+async def test_a_long_flood_wait_is_not_waited_out() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 600}})
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.send_message(1, "hi") is False  # at once, not after 10 minutes
+    assert calls == 1
 
 
 async def test_api_and_transport_errors_return_false() -> None:
@@ -254,3 +268,85 @@ async def test_broadcast_and_broadcast_document_reach_every_chat() -> None:
     chat_ids = {re.search(rb'name="chat_id"\r\n\r\n(\d+)\r\n', body)[1] for body in documents}
     assert chat_ids == {b"4", b"5"}
     assert all(b'filename="c.txt"' in body and b"0xabc" in body for body in documents)
+
+
+# ── tracked messages and edits ──────────────────────────────────────────────
+async def test_rate_limited_sends_get_three_attempts() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 0}})
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.send_message(1, "hi") is False
+    assert calls == 3
+
+
+async def test_a_tracked_message_can_be_edited_in_its_own_markup() -> None:
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        seen.append((method, form(request)))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 42}})
+
+    client, http = make_client(handler)
+    async with http:
+        sent = await client.send_tracked(7, "<b>hi</b>")
+        assert sent is not None and (sent.chat_id, sent.message_id, sent.plain) == (7, 42, False)
+        assert await client.edit_message_text(sent, "<b>hi</b> there")
+    method, edit = seen[-1]
+    assert method == "editMessageText"
+    assert (edit["chat_id"], edit["message_id"], edit["parse_mode"]) == ("7", "42", "HTML")
+    assert edit["text"] == "<b>hi</b> there"
+
+
+async def test_a_message_sent_as_plain_text_is_edited_as_plain_text() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        data = form(request)
+        seen.append(data)
+        if request.url.path.endswith("/sendMessage") and "parse_mode" in data:
+            return httpx.Response(400, json={"ok": False, "description": "can't parse entities"})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 5}})
+
+    client, http = make_client(handler)
+    async with http:
+        sent = await client.send_tracked(1, "<code>broken")
+        assert sent is not None and sent.plain
+        assert await client.edit_message_text(sent, "<code>0xabc</code> + details")
+    assert "parse_mode" not in seen[-1] and seen[-1]["text"] == "0xabc + details"
+
+
+async def test_edits_are_never_retried_and_an_unchanged_text_is_fine() -> None:
+    calls: list[str] = []
+    answers = iter(
+        [
+            httpx.Response(400, json={"ok": False, "description": "message is not modified"}),
+            httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 0}}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return next(answers)
+
+    client, http = make_client(handler)
+    async with http:
+        message = SentMessage(1, 9)
+        assert await client.edit_message_text(message, "same") is True
+        assert await client.edit_message_text(message, "new") is False
+    assert len(calls) == 2  # the rate-limited edit was not repeated
+
+
+async def test_a_message_too_long_to_edit_is_sent_but_not_tracked() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    client, http = make_client(handler)
+    async with http:
+        assert await client.send_tracked(1, "line\n" * 2000) is None
