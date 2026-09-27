@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
+from scraper_bot.chains.networks import EVM_CHAINS
 from scraper_bot.chains.rpc import NO_RETRY
 from scraper_bot.chains.solana import TOKEN_PROGRAM
 from scraper_bot.models import (
@@ -30,14 +31,9 @@ EVM = Address(Chain.ETHEREUM, "0x" + "4d" * 20)
 OTHER = Address(Chain.ETHEREUM, "0x" + "5e" * 20)
 MINT = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
 ENV = {
+    **{chain.env_var: "" for chain in EVM_CHAINS},  # every network off but the two below
     "ETH_RPC_URL": "https://eth.rpc",
     "BASE_RPC_URL": "https://base.rpc",
-    "ARB_RPC_URL": "",
-    "OPT_RPC_URL": "",
-    "BSC_RPC_URL": "",
-    "FANTOM_RPC_URL": "",
-    "SONIC_RPC_URL": "",
-    "AVAX_RPC_URL": "",
     "SOLANA_RPC_URL": "https://sol.rpc",
 }
 
@@ -47,6 +43,8 @@ class Chains:
 
     def __init__(self) -> None:
         self.code: dict[str, str] = {}  # lower-case EVM address -> bytecode (both networks)
+        self.host_code: dict[tuple[str, str], str] = {}  # (host, address): one network only
+        self.methods: list[tuple[str, str]] = []  # (host, method) of every call
         self.nonce: dict[tuple[str, str], int] = {}  # (host, address) -> transactions sent
         self.accounts: dict[str, dict[str, Any] | None] = {}
         self.down: set[str] = set()
@@ -67,8 +65,10 @@ class Chains:
 
     def answer(self, host: str, item: dict[str, Any]) -> Any:
         method, params = item["method"], item["params"]
+        self.methods.append((host, method))
         if method == "eth_getCode":
-            return self.code.get(params[0].lower(), "0x")
+            found = self.host_code.get((host, params[0].lower()))
+            return found or self.code.get(params[0].lower(), "0x")
         if method == "eth_getTransactionCount":
             return hex(self.nonce.get((host, params[0].lower()), 0))
         if method == "getMultipleAccounts":
@@ -90,10 +90,10 @@ class Harness:
         self.path = tmp_path / "pending.json"
         self.watch = self.build(paused=paused)
 
-    def build(self, *, paused: bool = False) -> PendingWatch:
+    def build(self, *, paused: bool = False, **env: str) -> PendingWatch:
         return PendingWatch(
             self.http,
-            make_settings(self.path.parent, **ENV),
+            make_settings(self.path.parent, **{**ENV, **env}),
             validator=self.validator,  # type: ignore[arg-type]
             registry=self.registry,
             notifier=self.notifier,  # type: ignore[arg-type]
@@ -305,6 +305,34 @@ async def test_a_failing_network_neither_classifies_nor_drops(h) -> None:
     h.chains.down.clear()
     await h.tick(1)
     assert entry.classified
+
+
+async def test_a_failing_optional_network_still_classifies(h) -> None:
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")  # Arc: an optional network
+    h.chains.down.add("arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)
+    entry = h.watch._entries[EVM]
+    assert entry.classified and set(entry.absent_on) == {"Ethereum", "Base"}
+    await h.tick(1)
+    nonces = [host for host, method in h.chains.methods if method == "eth_getTransactionCount"]
+    assert sorted(nonces) == ["base.rpc", "eth.rpc"]  # asked once, not on every tick
+
+
+async def test_a_token_on_an_optional_network_is_announced_once_it_answers(h) -> None:
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")
+    h.chains.down.add("arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)
+    h.chains.down.clear()
+    h.chains.host_code[("arc.rpc", EVM.value.lower())] = "0x6080"  # it was there all along
+    h.validator.confirm(EVM, "Arc")
+    await h.tick(1)
+    assert h.notifier.contracts == [(ConfirmedContract(EVM, "Arc"), PAGE)]
+    assert h.validator.options == [(("Arc",), True)]
+    [(_, timeline)] = h.notifier.contract_details
+    # Nobody saw Arc empty, so nothing is said about when it was deployed.
+    assert timeline is not None and not timeline.deployed and timeline.missing_at is None
 
 
 async def test_entries_survive_a_restart_and_a_broken_file_is_ignored(h) -> None:
@@ -569,3 +597,225 @@ async def test_files_of_earlier_builds_load(h) -> None:
     entry = h.watch._entries[EVM]
     assert entry.sites == {SITE: PAGE}
     assert not entry.baseline  # no per-network absence recorded: not taken for old news
+
+
+async def test_a_hanging_optional_network_costs_a_tick_only_the_grace(
+    h, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pending_module, "OPTIONAL_GRACE", 0.05)
+    hang = asyncio.Event()
+    original = h.chains.handler
+    arc_requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "arc.rpc":
+            arc_requests.append("batch")
+            await hang.wait()
+        return original(request)
+
+    h.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    h.watch.offer(SITE, PAGE, text(MINT), rejected(MINT, AddressKind.MISSING))
+    h.chains.accounts[MINT.value] = {"owner": TOKEN_PROGRAM, "data": ["", "base64"]}
+    h.validator.confirm(MINT, "Solana")
+    started = asyncio.get_running_loop().time()
+    await asyncio.wait_for(h.tick(0), timeout=2)
+    assert asyncio.get_running_loop().time() - started < 1  # not the 5 s RPC timeout
+    assert h.notifier.contracts == [(ConfirmedContract(MINT, "Solana"), PAGE)]
+    entry = h.watch._entries[EVM]
+    assert entry.classified and "Arc" not in entry.absent_on  # Arc said nothing yet
+    await asyncio.wait_for(h.tick(1), timeout=2)  # Arc still hangs: it is not asked twice
+    assert arc_requests == ["batch"]
+    hang.set()
+    await asyncio.sleep(0.05)
+    await h.http.aclose()
+
+
+async def test_existence_checks_feed_the_endpoint_health(h) -> None:
+    recorded: list[tuple[str, bool]] = []
+    h.watch._health = lambda name, error: recorded.append((name, error is None))
+    h.chains.down.add("base.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    h.watch.offer(SITE, PAGE, text(MINT), rejected(MINT, AddressKind.MISSING))
+    await h.tick(0)
+    await asyncio.sleep(0)
+    assert sorted(recorded) == [("Base", False), ("Ethereum", True), ("Solana", True)]
+
+
+async def test_an_error_in_a_tick_is_reported_and_the_watch_goes_on(h) -> None:
+    ticks = 0
+
+    async def sleep(_seconds: float) -> None:
+        nonlocal ticks
+        ticks += 1
+        if ticks > 3:
+            raise asyncio.CancelledError
+
+    async def broken(_chain: object = None) -> None:
+        raise KeyError("odd entry")
+
+    h.watch._sleep = sleep
+    h.watch.check_due = broken  # type: ignore[method-assign]
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    with pytest.raises(asyncio.CancelledError):
+        await h.watch.run()
+    # Every tick of each loop tried again (the real notifier rate-limits the reports).
+    assert len(h.notifier.problems) >= 3
+    assert h.notifier.problems[0][0] == "pending" and "KeyError" in h.notifier.problems[0][2]
+
+
+async def test_the_memory_of_dropped_addresses_is_bounded(
+    h, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scraper_bot.monitoring.pending as pending_module
+
+    monkeypatch.setattr(pending_module, "DROPPED_LIMIT", 2)
+    wallets = [Address(Chain.ETHEREUM, f"0x{i:040x}") for i in range(1, 4)]
+    for wallet in wallets:
+        assert h.watch.offer(SITE, PAGE, text(wallet), rejected(wallet, AddressKind.NO_CODE))
+        h.watch._drop(h.watch._entries[wallet], h.now)
+    assert list(h.watch._dropped) == wallets[1:]  # the first one dropped went first
+    newest = wallets[2]
+    assert not h.watch.offer(SITE, PAGE, text(newest), rejected(newest, AddressKind.NO_CODE))
+    oldest = wallets[0]
+    assert h.watch.offer(SITE, PAGE, text(oldest), rejected(oldest, AddressKind.NO_CODE))
+
+
+async def test_code_an_optional_network_reports_after_its_tick_is_confirmed_next_tick(
+    h, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pending_module, "OPTIONAL_GRACE", 0.02)
+    original = h.chains.handler
+    slow = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "arc.rpc":
+            await slow.wait()  # Arc answers, but only after the tick has moved on
+        return original(request)
+
+    h.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)
+    h.chains.host_code[("arc.rpc", EVM.value.lower())] = "0x6080"
+    slow.set()
+    await asyncio.sleep(0.05)  # the late batch comes back with code on Arc
+    assert h.watch._entries[EVM].late == {"Arc"}
+    h.validator.confirm(EVM, "Arc")
+    await h.tick(1)
+    assert h.notifier.contracts == [(ConfirmedContract(EVM, "Arc"), PAGE)]
+    assert h.validator.options == [(("Arc",), True)]
+    await h.http.aclose()
+
+
+async def test_a_token_the_validators_found_late_is_confirmed_at_the_next_tick(h) -> None:
+    h.watch.offer(SITE, PAGE, text(EVM, hinted=False), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)  # a slow entry: its next look is 30 s away
+    h.validator.confirm(EVM, "Arc")
+    h.watch.hurry(EVM, "Arc")
+    await h.tick(1)
+    assert h.notifier.contracts == [(ConfirmedContract(EVM, "Arc"), PAGE)]
+    h.watch.hurry(OTHER, "Arc")  # not watched: nothing happens
+
+
+async def test_a_network_switched_back_on_starts_without_old_absences(h) -> None:
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)
+    assert "Arc" in h.watch._entries[EVM].absent_on
+    h.watch.save()
+    again = h.build(ARC_RPC_URL="https://arc.rpc")
+    again._new_networks = frozenset({"Arc"})  # Arc was switched off and on again
+    again._stale_absences = frozenset({"Arc"})
+    again.load()
+    entry = again._entries[EVM]
+    assert entry.baseline and "Arc" not in entry.absent_on and "Base" in entry.absent_on
+
+
+async def test_the_first_start_after_the_update_keeps_the_absences_2_1_saw(h) -> None:
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    await h.tick(0)
+    h.watch.save()
+    again = h.build()
+    again._new_networks = frozenset({"Ethereum", "Base"})  # no networks file: all "new"
+    again.load()
+    entry = again._entries[EVM]
+    assert entry.baseline and set(entry.absent_on) == {"Ethereum", "Base"}
+
+
+async def test_a_late_empty_answer_counts_as_seen_absent(
+    h, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pending_module, "OPTIONAL_GRACE", 0.02)
+    original = h.chains.handler
+    slow = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "arc.rpc":
+            await slow.wait()  # Arc always answers after the tick moved on
+        return original(request)
+
+    h.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    sent_at = h.now
+    await h.tick(0)
+    slow.set()
+    await asyncio.sleep(0.05)
+    entry = h.watch._entries[EVM]
+    assert entry.absent_on["Arc"] == sent_at  # the late "nothing here" counts
+    await h.http.aclose()
+
+
+async def test_a_hurry_during_the_entry_s_own_check_is_not_undone(h) -> None:
+    h.watch.offer(SITE, PAGE, text(EVM, hinted=False), rejected(EVM, AddressKind.NO_CODE))
+    entry = h.watch._entries[EVM]
+    entry.late.add("Arc")  # code reported while its look was running
+    h.watch._reschedule(entry, h.now)
+    assert entry.next_check == h.now  # confirmed at the next tick, not in 30 s
+
+
+async def test_hanging_evm_confirmations_do_not_hold_back_a_solana_mint(h) -> None:
+    release = asyncio.Event()
+    validate_many = h.validator.validate_many
+
+    async def slow_evm(addresses, **options):
+        addresses = list(addresses)
+        if addresses and addresses[0].chain is Chain.ETHEREUM:
+            await release.wait()
+        return await validate_many(addresses, **options)
+
+    h.validator.validate_many = slow_evm  # type: ignore[method-assign]
+    wallets = [Address(Chain.ETHEREUM, f"0x{i:040x}") for i in range(1, 6)]
+    for wallet in wallets:
+        h.watch.offer(SITE, PAGE, text(wallet), rejected(wallet, AddressKind.NO_CODE))
+        h.chains.code[wallet.value.lower()] = "0x6080"  # all "deployed": confirmations hang
+    h.watch.offer(SITE, PAGE, text(MINT), rejected(MINT, AddressKind.MISSING))
+    h.chains.accounts[MINT.value] = {"owner": TOKEN_PROGRAM, "data": ["", "base64"]}
+    h.validator.confirm(MINT, "Solana")
+    evm = asyncio.create_task(h.watch.check_due(Chain.ETHEREUM))
+    await asyncio.sleep(0.02)
+    await asyncio.wait_for(h.watch.check_due(Chain.SOLANA), timeout=1)
+    assert h.notifier.contracts == [(ConfirmedContract(MINT, "Solana"), PAGE)]
+    release.set()
+    await evm
+
+
+async def test_the_watch_runs_one_loop_per_chain_family(h) -> None:
+    ticks: list[object] = []
+
+    async def check_due(chain: object = None) -> None:
+        ticks.append(chain)
+
+    async def sleep(_seconds: float) -> None:
+        if len(ticks) >= 4:
+            raise asyncio.CancelledError
+        await asyncio.sleep(0)
+
+    h.watch._sleep = sleep
+    h.watch.check_due = check_due  # type: ignore[method-assign]
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    with pytest.raises(asyncio.CancelledError):
+        await h.watch.run()
+    assert set(ticks) == {Chain.ETHEREUM, Chain.SOLANA}

@@ -82,3 +82,19 @@ def test_comment_only_or_unparsable_document_gives_empty_signature() -> None:
     assert sig("<!DOCTYPE html>") == ()
     assert sig("<html></html>") == ()
     assert sig("﻿") == ()  # a lone byte-order mark is invisible text
+
+
+def test_a_malformed_link_is_compared_as_written() -> None:
+    signature = HtmlNormalizer().signature(
+        '<a href="https://[YOUR_RPC_HOST]/v1?api-key=x">docs</a>'
+        '<img src="http://[object Object]?v=1"><p>CA below</p>'
+    )
+    attrs = [dict(n.attrs) for n in signature]
+    assert {"href": "https://[YOUR_RPC_HOST]/v1?api-key=x"} in attrs
+    assert {"src": "http://[object Object]?v=1"} in attrs
+
+
+def test_content_after_a_huge_text_node_is_kept() -> None:
+    bundle = "x" * (11 * 1024 * 1024)  # over libxml2's 10 MB limit for one text node
+    signature = HtmlNormalizer().signature(f"<div>{bundle}</div><p>CA: after the bundle</p>")
+    assert signature[-1].text == "CA: after the bundle"

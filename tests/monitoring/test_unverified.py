@@ -3,9 +3,16 @@ from pathlib import Path
 import pytest
 
 import scraper_bot.monitoring.unverified as unverified_module
-from scraper_bot.models import Address, Chain, ConfirmedContract, SiteState
+from scraper_bot.models import (
+    Address,
+    Chain,
+    ConfirmedContract,
+    SiteState,
+    address_key,
+    parse_address_key,
+)
 from scraper_bot.monitoring.alerts import AlertRegistry
-from scraper_bot.monitoring.unverified import UnverifiedWatcher, address_key, parse_key
+from scraper_bot.monitoring.unverified import UnverifiedWatcher
 from scraper_bot.storage import AddressCache, StateStore
 from tests.conftest import FakeNotifier, FakeTuning, FakeValidator
 
@@ -46,9 +53,9 @@ class Harness:
 
 
 def test_address_keys_round_trip() -> None:
-    assert parse_key(address_key(A)) == A
-    assert parse_key(address_key(S)) == S
-    assert parse_key("Nope:0x1") is None and parse_key("Ethereum:") is None
+    assert parse_address_key(address_key(A)) == A
+    assert parse_address_key(address_key(S)) == S
+    assert parse_address_key("Nope:0x1") is None and parse_address_key("Ethereum:") is None
 
 
 async def test_new_addresses_are_announced_once_and_persisted(tmp_path: Path) -> None:
@@ -100,7 +107,7 @@ async def test_a_token_already_announced_elsewhere_gets_no_confirmation(tmp_path
     h = Harness(tmp_path)
     h.validator.confirm(A, "Base")  # the same fresh verdict the pending watch got
     await h.watcher.observe([A], PAGE)
-    assert h.registry.claim(A)  # the pending watch sent its alert first
+    assert h.registry.claim(ConfirmedContract(A, "Base"))  # the pending watch was first
     await h.watcher.recheck()
     assert h.notifier.confirmed == [] and h.site.unverified == {}
 

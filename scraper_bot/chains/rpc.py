@@ -90,10 +90,6 @@ class JsonRpcClient:
         self._single_until = 0.0  # a node that refused a batch gets single calls till then
 
     @property
-    def host(self) -> str:
-        return self._host
-
-    @property
     def batches(self) -> bool:
         """False while the node is sent single calls (it refused a batch lately)."""
         return self._clock() >= self._single_until
@@ -229,13 +225,13 @@ class JsonRpcClient:
             raise self._transport_error(method, exc) from exc
         except httpx.TransportError as exc:  # refused, reset, HTTP/2 protocol error
             raise _Retryable(self._transport_error(method, exc)) from exc
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise self._transport_error(method, exc) from exc
         except RuntimeError as exc:  # the client was closed during shutdown
             raise RpcError(f"{method} via {self._host}: {exc}") from exc
         status = response.status_code
         if status in _RETRY_STATUSES:
-            retry_after = _parse_retry_after(response.headers.get("retry-after"))
+            retry_after = parse_retry_after(response.headers.get("retry-after"))
             if status == 429 and self._retry.cooldown_cap > 0:
                 pause = min(retry_after or 1.0, self._retry.cooldown_cap)
                 until = self._clock() + pause
@@ -249,6 +245,13 @@ class JsonRpcClient:
             data = response.json()
         except ValueError as exc:
             raise RpcError(f"{method} via {self._host}: invalid JSON") from exc
+        if isinstance(payload, list) and isinstance(data, dict):
+            # One error object for a whole batch: a rate limit by its code, else a node that
+            # refuses batches (or batches this big), which then gets single calls.
+            error = data.get("error")
+            if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
+                raise _Retryable(RpcError(f"{method} via {self._host}: rate limited"))
+            raise _BatchRefused(f"{method} via {self._host}: {_error_text(error)}")
         if _is_rate_limited(data):
             raise _Retryable(RpcError(f"{method} via {self._host}: rate limited"))
         return data
@@ -294,13 +297,21 @@ def _is_rate_limited(data: Any) -> bool:
 def _is_rate_limit(error: Any) -> bool:
     if not isinstance(error, dict):
         return False
+    message = str(error.get("message", "")).lower()
+    if error.get("code") == 3 or "revert" in message:
+        return False  # the contract's own error ("Max wallet limit exceeded"), not the node's
     if error.get("code") in _RATE_LIMIT_CODES:
         return True
-    message = str(error.get("message", "")).lower()
     return any(phrase in message for phrase in _RATE_LIMIT_PHRASES)
 
 
-def _parse_retry_after(value: str | None) -> float | None:
+def _error_text(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:200]
+    return "the answer was not a list"[:200]
+
+
+def parse_retry_after(value: str | None) -> float | None:
     """Seconds from a ``Retry-After`` header; HTTP-date forms are ignored."""
     if value is None:
         return None

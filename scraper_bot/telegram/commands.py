@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -32,7 +33,8 @@ from scraper_bot.pages.urls import InvalidUrlError
 from scraper_bot.preferences import ConfirmationRequired, PreferenceError, Preferences
 from scraper_bot.telegram.client import TelegramClient
 from scraper_bot.telegram.markup import code, escape
-from scraper_bot.telegram.timefmt import format_clock, format_duration
+from scraper_bot.telegram.settings_view import describe_setting, settings_overview
+from scraper_bot.telegram.timefmt import format_clock, format_duration, format_schedule
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +80,7 @@ _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
 # An unauthorised chat learns its chat id from /start at most this often (seconds).
 _STRANGER_REPLY_INTERVAL = 600.0
+_PROFILE_RETRY = 60.0  # seconds between getMe calls while the bot's own name is unknown
 _STRANGER_MEMORY = 1000
 
 
@@ -136,16 +139,21 @@ class ParsedCommand:
     argument: str
 
 
-def parse_command(text: str) -> ParsedCommand | None:
-    """``"/add@MyBot https://x.io"`` -> ``ParsedCommand("add", "https://x.io")``."""
-    stripped = text.strip()
-    if not stripped.startswith("/"):
+def parse_command(text: str, bot_username: str | None = None) -> ParsedCommand | None:
+    """``"/add@MyBot https://x.io"`` -> ``ParsedCommand("add", "https://x.io")``.
+
+    A command addressed to another bot (``/pause@OtherBot`` in a shared group) is not
+    ours: ``None``, once ``bot_username`` (our own) is known.
+    """
+    parts = text.strip().split(None, 1)
+    if not parts or not parts[0].startswith("/"):
         return None
-    head, _, rest = stripped[1:].partition(" ")
-    name = head.split("@", 1)[0].lower()
+    name, _, mention = parts[0][1:].partition("@")
+    if mention and bot_username and mention.lower() != bot_username.lower():
+        return None
     if not name:
         return None
-    return ParsedCommand(name, rest.strip())
+    return ParsedCommand(name.lower(), parts[1].strip() if len(parts) > 1 else "")
 
 
 class BotCommands:
@@ -175,6 +183,7 @@ class BotCommands:
         self._preferences = preferences
         self._clock = clock
         self._stranger_replies: dict[int, float] = {}
+        self._warned_chats: set[int] = set()  # told that TELEGRAM_CHAT_IDS is empty
         self._handlers: dict[str, Handler] = {
             "start": self._start,
             "help": self._help,
@@ -189,9 +198,9 @@ class BotCommands:
             "resume": self._resume,
             "list": self._list,
             "notify": self._notify,
-            "unmute": self._notify,
+            "unmute": lambda chat_id, argument: self._notify(chat_id, argument, "unmute"),
             "nonotifi": self._nonotifi,
-            "mute": self._nonotifi,
+            "mute": lambda chat_id, argument: self._nonotifi(chat_id, argument, "mute"),
         }
 
     async def handle_update(self, update: dict[str, Any]) -> None:
@@ -202,14 +211,20 @@ class BotCommands:
         text = message.get("text")
         if not isinstance(chat_id, int) or not isinstance(text, str):
             return
-        command = parse_command(text)
+        command = parse_command(text, self._telegram.username)
         if command is None:
             return
         if chat_id not in self._commanders:
             await self._answer_stranger(chat_id, command.name)
             return
         reply = await self.execute(chat_id, command)
-        if not self._alerts_configured and command.name in {"add", "list", "resume"}:
+        if (
+            not self._alerts_configured
+            and command.name in {"add", "list", "resume"}
+            and chat_id not in self._warned_chats
+        ):
+            # Once per chat and start: the reminder must not bury every reply.
+            self._warned_chats.add(chat_id)
             reply += (
                 f"\n\n⚠️ TELEGRAM_CHAT_IDS is empty, so alerts are dropped. "
                 f"Put your chat id {code(chat_id)} into .env and restart the bot."
@@ -231,7 +246,7 @@ class BotCommands:
         except (PreferenceError, InvalidUrlError) as exc:
             return f"❌ {escape(exc)}"
         except Exception as exc:
-            log.exception("command /%s %s failed", command.name, command.argument)
+            log.exception("command /%s %r failed", command.name, command.argument)
             detail = f"{type(exc).__name__}: {exc}"[:300]
             return (
                 f"⚠️ Internal error while running {code('/' + command.name)}: {code(detail)}\n"
@@ -241,7 +256,7 @@ class BotCommands:
     async def _answer_stranger(self, chat_id: int, name: str) -> None:
         """An unauthorised chat gets its chat id for /start (rate limited), nothing else."""
         if name != "start":
-            log.warning("ignoring /%s from unauthorised chat %s", name, chat_id)
+            log.warning("ignoring %r from unauthorised chat %s", "/" + name, chat_id)
             return
         now = self._clock()
         last = self._stranger_replies.get(chat_id)
@@ -297,9 +312,9 @@ class BotCommands:
             return f"❌ {escape(exc)}\n{TURBO_USAGE}"
         started = await self._turbo.start(request.url, request.minutes, request.start_at)
         if isinstance(started, ScheduledTurbo):
-            when = format_clock(started.start_at)
             return (
-                f"⏰ Turbo for {escape(started.url)} scheduled at {when} for "
+                f"⏰ Turbo for {escape(started.url)} scheduled at "
+                f"{format_schedule(started.start_at, time.time())} for "
                 f"{started.minutes:.0f} min. Cancel with {code(f'/turbo stop {started.url}')}"
             )
         limits = self._turbo.limits
@@ -314,21 +329,20 @@ class BotCommands:
             return "Settings are not available."
         tokens = argument.split()
         if not tokens:
-            return self._preferences.overview()
+            return settings_overview(self._preferences)
         if tokens[0].lower() == "reset":
             target = tokens[1] if len(tokens) > 1 else "all"
             changes = self._preferences.reset(None if target.lower() == "all" else target)
             if not changes:
                 return "Nothing to reset: every setting already has its .env value."
-            prefs = self._preferences
             lines = ["♻️ Restored .env values:"]
             lines.extend(
-                f"• {code(c.spec.key)}: {escape(prefs.format_value(c.spec, c.old))} → "
-                f"{escape(prefs.format_value(c.spec, c.new))}"
+                f"• {code(c.spec.key)}: {escape(c.spec.format(c.old))} → "
+                f"{escape(c.spec.format(c.new))}"
                 for c in changes
             )
             return "\n".join(lines)
-        return self._preferences.describe(tokens[0])
+        return describe_setting(self._preferences, tokens[0])
 
     async def _set(self, _chat_id: int, argument: str) -> str:
         if self._preferences is None:
@@ -338,10 +352,10 @@ class BotCommands:
             return SETTINGS_USAGE
         confirmed = len(tokens) > 2 and tokens[2].lower() == "confirm"
         change = self._preferences.set(tokens[0], tokens[1], confirmed=confirmed)
-        prefs = self._preferences
+        spec = change.spec
         return (
-            f"✅ {code(change.spec.key)}: {escape(prefs.format_value(change.spec, change.old))} → "
-            f"{escape(prefs.format_value(change.spec, change.new))} (applies immediately)"
+            f"✅ {code(spec.key)}: {escape(spec.format(change.old))} → "
+            f"{escape(spec.format(change.new))} (applies immediately)"
         )
 
     def _describe_confirmation(self, exc: ConfirmationRequired) -> str:
@@ -390,8 +404,9 @@ class BotCommands:
                 f"stop with {code(f'/turbo stop {session.url}')}"
             )
         for plan in self._turbo.scheduled():
+            when = format_schedule(plan.start_at, time.time())
             lines.append(
-                f"⏰ {escape(plan.url)}: starts at {format_clock(plan.start_at)} for "
+                f"⏰ {escape(plan.url)}: starts at {when} for "
                 f"{plan.minutes:.0f} min; "
                 f"cancel with {code(f'/turbo stop {plan.url}')}"
             )
@@ -403,12 +418,26 @@ class BotCommands:
         if not argument:
             return usage("/add <url>")
         site = await self._manager.add_site(argument)
-        return f"✅ {escape(site.url)} added to monitoring."
+        reply = f"✅ {escape(site.url)} added to monitoring."
+        shared = self._manager.sharing_pages(site.url)
+        if shared:
+            reply += (
+                f"\n⚠️ It shares pages with {', '.join(escape(url) for url in shared)}. "
+                "Both monitors render them and keep one snapshot of each, so a change "
+                "there is reported only by the monitor that sees it first (by none, if "
+                "that site is muted)."
+            )
+        return reply
 
     async def _remove(self, _chat_id: int, argument: str) -> str:
         if not argument:
             return usage("/remove <url>")
-        site = await self._manager.remove_site(argument)
+        url = self._manager.resolve(argument)
+        if self._turbo is not None:
+            # Its session would keep handing the site's addresses to the pending watch.
+            with contextlib.suppress(TurboError):
+                await self._turbo.stop(url)
+        site = await self._manager.remove_site(url)
         return f"✅ {escape(site.url)} removed from monitoring."
 
     async def _pause(self, _chat_id: int, argument: str) -> str:
@@ -420,18 +449,20 @@ class BotCommands:
     async def _resume(self, _chat_id: int, argument: str) -> str:
         if not argument:
             return usage("/resume <url>")
-        site = await self._manager.resume_site(argument)
+        site, restarted = await self._manager.resume_site(argument)
+        if restarted:
+            return f"▶️ {escape(site.url)} was stopped by an error; its monitor is running again."
         return f"▶️ {escape(site.url)} resumed."
 
-    async def _notify(self, _chat_id: int, argument: str) -> str:
+    async def _notify(self, _chat_id: int, argument: str, name: str = "notify") -> str:
         if not argument:
-            return usage("/notify <url>")
+            return usage(f"/{name} <url>")
         site = self._manager.set_notifications(argument, True)
         return f"🔔 Change alerts enabled for {escape(site.url)}."
 
-    async def _nonotifi(self, _chat_id: int, argument: str) -> str:
+    async def _nonotifi(self, _chat_id: int, argument: str, name: str = "nonotifi") -> str:
         if not argument:
-            return usage("/nonotifi <url>")
+            return usage(f"/{name} <url>")
         site = self._manager.set_notifications(argument, False)
         return f"🔇 Change alerts disabled for {escape(site.url)}."
 
@@ -451,7 +482,7 @@ class BotCommands:
         elif self._manager.is_running(site.url):
             state = "RUNNING"
         else:
-            state = "STOPPED"
+            state = "STOPPED"  # the monitor crashed and did not come back; /resume restarts it
         line = f"• {escape(site.url)} [alerts: {notifications}] [{state}]"
         if site.unverified_enabled:
             line += " [unverified]"
@@ -507,7 +538,14 @@ class TelegramListener:
     async def run(self) -> None:
         log.info("Telegram listener started")
         offset: int | None = None
+        profile_due = 0.0
         while True:
+            if self._telegram.username is None and time.monotonic() >= profile_due:
+                # Commands addressed to another bot are told apart by our own name; the
+                # getMe at the start may have failed.
+                profile_due = time.monotonic() + _PROFILE_RETRY
+                with contextlib.suppress(Exception):
+                    await self._telegram.get_me()
             updates = await self._telegram.get_updates(offset, self._poll_timeout)
             if updates is None:
                 await asyncio.sleep(self._error_backoff)

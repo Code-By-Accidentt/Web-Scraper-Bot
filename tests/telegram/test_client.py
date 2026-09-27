@@ -7,9 +7,13 @@ import pytest
 from scraper_bot.telegram.client import SentMessage, TelegramClient
 
 
+async def no_wait(_seconds: float) -> None:
+    return None
+
+
 def make_client(handler):
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return TelegramClient("123:secret", http), http
+    return TelegramClient("123:secret", http, sleep=no_wait), http
 
 
 def form(request: httpx.Request) -> dict[str, str]:
@@ -128,7 +132,9 @@ async def test_get_me_reports_profile_or_rejects_token() -> None:
 
     client, http = make_client(handler)
     async with http:
+        assert client.username is None
         assert await client.get_me() == {"id": 5, "username": "my_bot"}
+        assert client.username == "my_bot"  # commands for other bots are told apart by it
         try:
             await client.get_me()
         except TelegramAuthError:
@@ -186,12 +192,13 @@ async def test_token_never_appears_in_logs(caplog: pytest.LogCaptureFixture) -> 
             assert await client.get_updates(1, 30) is None
             assert await client.get_me() is None
     messages = [r.getMessage() for r in caplog.records if r.name == "scraper_bot.telegram.client"]
-    assert len(messages) == 4
+    assert len(messages) == 6  # the unsent message is tried three times
     assert all("<token>" in message for message in messages)
     assert all("secret" not in message for message in messages)
-    assert messages[0].startswith("sendMessage failed: ConnectError: cannot reach")
-    assert messages[2].startswith("getUpdates HTTP 500: gateway error for")
-    assert messages[3].startswith("getMe failed: cannot reach")
+    assert messages[0].startswith("sendMessage did not reach Telegram (ConnectError: cannot")
+    assert messages[2].startswith("sendMessage failed: ConnectError: cannot reach")
+    assert messages[4].startswith("getUpdates HTTP 500: gateway error for")
+    assert messages[5].startswith("getMe failed: cannot reach")
 
 
 async def test_long_text_without_newlines_is_hard_cut_at_4096() -> None:
@@ -350,3 +357,142 @@ async def test_a_message_too_long_to_edit_is_sent_but_not_tracked() -> None:
     client, http = make_client(handler)
     async with http:
         assert await client.send_tracked(1, "line\n" * 2000) is None
+
+
+async def test_a_patient_send_waits_out_a_long_flood_limit() -> None:
+    answers = [
+        httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 35}}),
+        httpx.Response(200, json={"ok": True, "result": {"message_id": 7}}),
+    ]
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramClient("123:secret", http, sleep=record)
+        sent = await client.send_tracked(1, "alert", patient=True)
+    assert sent is not None and sent.message_id == 7 and waits == [35.0]
+
+    answers[:] = [httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 35}})]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramClient("123:secret", http, sleep=record)
+        assert await client.send_message(1, "reply") is False  # a reply does not wait 35 s
+
+
+async def test_only_requests_that_never_left_are_sent_again() -> None:
+    calls: list[str] = []
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        calls.append("refused")
+        if len(calls) < 3:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    client, http = make_client(refused)
+    async with http:
+        assert await client.send_message(1, "hi") is True
+    assert calls == ["refused"] * 3
+
+    reads: list[str] = []
+
+    def lost_answer(request: httpx.Request) -> httpx.Response:
+        reads.append("sent")
+        raise httpx.ReadTimeout("no answer", request=request)  # it may have been delivered
+
+    client, http = make_client(lost_answer)
+    async with http:
+        assert await client.send_message(1, "hi", patient=True) is False
+    assert reads == ["sent"]  # never resent: that could duplicate the alert
+
+
+async def test_a_cut_inside_an_element_closes_and_reopens_it() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(form(request)["text"])
+        return httpx.Response(200, json={"ok": True, "result": {}})
+
+    client, http = make_client(handler)
+    lines = "\n".join(f"+ <b>item {i}</b> &amp; more text to fill the line" for i in range(150))
+    text = f"‼️ Changes\n\nAdded:\n<pre>{lines}</pre>\n\n➡️ <a href='https://x.io'>x.io</a>"
+    async with http:
+        assert await client.send_message(1, text)
+    assert len(seen) == 2
+    assert all(len(chunk) <= TelegramClient.MAX_MESSAGE_LENGTH for chunk in seen)
+    assert seen[0].endswith("</pre>") and seen[1].startswith("<pre>")
+    for chunk in seen:  # every chunk is balanced markup
+        assert chunk.count("<pre>") == chunk.count("</pre>") == 1
+        assert chunk.count("<b>") == chunk.count("</b>")
+    assert seen[0][: -len("</pre>")] + "\n" + seen[1][len("<pre>") :] == text
+
+
+def test_a_hard_cut_splits_neither_a_tag_nor_an_entity() -> None:
+    from scraper_bot.telegram.client import _safe_cut
+
+    text = "x" * 20 + "&amp;" + "y" * 20 + "<b>bold</b>"
+    assert _safe_cut(text, 22) == 20  # inside &amp;
+    assert _safe_cut(text, 47) == 45  # inside <b>
+    assert _safe_cut(text, 30) == 30
+
+
+def test_a_cut_moves_up_when_the_closing_tags_would_not_fit() -> None:
+    client = TelegramClient("123:secret", httpx.AsyncClient())
+    limit = TelegramClient.MAX_MESSAGE_LENGTH
+    text = "<pre>" + "x" * 1000 + "\n" + "y" * 3086 + "\n" + "z" * 3000 + "</pre>"
+    # The line break at 4092 leaves no room for </pre>: the cut moves up until it fits.
+    first, second = client._chunks(text)
+    assert first == text[: limit - len("</pre>")] + "</pre>"
+    assert second == "<pre>" + text[limit - len("</pre>") :]
+
+
+def test_a_tag_longer_than_a_message_is_cut_through_instead_of_looping() -> None:
+    client = TelegramClient("123:secret", httpx.AsyncClient())
+    text = "<a href='https://x.io/" + "p" * 9000 + "'>link</a>"
+    chunks = client._chunks(text)  # plain text then, but it ends
+    assert "".join(chunks) == text and all(len(c) <= 4096 for c in chunks)
+
+
+def test_emoji_count_twice_towards_the_limit() -> None:
+    client = TelegramClient("123:secret", httpx.AsyncClient())
+    text = "<pre>" + "\n".join("🚀 launch " + str(i) for i in range(600)) + "</pre>"
+    chunks = client._chunks(text)
+    assert all(len(c.encode("utf-16-le")) // 2 <= 4096 for c in chunks)
+    assert all(c.startswith("<pre>") and c.endswith("</pre>") for c in chunks)
+
+
+async def test_a_patient_send_waits_longer_and_longer_while_offline() -> None:
+    pauses: list[float] = []
+    calls = 0
+
+    async def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 8:
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = TelegramClient("123:secret", http, sleep=sleep)
+    async with http:
+        assert await client.send_message(1, "🔔 token", patient=True)
+    assert pauses == [2, 4, 8, 16, 30, 30, 30]  # about two minutes offline
+    pauses.clear()
+    calls = 3  # three more failures: all a reply gets
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http2:
+        quick = TelegramClient("123:secret", http2, sleep=sleep)
+        assert not await quick.send_message(1, "reply")  # a reply: three tries, 2 s apart
+    assert pauses == [2, 2]
+
+
+def test_a_wall_of_emoji_without_line_breaks_is_split_and_ends() -> None:
+    client = TelegramClient("123:secret", httpx.AsyncClient())
+    chunks = client._chunks("🚀" * 5000)
+    assert all(len(c.encode("utf-16-le")) // 2 <= 4096 for c in chunks)
+    assert "".join(chunks) == "🚀" * 5000

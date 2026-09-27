@@ -5,10 +5,12 @@ from typing import Any
 import pytest
 
 from scraper_bot.chains.address_extractor import sui_package
+from scraper_bot.chains.contract_validators import FailingEndpoint
 from scraper_bot.chains.enrichment import TokenInfo
 from scraper_bot.config import ChangedDefault
 from scraper_bot.models import (
     Address,
+    BlockSignal,
     Chain,
     ChangeReport,
     ConfirmedContract,
@@ -18,7 +20,7 @@ from scraper_bot.models import (
 )
 from scraper_bot.pages.urls import url_to_filename
 from scraper_bot.telegram.markup import strip_markup
-from scraper_bot.telegram.notifier import Notifier
+from scraper_bot.telegram.notifier import Notifier, format_amount, format_usd
 from scraper_bot.telegram.timefmt import format_precise, format_utc_offset
 from tests.conftest import FakeTelegram, node
 
@@ -38,15 +40,16 @@ async def test_addresses_and_commands_are_monospace() -> None:
     assert f"<code>{ADDRESS.value}</code>" in text
     assert "https://x.io/a?b=1&amp;c=2" in text  # escaped, not raw
     await notifier.site_auto_paused("https://x.io", "https://x.io/app", 5, ["https://x.io"])
+    await notifier.drain()
     assert "<code>/resume https://x.io</code>" in telegram.messages[-1][1]
 
 
 class SlowTelegram(FakeTelegram):
     """Token alerts take a moment to leave, like a real Telegram round trip."""
 
-    async def send_tracked(self, chat_id, text):
+    async def send_tracked(self, chat_id, text, *, patient=False):
         await asyncio.sleep(0.02)
-        return await super().send_tracked(chat_id, text)
+        return await super().send_tracked(chat_id, text, patient=patient)
 
 
 async def test_turbo_summary_never_overtakes_the_alerts_it_lists() -> None:
@@ -255,27 +258,43 @@ async def test_every_alert_type_renders_escaped_html() -> None:
     assert "every 5s, stops in 30 min.\n" in last()
 
     await notifier.turbo_finished(site, "time is up", (), 61.4, 12)
+    await notifier.drain()
     assert last() == (
         f"🎯 Turbo finished on {esc_site}: time is up\n"
         "Duration 61s, 12 renders, 0 confirmed contract(s)."
     )
     found = [ConfirmedContract(ADDRESS, "Base"), ConfirmedContract(ADDRESS, "BSC")]
     await notifier.turbo_finished(site, "2 contract(s) found", found, 9.6, 2)
+    await notifier.drain()
     text = last()
     assert "\nDuration 10s, 2 renders, 2 confirmed contract(s).\n" in text
     assert text.endswith(
         f"• <code>{ADDRESS.value}</code> (Base)\n• <code>{ADDRESS.value}</code> (BSC)"
     )
 
-    await notifier.site_blocked(site, page, "HTTP 403 (just a moment)", 120)
+    await notifier.site_blocked(site, page, BlockSignal("HTTP 403 (just a moment)"), 120)
     text = last()
     assert text.startswith(f"🚫 Possible IP block on {esc_site}\nPage: {esc_page}\n")
-    assert "Reason: <code>HTTP 403 (just a moment)</code>\n" in text
+    assert "Reason: <code>HTTP 403 (just a moment)</code>\nSlowing down:" in text
     assert "next check in 120s" in text
+    assert "you get a message when it answers normally again" in text
+    await notifier.site_blocked(
+        site, page, BlockSignal("HTTP 403", protection="Cloudflare challenge"), 120
+    )
+    assert "Reason: <code>HTTP 403</code>\nProtection: Cloudflare challenge\n" in last()
 
     await notifier.site_recovered(site)
     assert last() == f"✅ {esc_site} answers normally again; normal interval restored."
-    assert len(telegram.messages) == 2 * 10  # ten alerts, each to both chats
+    await notifier.site_recovered(site, blocked_for=750)
+    assert last() == (
+        f"✅ {esc_site} answers normally again after 12m 30s; normal interval restored."
+    )
+
+    await notifier.captcha_shown(page, "hCaptcha")
+    text = last()
+    assert text.startswith(f"🧩 Captcha on {esc_page}: the page shows a hCaptcha widget.\n")
+    assert text.endswith("You hear about each widget once per page.")
+    assert len(telegram.messages) == 2 * 13  # thirteen alerts, each to both chats
 
 
 async def test_contracts_batch_sends_a_sorted_tab_separated_document() -> None:
@@ -472,12 +491,92 @@ async def test_a_cancelled_round_does_not_lose_the_document_and_the_pause_waits(
     )
     await monitor
     monitor.cancel()  # /pause or shutdown while the upload is still running
-    pause = asyncio.create_task(
-        notifier.site_auto_paused("https://x.io", "https://x.io", 1, ["https://x.io"])
+    sent = telegram.broadcast
+
+    async def broadcast(*args: Any, **kwargs: Any) -> bool:
+        order.append("pause")
+        return await sent(*args, **kwargs)
+
+    telegram.broadcast = broadcast  # type: ignore[method-assign]
+    # The monitor is not held up: the notice waits for the document in a task of its own.
+    await asyncio.wait_for(
+        notifier.site_auto_paused("https://x.io", "https://x.io", 1, ["https://x.io"]), 1
     )
     await asyncio.sleep(0.05)
     assert telegram.messages == []  # the pause message waits for the document
     uploading.set()
-    await pause
-    order.append("pause")
+    await notifier.drain()
     assert order == ["document", "pause"] and len(telegram.documents) == 1
+
+
+def test_format_helpers() -> None:
+    assert format_amount(1_234) == "1.23K"
+    assert format_amount(12_400_000) == "12.4M"
+    assert format_amount(5e9) == "5B"
+    assert format_amount(49_951_489_980.6) == "50B"
+    assert format_amount(999) == "999" and format_amount(0.5) == "0.5"
+    assert format_usd(1.0) == "$1.00"
+    assert format_usd(12_400_000) == "$12.4M"
+    assert format_usd(0.0009773) == "$0.0009773"
+    assert format_usd(0.00000012) == "$1.2e-07"
+
+
+async def test_stuck_rpc_endpoints_get_one_report_that_says_what_happens_meanwhile() -> None:
+    now = 1_000.0
+    notifier, telegram = make(problem_cooldown=600, clock=lambda: now)
+    fantom = FailingEndpoint("Fantom", 310, "eth_getCode via rpcapi.fantom.network: HTTP 502")
+    arc = FailingEndpoint("Arc", 305, "eth_getCode via arc-rpc.publicnode.com: timed out", True)
+    notifier.rpc_endpoints_stuck([fantom, arc], 10)
+    await notifier.drain()
+    assert len(telegram.messages) == 1
+    text = strip_markup(telegram.messages[0][1])
+    assert text.startswith("🛑 On-chain checks keep failing\n")
+    assert "Fantom for 5m 10s: eth_getCode via rpcapi.fantom.network: HTTP 502" in text
+    assert "Arc for 5m 5s" in text
+    assert "re-checked every 10 s" in text and "Arc is an optional network" in text
+
+    notifier.rpc_endpoints_stuck([arc], 10)  # only an optional network: no retry promise
+    await notifier.drain()
+    optional_only = strip_markup(telegram.messages[-1][1])
+    assert "re-checked every" not in optional_only and "optional network" in optional_only
+
+
+async def test_a_first_check_pause_says_the_tokens_are_probably_old() -> None:
+    notifier, telegram = make()
+    await notifier.site_auto_paused("https://x.io", "https://x.io", 6, ["https://x.io"])
+    await notifier.drain()
+    later = strip_markup(telegram.messages[-1][1])
+    assert "first check" not in later and "will not be announced again" in later
+    await notifier.site_auto_paused(
+        "https://x.io", "https://x.io", 6, ["https://x.io"], first_check=True
+    )
+    await notifier.drain()
+    first = strip_markup(telegram.messages[-1][1])
+    assert first.startswith("⏸️ Monitoring paused: 6 confirmed contracts found on https://x.io\n")
+    assert "first check of the page since monitoring started or resumed" in first
+    assert "not 6 launches" in first and "/resume https://x.io" in first
+
+
+async def test_two_optional_networks_are_named_together() -> None:
+    notifier, telegram = make()
+    arc = FailingEndpoint("Arc", 400, "timed out", True)
+    robinhood = FailingEndpoint("Robinhood Chain", 310, "HTTP 502", True)
+    notifier.rpc_endpoints_stuck([arc, robinhood], 10)
+    await notifier.drain()
+    text = strip_markup(telegram.messages[-1][1])
+    assert "Arc and Robinhood Chain are optional networks" in text
+
+
+async def test_the_once_per_outage_rpc_report_is_sent_patiently() -> None:
+    notifier, telegram = make()
+    sent: list[bool] = []
+    original = telegram.broadcast
+
+    async def broadcast(chat_ids: Any, text: str, *, patient: bool = False) -> bool:
+        sent.append(patient)
+        return await original(chat_ids, text, patient=patient)
+
+    telegram.broadcast = broadcast  # type: ignore[method-assign]
+    notifier.rpc_endpoints_stuck([FailingEndpoint("Arc", 400, "timed out", True)], 10)
+    await notifier.drain()
+    assert sent == [True]

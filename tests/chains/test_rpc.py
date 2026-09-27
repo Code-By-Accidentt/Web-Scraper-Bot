@@ -12,6 +12,7 @@ from scraper_bot.chains.rpc import (
     RetryPolicy,
     RpcCallError,
     RpcError,
+    parse_retry_after,
 )
 
 # The path carries an API key, as the URLs of public node providers do.
@@ -365,3 +366,62 @@ async def test_a_node_gets_batches_again_after_a_while() -> None:
     assert rpc.batches
     await rpc.call_batch([("eth_chainId", [])])
     assert kinds == ["batch", "single", "batch"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("120", 120.0),
+        (" 5 ", 5.0),
+        ("0", 0.0),
+        ("1.5", 1.5),
+        ("-1", None),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_parse_retry_after(value: str | None, expected: float | None) -> None:
+    assert parse_retry_after(value) == expected
+
+
+async def test_a_contracts_own_revert_message_is_not_a_rate_limit() -> None:
+    reverted = httpx.Response(
+        200,
+        json=[
+            {"jsonrpc": "2.0", "id": 0, "result": "0x" + "00" * 31 + "12"},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": 3, "message": "execution reverted: Max wallet limit exceeded"},
+            },
+        ],
+    )
+    handler, seen = scripted(reverted)
+    answers = await retrying(handler, Clock()).call_batch([("a", []), ("b", [])])
+    assert answers[0] == "0x" + "00" * 31 + "12"
+    assert isinstance(answers[1], RpcCallError) and len(seen) == 1  # answered, not retried
+
+
+async def test_a_batch_refused_with_one_error_object_falls_back_to_single_calls() -> None:
+    kinds: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            kinds.append("batch")
+            error = {"code": -32600, "message": "batch size limit exceeded"}
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": None, "error": error})
+        kinds.append("single")
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": body["params"][0]})
+
+    rpc = retrying(handler, Clock())
+    assert await rpc.call_batch([("echo", ["a"]), ("echo", ["b"])]) == ["a", "b"]
+    assert kinds == ["batch", "single", "single"] and not rpc.batches
+
+
+async def test_a_malformed_url_is_an_rpc_error() -> None:
+    http = httpx.AsyncClient(transport=httpx.MockTransport(scripted(OK)[0]))
+    rpc = JsonRpcClient(http, "https://rpc.example:8545x", timeout=5, retry=NO_RETRY)
+    with pytest.raises(RpcError, match="InvalidURL"):
+        await rpc.call("eth_chainId", [])

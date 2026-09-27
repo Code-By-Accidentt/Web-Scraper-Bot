@@ -12,7 +12,13 @@ import time
 from collections.abc import Callable, Sequence
 
 from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.models import Address, Chain, SiteState, ValidationStatus
+from scraper_bot.models import (
+    Address,
+    SiteState,
+    ValidationStatus,
+    address_key,
+    parse_address_key,
+)
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.preferences import Tuning
 from scraper_bot.storage import AddressCache
@@ -23,18 +29,6 @@ log = logging.getLogger(__name__)
 _MEMORY = 7 * 86_400  # how long an announced address is remembered, so it is not announced twice
 _MAX_ENTRIES = 1000
 _DIGEST_PERIOD = 3600.0
-
-
-def address_key(address: Address) -> str:
-    return f"{address.chain.value}:{address.value}"
-
-
-def parse_key(key: str) -> Address | None:
-    chain_name, _, value = key.partition(":")
-    try:
-        return Address(Chain(chain_name), value) if value else None
-    except ValueError:
-        return None
 
 
 class UnverifiedWatcher:
@@ -112,7 +106,7 @@ class UnverifiedWatcher:
                 continue
             if now - self._last_check.get(key, 0.0) < self._tuning.unverified_recheck:
                 continue
-            address = parse_key(key)
+            address = parse_address_key(key)
             if address is not None:
                 due.append(address)
         if not due:
@@ -123,7 +117,7 @@ class UnverifiedWatcher:
             self._last_check[key] = now
             if result.status is ValidationStatus.CONFIRMED and result.contract is not None:
                 # The pending watch may have confirmed it in the same instant: one alert only.
-                if self._registry.claim(result.contract.address):
+                if self._registry.claim(result.contract):
                     await self._notifier.address_confirmed(
                         result.contract, self._pages.get(key, self._site.url)
                     )

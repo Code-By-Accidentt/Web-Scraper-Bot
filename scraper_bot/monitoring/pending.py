@@ -16,15 +16,16 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.chains.evm import is_delegated_wallet
+from scraper_bot.chains.contract_validators import OPTIONAL_GRACE, ContractValidator
+from scraper_bot.chains.evm import has_code, is_delegated_wallet
 from scraper_bot.chains.rpc import JsonRpcClient, RetryPolicy, RpcError
 from scraper_bot.chains.solana import TOKEN_2022_PROGRAM, TOKEN_PROGRAM
 from scraper_bot.config import Settings
@@ -38,6 +39,8 @@ from scraper_bot.models import (
     Timeline,
     ValidationResult,
     ValidationStatus,
+    address_key,
+    parse_address_key,
 )
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.storage import atomic_write_text
@@ -47,6 +50,7 @@ log = logging.getLogger(__name__)
 
 WATCH_FOR = 24 * 3600.0  # an address that never becomes a token is given up after a day
 REMEMBER_DROPPED = 7 * 86_400.0  # a dropped address is not taken back for a week
+DROPPED_LIMIT = 20_000  # dropped addresses remembered; the oldest are forgotten first
 SITE_LIMIT = 100  # watched addresses per site
 TOTAL_LIMIT = 1000
 EVM_PER_TICK = 20  # addresses in one tick's batch per EVM network
@@ -56,7 +60,6 @@ _FAST_WINDOWS = ((15 * 60.0, 1.0), (3600.0, 5.0))  # (age below, seconds between
 _SLOW_INTERVAL = 30.0
 _SAVE_EVERY = 5.0
 _STORE_VERSION = 2
-_EMPTY_CODE = frozenset({"", "0x", "0x0"})
 _MINT_OWNERS = frozenset({TOKEN_PROGRAM, TOKEN_2022_PROGRAM})
 _WATCHED_CHAINS = frozenset({Chain.ETHEREUM, Chain.SOLANA})  # a Sui package cannot be known early
 # A hint in the words before a link (pump.fun/, /token/, "CA") counts like one in text.
@@ -64,6 +67,8 @@ _VISIBLE = frozenset({SightingSource.TEXT, SightingSource.LINK})
 _SOLANA = "Solana"  # the "network" of a Solana address in ``absent_on``
 
 Listener = Callable[[Address], None]
+# Told each endpoint's answer (None) or failure: the endpoint health of the validators.
+HealthRecorder = Callable[[str, BaseException | None], None]
 
 
 @dataclass(slots=True)
@@ -77,12 +82,13 @@ class PendingEntry:
     classified: bool = False  # checked once: nothing lives there yet (EVM: and no wallet)
     # On a page when a turbo session started: news only where it was seen absent since.
     baseline: bool = False
-    last_check: float | None = None  # the last check attempt (it may have failed or been partial)
     next_check: float = 0.0
     # every site showing it -> the page it is on there (site_url and page_url included)
     sites: dict[str, str] = field(default_factory=dict)
     # network -> the last check that found nothing there (EVM network name, or "Solana")
     absent_on: dict[str, float] = field(default_factory=dict)
+    # networks that reported code after their check (not saved): confirmed at the next tick
+    late: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.sites.setdefault(self.site_url, self.page_url)
@@ -121,12 +127,16 @@ class PendingWatch:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         tick: float = 1.0,
         retry: RetryPolicy | None = None,
+        health: HealthRecorder | None = None,
+        stale_absences: Collection[str] = (),
+        new_networks: Collection[str] = (),
     ) -> None:
         timeout = settings.rpc_timeout
         self._evm = [
             (net.name, JsonRpcClient(http, net.rpc_url, timeout, retry=retry))
             for net in settings.evm_networks
         ]
+        self._required = frozenset(net.name for net in settings.evm_networks if not net.optional)
         self._solana = JsonRpcClient(http, settings.solana_rpc_url, timeout, retry=retry)
         self._validator = validator
         self._registry = registry
@@ -141,7 +151,20 @@ class PendingWatch:
         self._dropped: dict[Address, _Dropped] = {}
         self._turbo_sites: set[str] = set()
         self._listeners: dict[str, list[Listener]] = {}
-        self._confirming = asyncio.Semaphore(CONFIRMING_AT_ONCE)
+        # One queue per chain family: EVM confirmations that hang never hold up a Solana mint.
+        self._confirming = {
+            Chain.ETHEREUM: asyncio.Semaphore(CONFIRMING_AT_ONCE),
+            Chain.SOLANA: asyncio.Semaphore(CONFIRMING_AT_ONCE),
+        }
+        self._health = health
+        # Networks switched off and on again: what was seen there before is stale.
+        self._stale_absences = frozenset(stale_absences)
+        # Batches of optional networks still running after their tick: the entries they ask
+        # about and when they were sent, so a late answer is not thrown away.
+        self._late_batches: dict[asyncio.Future[list[Any]], tuple[list[PendingEntry], float]] = {}
+        self._in_flight: set[str] = set()  # networks whose last batch has not come back
+        # EVM networks added since the saved entries were checked (see load)
+        self._new_networks = frozenset(new_networks)
         self._dirty = False
         self._saved_at = 0.0
 
@@ -223,24 +246,42 @@ class PendingWatch:
 
     # ── the loop ────────────────────────────────────────────────────────────
     async def run(self) -> None:
-        """Check due addresses every ``tick`` seconds; nothing is sent while none is watched."""
+        """Check due addresses every ``tick`` seconds; nothing is sent while none is watched.
+
+        An error never ends the loop: it is logged, reported (a 🛑 at most every ten
+        minutes) and the next tick tries again.
+        """
+        # One loop per chain family: a hanging EVM node never holds back a Solana mint.
+        await asyncio.gather(self._loop(Chain.ETHEREUM), self._loop(Chain.SOLANA))
+
+    async def _loop(self, chain: Chain) -> None:
         while True:
             await self._sleep(self._tick)
-            if self._entries:
-                try:
-                    await self.check_due()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("checking the watched addresses failed")
-            now = self._clock()
-            # A clock stepped back must not hold saves off until it catches up.
-            if self._dirty and not 0 <= now - self._saved_at < _SAVE_EVERY:
-                self.save()
+            try:
+                if self._entries:
+                    await self.check_due(chain)
+                now = self._clock()
+                # A clock stepped back must not hold saves off until it catches up.
+                if self._dirty and not 0 <= now - self._saved_at < _SAVE_EVERY:
+                    self.save()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("the pending watch failed")
+                self._notifier.report_later(
+                    "pending",
+                    "The watch of addresses published before their token failed",
+                    f"{type(exc).__name__}: {exc}",
+                    hint="It keeps running and tries again every second; the log has the "
+                    "traceback.",
+                )
 
-    async def check_due(self) -> None:
+    async def check_due(self, chain: Chain | None = None) -> None:
+        """Check the entries that are due (``chain``: only that family's)."""
         now = self._clock()
         for address, entry in list(self._entries.items()):
+            if chain is not None and address.chain is not chain:
+                continue
             if now - entry.first_seen > WATCH_FOR:
                 log.info("gave up on %s %s after a day", address.chain.value, address)
                 self._drop(entry, now, hard=False)
@@ -252,58 +293,144 @@ class PendingWatch:
         )
         evm = [e for e in due if e.address.chain is Chain.ETHEREUM][:EVM_PER_TICK]
         solana = [e for e in due if e.address.chain is Chain.SOLANA][:SOLANA_PER_TICK]
-        looks = await asyncio.gather(self._look_evm(evm, now), self._look_solana(solana, now))
+        if chain is not None:
+            evm = evm if chain is Chain.ETHEREUM else []
+            solana = solana if chain is Chain.SOLANA else []
         await asyncio.gather(
-            *(
-                self._confirm(entry, networks, now)
-                for appeared in looks
-                for entry, networks in appeared
-            )
+            self._pass(self._look_evm(evm, now), now),
+            self._pass(self._look_solana(solana, now), now),
         )
+
+    async def _pass(
+        self,
+        look: Awaitable[list[tuple[PendingEntry, tuple[str, ...] | None]]],
+        now: float,
+    ) -> None:
+        appeared = await look
+        await asyncio.gather(*(self._confirm(entry, networks, now) for entry, networks in appeared))
 
     # ── cheap existence checks ──────────────────────────────────────────────
     async def _look_evm(
         self, entries: list[PendingEntry], now: float
     ) -> list[tuple[PendingEntry, tuple[str, ...] | None]]:
+        appeared: list[tuple[PendingEntry, tuple[str, ...] | None]] = []
+        # Code an optional network reported after its tick (or after a verdict): confirmed
+        # now, without another look.
+        hurried = [e for e in entries if e.late]
+        for entry in hurried:
+            where, entry.late = tuple(sorted(entry.late)), set()
+            self._appeared(entry, where, now, appeared)
+        entries = [e for e in entries if e not in hurried and e.address in self._entries]
         if not entries:
-            return []
+            return appeared
         unknown = [e for e in entries if not e.classified]
         calls = [("eth_getCode", [e.address.value, "latest"]) for e in entries]
         calls += [("eth_getTransactionCount", [e.address.value, "latest"]) for e in unknown]
-        answers = await asyncio.gather(
-            *(client.call_batch(calls) for _, client in self._evm), return_exceptions=True
-        )
-        per_network = [
-            (name, answer)
-            for (name, _), answer in zip(self._evm, answers, strict=True)
-            if isinstance(answer, list)
-        ]
-        complete = len(per_network) == len(self._evm)
-        appeared: list[tuple[PendingEntry, tuple[str, ...] | None]] = []
+        answers = await self._batches(calls, entries, now)
+        per_network = [(name, got) for name, got in answers.items() if isinstance(got, list)]
         for index, entry in enumerate(entries):
             codes = [(name, network[index]) for name, network in per_network]
             if any(isinstance(code, str) and is_delegated_wallet(code) for _, code in codes):
                 self._drop(entry, now, reason="an EIP-7702 wallet")
                 continue
-            deployed = tuple(
-                name
-                for name, code in codes
-                if isinstance(code, str) and code.lower() not in _EMPTY_CODE
-            )
+            deployed = tuple(name for name, code in codes if has_code(code))
             if deployed:
                 self._appeared(entry, deployed, now, appeared)
                 continue
             empty = [name for name, code in codes if isinstance(code, str)]
-            answered = complete and len(empty) == len(self._evm)
+            # Classified once every network that is not optional answered: an optional one
+            # that fails keeps being asked for code, but not for a nonce on every tick.
+            answered = bool(empty) and self._required <= set(empty)
             if not entry.classified:
                 at = len(entries) + unknown.index(entry)
-                nonces = [network[at] for _, network in per_network]
-                if any(_uint(nonce) for nonce in nonces):
+                nonces = {name: network[at] for name, network in per_network}
+                if any(_uint(nonce) for nonce in nonces.values()):
                     self._drop(entry, now, reason="a wallet (it has sent transactions)")
                     continue
-                answered = answered and all(isinstance(nonce, str) for nonce in nonces)
+                answered = answered and all(
+                    isinstance(nonces.get(name), str) for name in self._required
+                )
             self._absent(entry, empty, now, answered)
         return appeared
+
+    async def _batches(
+        self, calls: list[tuple[str, list[Any]]], entries: list[PendingEntry], sent_at: float
+    ) -> dict[str, Any]:
+        """Each EVM network's answer to ``calls`` (a list, or the error it raised).
+
+        Optional networks get ``OPTIONAL_GRACE`` after the required ones; one still silent
+        then is left out of this tick and finishes in the background, where what it says
+        about ``entries`` (code, or none as of ``sent_at``) still counts. A network whose
+        last batch has not come back is skipped, so a hanging node gets one request at a
+        time.
+        """
+        tasks: dict[asyncio.Future[list[Any]], str] = {}
+        for name, client in self._evm:
+            if name in self._in_flight:
+                continue
+            task = asyncio.ensure_future(client.call_batch(calls))
+            self._in_flight.add(name)
+            task.add_done_callback(lambda done, network=name: self._batch_done(network, done))
+            tasks[task] = name
+        answers: dict[str, Any] = {}
+        pending = set(tasks)
+        loop = asyncio.get_running_loop()
+        grace_ends: float | None = None
+        try:
+            while pending:
+                timeout = None
+                if all(tasks[task] not in self._required for task in pending):
+                    if grace_ends is None:
+                        grace_ends = loop.time() + OPTIONAL_GRACE
+                    timeout = max(grace_ends - loop.time(), 0.0)
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    for task in pending:  # too late for this tick, not for the next one
+                        self._late_batches[task] = (entries, sent_at)
+                    break
+                for task in done:
+                    answers[tasks[task]] = task.exception() or task.result()
+        except BaseException:
+            for task in pending:
+                task.cancel()
+            raise
+        return answers
+
+    def _batch_done(self, name: str, task: asyncio.Future[list[Any]]) -> None:
+        self._in_flight.discard(name)
+        late = self._late_batches.pop(task, None)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.debug("existence check on %s failed: %s", name, error)
+        if self._health is not None:
+            self._health(name, error)
+        if late is None or error is not None:
+            return
+        entries, sent_at = late
+        codes = task.result()
+        for index, entry in enumerate(entries):
+            code = codes[index] if index < len(codes) else None
+            if not isinstance(code, str) or entry.address not in self._entries:
+                continue
+            if has_code(code):
+                self.hurry(entry.address, name)
+            elif name not in entry.absent_on or entry.absent_on[name] < sent_at:
+                # Nothing there yet: what tells a deployment there from old news later.
+                entry.absent_on[name] = sent_at
+                self._dirty = True
+
+    def hurry(self, address: Address, network: str) -> None:
+        """``network`` has code at ``address`` (an answer that came too late for its check):
+        the next tick confirms it there, without waiting for its next look."""
+        entry = self._entries.get(address)
+        if entry is None:
+            return
+        entry.late.add(network)
+        entry.next_check = min(entry.next_check, self._clock())
 
     async def _look_solana(
         self, entries: list[PendingEntry], now: float
@@ -321,7 +448,12 @@ class PendingWatch:
             )
         except RpcError as exc:
             log.debug("Solana existence check failed: %s", exc)
+            if self._health is not None:
+                self._health(_SOLANA, exc)
             result = None
+        else:
+            if self._health is not None:
+                self._health(_SOLANA, None)
         values = result.get("value") if isinstance(result, dict) else None
         if not isinstance(values, list) or len(values) != len(entries):
             for entry in entries:
@@ -369,7 +501,7 @@ class PendingWatch:
     async def _confirm(
         self, entry: PendingEntry, networks: tuple[str, ...] | None, now: float
     ) -> None:
-        async with self._confirming:
+        async with self._confirming[entry.address.chain]:
             results = await self._validator.validate_many(
                 [entry.address], negative_cache=False, networks=networks, urgent=True
             )
@@ -382,7 +514,7 @@ class PendingWatch:
             for result in tokens:
                 contract = result.contract
                 assert contract is not None
-                if self._registry.claim(contract.address):
+                if self._registry.claim(contract):
                     await self._notifier.contract_found(
                         contract,
                         entry.page_url,
@@ -501,7 +633,9 @@ class PendingWatch:
         self._dirty = True
 
     def _reschedule(self, entry: PendingEntry, now: float) -> None:
-        entry.last_check = now
+        if entry.late:
+            entry.next_check = now  # code reported meanwhile: confirmed at the next tick
+            return
         turbo = self._turbo_interval() if entry.sites.keys() & self._turbo_sites else None
         entry.next_check = now + check_interval(entry, now, turbo)
 
@@ -511,8 +645,16 @@ class PendingWatch:
         if reason:
             log.info("stopped watching %s %s: %s", entry.address.chain.value, entry.address, reason)
         self._remove(entry)
+        self._dropped.pop(entry.address, None)
         self._dropped[entry.address] = _Dropped(now + REMEMBER_DROPPED, hard)
+        self._trim_dropped()
         self._dirty = True
+
+    def _trim_dropped(self) -> None:
+        """First in, first out: a forgotten wallet costs one more check, not a wrong alert."""
+        excess = max(len(self._dropped) - DROPPED_LIMIT, 0)
+        for address in list(islice(self._dropped, excess)):
+            del self._dropped[address]
 
     def _remove(self, entry: PendingEntry) -> None:
         if self._entries.pop(entry.address, None) is not None:
@@ -540,15 +682,44 @@ class PendingWatch:
                 address: _Dropped(float(until), hard)
                 for section, hard in (("dropped", True), ("expired", False))
                 for key, until in data.get(section, {}).items()
-                if (address := _address_from(key)) is not None and float(until) > now
+                if (address := parse_address_key(key)) is not None and float(until) > now
             }
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             log.warning("pending watch file %s is unreadable (%s); starting empty", self._path, exc)
             return
         self._entries = {entry.address: entry for entry in entries if entry is not None}
-        self._dropped = dropped
+        self._dropped = dict(sorted(dropped.items(), key=lambda item: item[1].until))
+        self._trim_dropped()
+        if self._new_networks:
+            self._forget_old_verdicts()
         if self._entries:
             log.info("%d address(es) watched until they become a token", len(self._entries))
+
+    def _forget_old_verdicts(self) -> None:
+        """The saved EVM entries were never checked on the networks added since.
+
+        Code found there now is old news (a token the page already listed), not a
+        deployment: the entries become baselines, and the regular monitor, which no longer
+        has their old rejections cached, announces such tokens the usual way (one document
+        and a pause when a page lists many). Addresses given up on come back when shown.
+        """
+        evm = [entry for entry in self._entries.values() if entry.address.chain is Chain.ETHEREUM]
+        for entry in evm:
+            entry.baseline = True
+            for name in self._stale_absences:
+                # Seen absent there before the network was switched off: stale news.
+                entry.absent_on.pop(name, None)
+        self._dropped = {
+            address: dropped
+            for address, dropped in self._dropped.items()
+            if dropped.hard or address.chain is not Chain.ETHEREUM
+        }
+        self._dirty = True
+        log.info(
+            "new EVM network(s) %s: %d watched EVM address(es) are baselines now",
+            ", ".join(sorted(self._new_networks)),
+            len(evm),
+        )
 
     def save(self) -> None:
         now = self._clock()
@@ -557,8 +728,8 @@ class PendingWatch:
             "version": _STORE_VERSION,
             "entries": [_entry_to(entry) for entry in self._entries.values()],
             # wallets and non-tokens; "expired" holds addresses only given up on
-            "dropped": {_key(a): d.until for a, d in self._dropped.items() if d.hard},
-            "expired": {_key(a): d.until for a, d in self._dropped.items() if not d.hard},
+            "dropped": {address_key(a): d.until for a, d in self._dropped.items() if d.hard},
+            "expired": {address_key(a): d.until for a, d in self._dropped.items() if not d.hard},
         }
         try:
             atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False))
@@ -576,22 +747,10 @@ def _uint(answer: Any) -> int:
         return 0
 
 
-def _key(address: Address) -> str:
-    return f"{address.chain.value}:{address.value}"
-
-
-def _address_from(key: str) -> Address | None:
-    chain, _, value = key.partition(":")
-    try:
-        return Address(Chain(chain), value) if value else None
-    except ValueError:
-        return None
-
-
 def _entry_to(entry: PendingEntry) -> dict[str, Any]:
     sighting = entry.sighting
     return {
-        "address": _key(entry.address),
+        "address": address_key(entry.address),
         "site": entry.site_url,
         "page": entry.page_url,
         "sites": dict(entry.sites),
@@ -616,7 +775,7 @@ def _sites_from(raw: Any, page_url: str) -> dict[str, str]:
 
 
 def _entry_from(raw: dict[str, Any], *, forget_baseline: bool = False) -> PendingEntry | None:
-    address = _address_from(str(raw["address"]))
+    address = parse_address_key(str(raw["address"]))
     if address is None:
         return None
     source = raw.get("source")

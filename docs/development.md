@@ -10,7 +10,7 @@ playwright install chromium              # only for the opt-in browser tests
 ## Checks
 
 ```bash
-pytest -q                                # ~750 tests, offline, about 9 s
+pytest -q                                # ~940 tests, offline, about 12 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
 SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/test_fetcher_browser.py   # real Chromium
 ```
@@ -56,8 +56,9 @@ Coverage sits at about 97% of lines. The browser path of `pages/fetcher.py` and
 | Page that never goes idle | pays the full `NETWORK_IDLE_TIMEOUT` per render (4 s cap → 4.6 s, 2 s cap → 2.6 s) |
 | A round of 4 pages | ~2 s; 7 sub-page probes 0.2 s |
 | 12 heavy pages | 6 tabs 2.7 s, 8 tabs 2.6 s, 12 tabs 1.7 s |
-| JSON-RPC call, any of the 10 endpoints | 44–72 ms median, 316 ms worst |
+| JSON-RPC call, any of 2.1's 10 endpoints (8 EVM, Solana, Sui) | 44–72 ms median, 316 ms worst |
 | Full validation of a new address | wallet on 8 EVM networks 88 ms, ERC-20 token 122 ms, Solana 55 ms, Sui 47 ms |
+| The same with 10 EVM networks (2026-09-27, warm connections) | wallet 128 ms, ERC-20 on Ethereum 149 ms, on Arc 118 ms, on Robinhood Chain 128 ms, Solana 82 ms; Arc and Robinhood publicnode answer in ~50 ms and took 40 parallel calls without a 429 |
 | Token details for an alert | 50–300 ms, all fields |
 | CPU per changed page | 800 nodes 30 ms, 8 000 nodes 0.4 s, 20 000 nodes 1.6 s (runs in a thread) |
 | Address extraction | 1 MB of JS 160 ms, 5 MB 0.8 s |
@@ -73,12 +74,20 @@ attribute, section, kind, label, description, range, unit, scale, optional cauti
 attribute in the `Tuning` protocol, the field in `tests.conftest.FakeTuning`. Read it
 from the tuning object at use time, never cache it.
 
-**A chain.** Add the pattern and canonical form in `chains/address_extractor.py` and a
-`Chain` member in `models.py`; a validator class in `chains/contract_validators.py` and a
-branch in `ContractValidator._lookup`; explorer / DEX links and metadata lookups in
-`chains/enrichment.py`; helpers in a new `chains/<chain>.py` if the RPC surface is big;
-tests next to the existing ones with `httpx.MockTransport` responders; `.env.example`
-and the docs for the new RPC URL.
+**An EVM network.** One `EvmChain` entry in `chains/networks.py` (name, `.env` key,
+default RPC, chain id, explorer and DexScreener links, `optional` for a young chain whose
+public nodes may fail), its stablecoins and wrapped tokens in `chains/stoplist.py`
+(check each `symbol()` on-chain), the line in `.env.example` and the row in
+`docs/configuration.md`. Settings, warm-up, chain-id check, validation, pending watch and
+alert links pick it up from the table; `tests/chains/test_networks.py` keeps the table
+consistent.
+
+**A chain family.** Add the pattern and canonical form in `chains/address_extractor.py`
+and a `Chain` member in `models.py`; a validator class in `chains/contract_validators.py`
+and a branch in `ContractValidator._lookup`; links in `chains/networks.py` and metadata
+lookups in `chains/enrichment.py`; helpers in a new `chains/<chain>.py` if the RPC surface
+is big; tests next to the existing ones with `httpx.MockTransport` responders;
+`.env.example` and the docs for the new RPC URL.
 
 **An alert.** A method on `telegram/notifier.py` (escape everything, monospace what
 people copy), the same method on `tests.conftest.FakeNotifier` recording the call, a

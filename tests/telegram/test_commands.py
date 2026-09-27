@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from scraper_bot.storage import SnapshotStore, StateStore
 from scraper_bot.telegram.commands import (
     SETTINGS_USAGE,
     BotCommands,
+    ParsedCommand,
     TelegramListener,
     TurboRequest,
     parse_command,
@@ -42,11 +44,45 @@ from tests.conftest import (
         ("hello", None),
         ("/", None),
         ("", None),
+        ("/add\nexample.com", ("add", "example.com")),
+        ("/add\texample.com  more", ("add", "example.com  more")),
+        ("/pause@OtherBot x.io", ("pause", "x.io")),  # our own name is not known yet
     ],
 )
 def test_parse_command(text: str, expected: tuple[str, str] | None) -> None:
     parsed = parse_command(text)
     assert ((parsed.name, parsed.argument) if parsed else None) == expected
+
+
+def test_a_command_for_another_bot_is_not_ours() -> None:
+    assert parse_command("/pause@OtherBot x.io", "MyBot") is None
+    assert parse_command("/pause@mybot x.io", "MyBot") == ParsedCommand("pause", "x.io")
+    assert parse_command("/pause x.io", "MyBot") == ParsedCommand("pause", "x.io")
+
+
+async def test_commands_meant_for_another_bot_get_no_answer(tmp_path: Path) -> None:
+    manager, telegram, commands = make(tmp_path)
+    telegram.username = "MyBot"
+    await manager.start()
+    try:
+        assert await send(commands, telegram, "/add@OtherBot example.com") == ""
+        assert manager.sites() == []
+        reply = await send(commands, telegram, "/add@MyBot example.com")
+        assert "added to monitoring" in reply
+    finally:
+        await manager.shutdown()
+
+
+async def test_add_warns_when_the_new_site_shares_pages(tmp_path: Path) -> None:
+    manager, telegram, commands = make(tmp_path)
+    await manager.start()
+    try:
+        assert "shares pages" not in await send(commands, telegram, "/add example.com")
+        reply = await send(commands, telegram, "/add www.example.com")
+        assert "⚠️ It shares pages with https://example.com." in reply
+        assert "(by none, if that site is muted)" in reply
+    finally:
+        await manager.shutdown()
 
 
 def make(
@@ -398,9 +434,9 @@ async def test_usage_hints_for_every_url_command(tmp_path: Path) -> None:
     _, telegram, commands = make(tmp_path)
     for name in ("remove", "pause", "resume", "notify", "nonotifi"):
         assert await send(commands, telegram, f"/{name}") == f"Usage: /{name} <url>"
-    # The aliases share their handler, so they answer with the canonical usage line.
-    assert await send(commands, telegram, "/mute") == "Usage: /nonotifi <url>"
-    assert await send(commands, telegram, "/unmute") == "Usage: /notify <url>"
+    # An alias answers with the name that was typed.
+    assert await send(commands, telegram, "/mute") == "Usage: /mute <url>"
+    assert await send(commands, telegram, "/unmute") == "Usage: /unmute <url>"
 
 
 async def test_list_shows_stopped_blocked_and_last_change(tmp_path: Path) -> None:
@@ -441,6 +477,39 @@ async def test_list_shows_stopped_blocked_and_last_change(tmp_path: Path) -> Non
     ]
 
 
+async def test_resume_restarts_a_stopped_site(tmp_path: Path) -> None:
+    crashes = [True]
+
+    def factory(site: SiteState, persist: Any, on_auto_pause: Any) -> StubMonitor:
+        crash = crashes.pop(0) if crashes else False
+        return StubMonitor(site, persist, on_auto_pause, crash=crash)
+
+    manager = MonitorManager(
+        state_store=StateStore(tmp_path / "state.json"),
+        snapshot_store=SnapshotStore(tmp_path / "snaps"),
+        deriver=SubUrlDeriver(()),
+        monitor_factory=factory,
+        restart_delay=0,  # the crash is not cured automatically: the site is STOPPED
+    )
+    telegram = FakeTelegram()
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,))
+    await manager.start()
+    try:
+        await manager.add_site("https://crash.io")
+        for _ in range(100):
+            if not manager.is_running("https://crash.io"):
+                break
+            await asyncio.sleep(0.01)
+        assert "[STOPPED]" in await send(commands, telegram, "/list")
+        reply = await send(commands, telegram, "/resume crash.io")
+        assert reply == "▶️ https://crash.io was stopped by an error; its monitor is running again."
+        assert manager.is_running("https://crash.io")
+        again = await send(commands, telegram, "/resume crash.io")
+        assert again == "▶️ https://crash.io is not paused."
+    finally:
+        await manager.shutdown()
+
+
 async def test_settings_reset_with_nothing_overridden(tmp_path: Path) -> None:
     _, telegram, commands = with_preferences(tmp_path)
     assert (await send(commands, telegram, "/settings reset all")).startswith(
@@ -457,7 +526,7 @@ async def test_settings_and_set_without_preferences_wired(tmp_path: Path) -> Non
         assert await send(commands, telegram, text) == "Settings are not available."
 
 
-async def test_missing_recipients_warning_on_list_and_resume_but_not_pause(
+async def test_missing_recipients_warning_once_per_chat_and_not_on_pause(
     tmp_path: Path,
 ) -> None:
     manager, telegram, _ = make(tmp_path)
@@ -471,8 +540,9 @@ async def test_missing_recipients_warning_on_list_and_resume_but_not_pause(
         paused = await send(commands, telegram, "/pause example.com", chat_id=7)
         assert paused.startswith("⏸️ https://example.com paused.") and warning not in paused
         resumed = await send(commands, telegram, "/resume example.com", chat_id=7)
-        assert resumed.startswith("▶️ https://example.com resumed.") and warning in resumed
-        assert "chat id 7" in resumed
+        assert resumed.startswith("▶️ https://example.com resumed.")
+        assert warning not in resumed  # once per chat and start is enough
+        assert "chat id 7" in listed
     finally:
         await manager.shutdown()
 
@@ -563,3 +633,49 @@ async def test_generic_monitor_and_turbo_errors_fall_back_to_the_message(
     assert await send(commands, telegram, "/pause example.com") == "❌ https://example.com"
     assert await send(commands, telegram, "/turbo stop example.com") == "❌ <https://example.com>"
     assert "&lt;https://example.com&gt;" in telegram.messages[-1][1]  # escaped for HTML
+
+
+async def test_a_scheduled_turbo_names_the_zone_and_the_time_left(tmp_path: Path) -> None:
+    from scraper_bot.telegram.timefmt import format_utc_offset
+
+    manager, telegram, _ = make(tmp_path)
+    turbo = make_turbo()
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), turbo=turbo)
+    try:
+        reply = await send(commands, telegram, "/turbo example.com 5 in 2h")
+        offset = format_utc_offset(time.time() + 7200)
+        assert f"({offset}, in 1h 59m)" in reply or f"({offset}, in 2h 0m)" in reply
+        status = await send(commands, telegram, "/turbo")
+        assert offset in status and ("in 1h 59m" in status or "in 2h 0m" in status)
+    finally:
+        await turbo.shutdown()
+
+
+async def test_remove_ends_the_turbo_session_of_the_site(tmp_path: Path) -> None:
+    manager, telegram, _ = make(tmp_path)
+    turbo = make_turbo()
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), turbo=turbo)
+    await manager.start()
+    try:
+        await send(commands, telegram, "/add example.com")
+        assert "Turbo started" in await send(commands, telegram, "/turbo example.com 5")
+        assert [s.url for s in turbo.active()] == ["https://example.com"]
+        assert "removed from monitoring" in await send(commands, telegram, "/remove example.com")
+        assert turbo.active() == []
+        # Not monitored: nothing is stopped and the reply says so.
+        assert "is not monitored" in await send(commands, telegram, "/remove other.io")
+    finally:
+        await turbo.shutdown()
+        await manager.shutdown()
+
+
+async def test_the_listener_learns_the_bot_name_when_the_start_could_not(tmp_path: Path) -> None:
+    _, telegram, commands = make(tmp_path)
+    telegram.updates = [[], []]
+    listener = TelegramListener(telegram, commands, poll_timeout=0, error_backoff=0)
+    task = asyncio.create_task(listener.run())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert telegram.profile_calls == 1  # asked once, then not again within a minute

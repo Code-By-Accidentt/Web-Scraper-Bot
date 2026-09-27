@@ -11,14 +11,16 @@ import os
 import socketserver
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 
 from scraper_bot.chains.address_extractor import AddressExtractor
+from scraper_bot.config import Settings
 from scraper_bot.pages.fetcher import PlaywrightFetcher
-from tests.conftest import make_settings
+from tests.conftest import extract, make_settings
 
 pytestmark = pytest.mark.skipif(
     os.getenv("SCRAPER_BOT_BROWSER_TESTS") != "1",
@@ -88,16 +90,27 @@ def site(tmp_path: Path) -> Iterator[str]:
 
 
 def suffixes(texts: tuple[str, ...]) -> set[str]:
-    return {a.value[-2:] for a in AddressExtractor().extract_many(texts)}
+    extractor = AddressExtractor()
+    return {a.value[-2:] for text in texts for a in extract(extractor, text)}
+
+
+@asynccontextmanager
+async def browser(settings: Settings) -> AsyncIterator[PlaywrightFetcher]:
+    fetcher = PlaywrightFetcher(settings)
+    await fetcher.start()
+    try:
+        yield fetcher
+    finally:
+        await fetcher.stop()
 
 
 async def test_deep_scan_finds_addresses_outside_the_dom(site: str, tmp_path: Path) -> None:
     settings = make_settings(tmp_path, SETTLE_DELAY="0.5", DEEP_SCAN="true")
-    async with PlaywrightFetcher(settings) as fetcher:
+    async with browser(settings) as fetcher:
         result = await fetcher.fetch(site)
     assert result.ok
     assert suffixes((result.html,)) == {"01", "02", "03", "04", "05", "06", "07"}
-    assert suffixes(result.scan_texts) == {
+    assert suffixes((result.html, *result.extra_texts)) == {
         "01",
         "02",
         "03",
@@ -114,18 +127,17 @@ async def test_deep_scan_finds_addresses_outside_the_dom(site: str, tmp_path: Pa
 
 async def test_deep_scan_can_be_disabled(site: str, tmp_path: Path) -> None:
     settings = make_settings(tmp_path, SETTLE_DELAY="0.5", DEEP_SCAN="false")
-    async with PlaywrightFetcher(settings) as fetcher:
+    async with browser(settings) as fetcher:
         before = time.time()
         result = await fetcher.fetch(site)
         after = time.time()
     assert result.extra_texts == () and result.dom_texts == ()
-    assert result.scan_texts == (result.html,)
     assert result.started_at is not None and before <= result.started_at <= after
 
 
 async def test_load_timeout_override_is_reported(site: str, tmp_path: Path) -> None:
     settings = make_settings(tmp_path, DEEP_SCAN="false")
-    async with PlaywrightFetcher(settings) as fetcher:
+    async with browser(settings) as fetcher:
         result = await fetcher.fetch(site.replace("/index.html", "/slow"), timeout=1)
     assert result.timed_out and not result.ok
     assert result.error == "timeout after 1s"

@@ -8,10 +8,14 @@ filter counts alerts per element and silences it after ``threshold`` in ``window
 from __future__ import annotations
 
 import hashlib
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Mapping
 
 from scraper_bot.models import ChangeReport, Node, NoiseEntry, NoiseMemory, Signature
+from scraper_bot.pages.change_detector import shape
+
+_WHOLESALE_FROM = 20  # nodes a page needs before a report can swap out most of it
+_WHOLESALE_KEY = "page|wholesale"
 
 
 class NoiseFilter:
@@ -44,6 +48,16 @@ class NoiseFilter:
         updated: NoiseMemory = {
             key: entry for key, entry in memory.items() if now - entry.last_seen < self._window
         }
+        if len(before) >= _WHOLESALE_FROM and len(report.removed) > len(before) // 2:
+            # Most of the page swapped out (an interstitial, a redesign): counted for the
+            # page as a whole, not per element, or every element would be silenced for the
+            # window. A page that keeps swapping is silenced like any flapping element.
+            entry = updated.get(_WHOLESALE_KEY)
+            count = entry.count if entry else 0
+            updated[_WHOLESALE_KEY] = NoiseEntry(count + 1, now)
+            if count >= self._threshold:
+                return ChangeReport(report.url), updated
+            return report, updated
         touched: set[str] = set()
 
         def keep(key: str) -> bool:
@@ -55,12 +69,12 @@ class NoiseFilter:
         removed = tuple(
             node
             for node in report.removed
-            if keep(self.node_key(node, old_positions.among_attrs(node)))
+            if keep(self.node_key(node, old_positions.among_look_alikes(node)))
         )
         added = tuple(
             node
             for node in report.added
-            if keep(self.node_key(node, new_positions.among_attrs(node)))
+            if keep(self.node_key(node, new_positions.among_look_alikes(node)))
         )
         modified = tuple(
             (old, new)
@@ -77,13 +91,13 @@ class NoiseFilter:
         """Identity of an element whose *text* changes: tag + attributes + position.
 
         The position among look-alikes keeps two ``<span class="stat">`` from sharing
-        one memory entry. Elements without attributes fall back to tag + first word
-        of the text, so a rotating ``<p>`` does not silence every other paragraph.
+        one memory entry. Elements without attributes fall back to tag + the first word of
+        the text with numbers masked (``<td>1203</td>`` stays one element while it counts)
+        + position among such elements, so a rotating ``<p>`` does not silence the others.
         """
         if node.attrs:
             return f"{node.tag}|attrs|{_digest(repr(node.attrs))}|{ordinal}"
-        first_word = node.text.split(" ", 1)[0] if node.text else ""
-        return f"{node.tag}|text|{_digest(first_word)}"
+        return f"{node.tag}|word|{_digest(_first_word(node))}|{ordinal}"
 
     @staticmethod
     def pair_key(old: Node, new: Node, ordinal: int = 0) -> str:
@@ -95,26 +109,28 @@ class _Positions:
     """Where each node of one signature stands among the nodes that look like it."""
 
     def __init__(self, signature: Signature) -> None:
-        self._by_attrs: dict[tuple[str, tuple[tuple[str, str], ...]], list[Node]] = defaultdict(
-            list
-        )
-        self._by_text: dict[tuple[str, str], list[Node]] = defaultdict(list)
+        # The first position of each node in its group, counted in one pass.
+        self._look_alike: dict[Node, int] = {}
+        self._same_text: dict[Node, int] = {}
+        look_alikes: Counter[tuple[object, ...]] = Counter()
+        same_text: Counter[tuple[str, str]] = Counter()
         for node in signature:
-            self._by_attrs[node.tag, node.attrs].append(node)
-            self._by_text[node.tag, node.text].append(node)
+            group = (node.tag, "attrs", node.attrs) if node.attrs else (node.tag, _first_word(node))
+            self._look_alike.setdefault(node, look_alikes[group])
+            look_alikes[group] += 1
+            self._same_text.setdefault(node, same_text[node.tag, node.text])
+            same_text[node.tag, node.text] += 1
 
-    def among_attrs(self, node: Node) -> int:
-        return _position(self._by_attrs.get((node.tag, node.attrs), ()), node)
+    def among_look_alikes(self, node: Node) -> int:
+        """Position among nodes with the same attributes (attribute-less: the same word)."""
+        return self._look_alike.get(node, 0)
 
     def among_text(self, node: Node) -> int:
-        return _position(self._by_text.get((node.tag, node.text), ()), node)
+        return self._same_text.get(node, 0)
 
 
-def _position(group: Sequence[Node], node: Node) -> int:
-    for index, candidate in enumerate(group):
-        if candidate == node:
-            return index
-    return 0
+def _first_word(node: Node) -> str:
+    return shape(node.text.split(" ", 1)[0]) if node.text else ""
 
 
 def _digest(text: str) -> str:

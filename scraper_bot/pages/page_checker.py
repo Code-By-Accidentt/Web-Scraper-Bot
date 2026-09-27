@@ -6,12 +6,10 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
 
 from scraper_bot.chains.address_extractor import AddressExtractor
 from scraper_bot.chains.contract_validators import ContractValidator
 from scraper_bot.models import (
-    ConfirmedContract,
     Observation,
     PageCheckOutcome,
     PageStatus,
@@ -26,18 +24,13 @@ from scraper_bot.pages.change_detector import ChangeDetector
 from scraper_bot.pages.fetcher import FetchResult, PageFetcher
 from scraper_bot.pages.html_normalizer import HtmlNormalizer
 from scraper_bot.pages.noise_filter import NoiseFilter
-from scraper_bot.pages.sightings import find_sightings
+from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
 from scraper_bot.preferences import Tuning
 from scraper_bot.storage import SnapshotStore
 
 log = logging.getLogger(__name__)
 
-T = TypeVar("T")
 Observer = Callable[[Observation], Awaitable[None]]
-
-
-def _contracts(results: tuple[ValidationResult, ...]) -> tuple[ConfirmedContract, ...]:
-    return tuple(result.contract for result in results if result.contract is not None)
 
 
 def _without_old_deep(
@@ -70,7 +63,9 @@ class PageChecker:
     A change counts only when it survives a second render taken ``confirm_delay``
     seconds later: whatever differs between the two renders is volatile, elements
     that keep changing across rounds are silenced by :class:`NoiseFilter`, and the
-    snapshot always advances to the second render so noise never accumulates.
+    snapshot advances to the second render without the volatile nodes it did not have,
+    so noise never accumulates and a change that landed between the renders is
+    reported by the next round.
     """
 
     def __init__(
@@ -117,48 +112,64 @@ class PageChecker:
         if first.started_at is not None:
             started = first.started_at  # after the wait for a free tab
         block = self._blocks.inspect(first)
-        if block is not None:
+        if not first.ok:
             # A challenge or ban page must never be diffed against the real snapshot.
             return PageCheckOutcome(
-                page_url, PageStatus.UNAVAILABLE, error=block.reason, block=block
-            )
-        if not first.ok:
-            return PageCheckOutcome(
-                page_url, PageStatus.UNAVAILABLE, error=first.reason, timed_out=first.timed_out
+                page_url,
+                PageStatus.UNAVAILABLE,
+                error=block.reason if block is not None else first.reason,
+                block=block,
+                timed_out=first.timed_out,
             )
 
         snapshot = self._snapshots.load(page_url)
         current = await asyncio.to_thread(self._normalizer.signature, first.html)
         deep_seen = snapshot.deep_seen if snapshot is not None else None
-        recording = deep_seen is None and bool(first.extra_texts)
-        sightings, deep_seen = _without_old_deep(
-            await self._sightings(current, first), deep_seen, recording=recording
-        )
+        found = await self._sightings(current, first)
+        recording = False
+        if block is None:
+            recording = deep_seen is None and bool(first.extra_texts)
+            sightings, deep_seen = _without_old_deep(found, deep_seen, recording=recording)
+        else:
+            # A 2xx answer that looks like a challenge may be the real page with an unlucky
+            # title: what it shows is read (a CA must not wait), not its source or scripts.
+            sightings = tuple(shown_on_a_challenge(found))
         if recording and snapshot is not None:
             # A page stored before deep scan was on: its deep sources are known from now on.
             snapshot.deep_seen = deep_seen
             self._snapshots.save(page_url, snapshot)
         results = await self._validate(sightings)
+        # A challenge or a blank render did not show the page: no appearance window opens.
+        read = block is None and bool(current)
         await self._observe(
-            on_observation, Observation(page_url, seen_at, sightings, results, started)
+            on_observation, Observation(page_url, seen_at, sightings, results, started, read)
         )
-        contracts = _contracts(results)
         candidates = tuple(sighting.address for sighting in sightings)
+        if block is not None:
+            return PageCheckOutcome(
+                page_url,
+                PageStatus.UNAVAILABLE,
+                error=block.reason,
+                block=block,
+                candidates=candidates,
+            )
+        captcha = await asyncio.to_thread(self._blocks.captcha, first.html)
         if not current:
             # A blank 200 (deploy in progress, empty shell) is not a page to compare.
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNAVAILABLE,
-                contracts,
                 error="empty page",
                 candidates=candidates,
             )
         if snapshot is None:
             self._snapshots.save(page_url, Snapshot(current, deep_seen=deep_seen))
-            return PageCheckOutcome(page_url, PageStatus.BASELINE, contracts, candidates=candidates)
+            return PageCheckOutcome(
+                page_url, PageStatus.BASELINE, candidates=candidates, captcha=captcha
+            )
         if not self._detector.differs(snapshot.signature, current):
             return PageCheckOutcome(
-                page_url, PageStatus.UNCHANGED, contracts, candidates=candidates
+                page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
             )
 
         # Something differs: render again to separate real edits from volatile parts.
@@ -169,12 +180,23 @@ class PageChecker:
         if second.started_at is not None:
             started_again = second.started_at
         block = self._blocks.inspect(second)
+        if block is not None and second.ok:
+            # Like the first render: what a 2xx challenge-looking page shows is read.
+            signature = await asyncio.to_thread(self._normalizer.signature, second.html)
+            shown = shown_on_a_challenge(await self._sightings(signature, second))
+            new = tuple(s for s in shown if s.address not in set(candidates))
+            if new:
+                more = await self._validate(new)
+                observation = Observation(
+                    page_url, seen_again, new, more, started_again, read=False
+                )
+                await self._observe(on_observation, observation)
+                candidates += tuple(sighting.address for sighting in new)
         if block is not None or not second.ok:
             reason = block.reason if block is not None else second.reason
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNAVAILABLE,
-                contracts,
                 error=reason,
                 block=block,
                 candidates=candidates,
@@ -188,41 +210,55 @@ class PageChecker:
         new = tuple(s for s in again if s.address not in seen)
         if new:
             more = await self._validate(new)
-            await self._observe(
-                on_observation, Observation(page_url, seen_again, new, more, started_again)
+            observation = Observation(
+                page_url, seen_again, new, more, started_again, read=bool(confirmed)
             )
+            await self._observe(on_observation, observation)
             candidates += tuple(sighting.address for sighting in new)
-            contracts = self._unique(contracts, _contracts(more), key=lambda c: c.address)
         if not confirmed:
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNAVAILABLE,
-                contracts,
                 error="empty page",
                 candidates=candidates,
             )
         if self._detector.is_unstable(current, confirmed):
             reason = f"renders differ in size ({len(current)} vs {len(confirmed)} nodes)"
             return PageCheckOutcome(
-                page_url, PageStatus.UNSTABLE, contracts, error=reason, candidates=candidates
+                page_url,
+                PageStatus.UNSTABLE,
+                error=reason,
+                candidates=candidates,
+                captcha=captcha,
             )
         # The diffs are pure CPU work that can take seconds on pages with thousands of
         # look-alike nodes; a worker thread keeps the other monitors and Telegram alive.
         volatile = await asyncio.to_thread(self._detector.volatile_nodes, current, confirmed)
-        report = await asyncio.to_thread(
-            self._detector.compare, snapshot.signature, confirmed, page_url, ignore=volatile
+        # The snapshot keeps only confirmed content: a change that landed between the two
+        # renders (volatile now) is reported by the next round, if it lasts.
+        report, accepted = await asyncio.to_thread(
+            self._detector.diff, snapshot.signature, confirmed, page_url, ignore=volatile
         )
         noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
-        report, memory = noise.apply(
-            report, snapshot.noise, self._clock(), before=snapshot.signature, after=confirmed
+        report, memory = await asyncio.to_thread(
+            noise.apply,
+            report,
+            snapshot.noise,
+            self._clock(),
+            before=snapshot.signature,
+            after=accepted,
         )
-        self._snapshots.save(page_url, Snapshot(confirmed, memory, deep_seen))
+        self._snapshots.save(page_url, Snapshot(accepted, memory, deep_seen))
         if report.is_empty:
             return PageCheckOutcome(
-                page_url, PageStatus.UNCHANGED, contracts, candidates=candidates
+                page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
             )
         return PageCheckOutcome(
-            page_url, PageStatus.CHANGED, contracts, report=report, candidates=candidates
+            page_url,
+            PageStatus.CHANGED,
+            report=report,
+            candidates=candidates,
+            captcha=captcha,
         )
 
     async def _sightings(self, signature: Signature, result: FetchResult) -> tuple[Sighting, ...]:
@@ -252,11 +288,3 @@ class PageChecker:
             raise
         except Exception:
             log.exception("handling the addresses seen on %s failed", observation.page_url)
-
-    @staticmethod
-    def _unique(
-        first: tuple[T, ...], second: tuple[T, ...], *, key: Callable[[T], object]
-    ) -> tuple[T, ...]:
-        """``first`` followed by the items of ``second`` whose key is new."""
-        seen = {key(item) for item in first}
-        return first + tuple(item for item in second if key(item) not in seen)

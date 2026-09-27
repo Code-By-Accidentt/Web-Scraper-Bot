@@ -8,6 +8,7 @@ from scraper_bot.chains.address_extractor import (
     to_checksum_address,
 )
 from scraper_bot.models import Address, Chain
+from tests.conftest import extract
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -44,7 +45,7 @@ def test_solana_address_validation() -> None:
 
 def test_extractor_finds_both_chains_and_canonicalises() -> None:
     html = f"<p>token: {USDC_ETH.lower()}</p><span>{USDC_SOL}</span>"
-    assert AddressExtractor().extract(html) == [
+    assert extract(AddressExtractor(), html) == [
         Address(Chain.ETHEREUM, USDC_ETH),
         Address(Chain.SOLANA, USDC_SOL),
     ]
@@ -52,39 +53,31 @@ def test_extractor_finds_both_chains_and_canonicalises() -> None:
 
 def test_extractor_deduplicates_and_keeps_first_seen_order() -> None:
     html = f"{USDC_SOL} {USDC_ETH} {USDC_ETH.lower()} {USDC_SOL}"
-    assert AddressExtractor().extract(html) == [
-        Address(Chain.ETHEREUM, USDC_ETH),
+    assert extract(AddressExtractor(), html) == [
         Address(Chain.SOLANA, USDC_SOL),
+        Address(Chain.ETHEREUM, USDC_ETH),
     ]
 
 
 def test_extractor_ignores_fragments_glued_to_other_characters() -> None:
     html = f"abc{USDC_ETH} {USDC_ETH}def x{USDC_SOL} {USDC_SOL}y"
-    assert AddressExtractor().extract(html) == []
+    assert extract(AddressExtractor(), html) == []
 
 
 def test_extractor_ignores_hashes_and_long_runs() -> None:
     sha = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
     long_run = "A" * 50
     hex_hash = "0x" + "ab" * 32  # 64 hex chars: too long for an address
-    assert AddressExtractor().extract(f"{sha} {long_run} {hex_hash}") == []
+    assert extract(AddressExtractor(), f"{sha} {long_run} {hex_hash}") == []
 
 
 def test_extractor_can_be_limited_to_one_chain() -> None:
     html = f"{USDC_ETH} {USDC_SOL}"
-    assert AddressExtractor(chains=(Chain.SOLANA,)).extract(html) == [
+    assert extract(AddressExtractor(chains=(Chain.SOLANA,)), html) == [
         Address(Chain.SOLANA, USDC_SOL)
     ]
-    assert AddressExtractor(chains=(Chain.ETHEREUM,)).extract(html) == [
+    assert extract(AddressExtractor(chains=(Chain.ETHEREUM,)), html) == [
         Address(Chain.ETHEREUM, USDC_ETH)
-    ]
-
-
-def test_extract_many_deduplicates_across_texts() -> None:
-    texts = (f"<p>{USDC_ETH}</p>", f"var a = '{USDC_ETH.lower()}'; var b = '{USDC_SOL}';", "")
-    assert AddressExtractor().extract_many(texts) == [
-        Address(Chain.ETHEREUM, USDC_ETH),
-        Address(Chain.SOLANA, USDC_SOL),
     ]
 
 
@@ -95,25 +88,25 @@ SUI_COIN = f"{SUI_PKG}::usdc::USDC"
 def test_sui_coin_types_are_extracted_and_normalised() -> None:
     shouting = "0x" + SUI_PKG[2:].upper()
     text = f"CA: {shouting}::usdc::USDC, native 0x2::sui::SUI, book 0xdee9::clob::Pool"
-    assert AddressExtractor().extract(text) == [Address(Chain.SUI, SUI_COIN)]
+    assert extract(AddressExtractor(), text) == [Address(Chain.SUI, SUI_COIN)]
     generic = f"Coin<{SUI_COIN}> in 0x2::coin::Coin"
-    assert AddressExtractor().extract(generic) == [Address(Chain.SUI, SUI_COIN)]
+    assert extract(AddressExtractor(), generic) == [Address(Chain.SUI, SUI_COIN)]
 
 
 def test_bare_sui_ids_need_sui_context_and_yield_to_coin_types() -> None:
     tx_hash = "0x" + "9f" * 32
-    assert AddressExtractor().extract(f"Tx {tx_hash} confirmed on Etherscan") == []
-    assert AddressExtractor().extract(f"Package {tx_hash} is live on Sui") == [
+    assert extract(AddressExtractor(), f"Tx {tx_hash} confirmed on Etherscan") == []
+    assert extract(AddressExtractor(), f"Package {tx_hash} is live on Sui") == [
         Address(Chain.SUI, tx_hash)
     ]
     both = f"{SUI_PKG} publishes {SUI_COIN} (Suiscan)"
-    assert AddressExtractor().extract(both) == [Address(Chain.SUI, SUI_COIN)]
+    assert extract(AddressExtractor(), both) == [Address(Chain.SUI, SUI_COIN)]
 
 
 def test_hex_runs_inside_sui_ids_are_not_solana_candidates() -> None:
     sui_id = "0x0" + "a1b2c3d4e5f6a7b8c9d1e2f3a4b5c6d7e8f9a1b2c3d" + "0" + "ffeeddccbbaa9988776"
     assert len(sui_id) == 66
-    found = AddressExtractor().extract(f"Object {sui_id} on Sui")
+    found = extract(AddressExtractor(), f"Object {sui_id} on Sui")
     assert found == [Address(Chain.SUI, sui_id)]
 
 
@@ -126,8 +119,67 @@ def test_detect_chain_for_context_free_addresses() -> None:
 
 def test_evm_pattern_stops_before_a_sui_type_separator() -> None:
     forty = "0x" + "ab" * 20
-    found = AddressExtractor().extract(f"Type {forty}::meme::MEME on Sui")
+    found = extract(AddressExtractor(), f"Type {forty}::meme::MEME on Sui")
     assert found == [Address(Chain.SUI, "0x" + "0" * 24 + "ab" * 20 + "::meme::MEME")]
-    assert AddressExtractor().extract(f"Wallet {forty} here") == [
+    assert extract(AddressExtractor(), f"Wallet {forty} here") == [
         Address(Chain.ETHEREUM, to_checksum_address(forty))
     ]
+
+
+PUMP_MINT = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAtAAAAAiCAYAAAB2ku6nAAAEVkl"  # carries KGgoAAAA...EVk
+
+
+def solana(text: str) -> list[tuple[str, int]]:
+    return [
+        (address.value, offset)
+        for address, offset in AddressExtractor().locate(text)
+        if address.chain is Chain.SOLANA
+    ]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["data:image/png;base64,", "DATA:image/png;base64,", "data:image\\/png;base64,"],
+)
+def test_inline_files_are_not_read_for_addresses(prefix: str) -> None:
+    text = f'<img src="{prefix}{PNG}"> CA: {PUMP_MINT}'
+    # The payload is blanked, not removed: the real address keeps its offset.
+    assert solana(text) == [(PUMP_MINT, text.index(PUMP_MINT))]
+    fake = PNG[7:-1]
+    assert fake == "KGgoAAAANSUhEUgAAAtAAAAAiCAYAAAB2ku6nAAAEVk"
+    assert solana(fake) == [(fake, 0)]  # alone, the run would pass for a mint
+
+
+def test_single_case_runs_are_not_solana_keys() -> None:
+    ipfs = "/api/ipfs/content/bafkreiglu4otsngw67b7ism2friztguep4fxxud2vd32xm6hrve"
+    assert is_solana_address("u4otsngw67b7ism2friztguep4fxxud2vd32xm6hrve")  # decodes
+    assert solana(ipfs) == []
+    assert solana("ABCDEFGHJKLMNPQRSTUVWXYZ23456789ABCDEFGHJKL") == []
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://pump.fun/coin/{}",
+        "CA:{}",
+        "?address={}&x=1",
+        '{{"mint":"{}"}}',
+        "buy+{}+now",
+        "_{}_",
+        "адрес:{}",
+    ],
+)
+def test_a_mint_is_found_in_its_usual_company(template: str) -> None:
+    text = template.format(PUMP_MINT)
+    assert solana(text) == [(PUMP_MINT, text.index(PUMP_MINT))]
+
+
+@pytest.mark.parametrize("glued", ["0{}", "{}O", "l{}", "I{}", "x{}"])
+def test_a_run_glued_to_other_letters_is_a_fragment(glued: str) -> None:
+    assert solana(glued.format(PUMP_MINT)) == []
+
+
+def test_an_upper_case_data_uri_is_blanked_too() -> None:
+    text = f'<img src="data:image/png;BASE64,{PNG}"> CA: {PUMP_MINT}'
+    assert solana(text) == [(PUMP_MINT, text.index(PUMP_MINT))]

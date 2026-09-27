@@ -5,8 +5,8 @@ import pytest
 from dotenv import dotenv_values
 
 from scraper_bot import config as config_module
+from scraper_bot.chains.networks import EVM_CHAINS
 from scraper_bot.config import (
-    DEFAULT_EVM_NETWORKS,
     FALSE_WORDS,
     TRUE_WORDS,
     ChangedDefault,
@@ -90,7 +90,7 @@ def test_dotenv_file_is_read_but_environment_wins(tmp_path) -> None:
 
 
 def test_all_evm_endpoints_disabled_is_an_error(tmp_path) -> None:
-    disabled = {var: "" for _, var, _ in DEFAULT_EVM_NETWORKS}
+    disabled = {chain.env_var: "" for chain in EVM_CHAINS}
     disabled["ETH_RPC_URL"] = "   "  # blank counts as disabled too
     with pytest.raises(ConfigError, match="at least one EVM RPC endpoint"):
         make_settings(tmp_path, **disabled)
@@ -267,3 +267,30 @@ def test_env_example_values_are_the_code_defaults(tmp_path: Path) -> None:
     identity = {key: example[key] for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_IDS")}
     defaults = Settings.from_env({**identity, "DATA_DIR": data_dir}, dotenv_path=None)
     assert from_example == defaults
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("ARC_RPC_URL", "https://arc-rpc.publicnode.com:8545x", "ARC_RPC_URL is not a valid URL"),
+        ("BASE_RPC_URL", "base-rpc.publicnode.com", "BASE_RPC_URL must be an http"),
+        ("SOLANA_RPC_URL", "ftp://solana.example", "SOLANA_RPC_URL must be an http"),
+        ("SUI_RPC_URL", "https://", "SUI_RPC_URL must be an http"),
+    ],
+)
+def test_a_typo_in_an_rpc_url_stops_the_start(
+    tmp_path: Path, key: str, value: str, message: str
+) -> None:
+    with pytest.raises(ConfigError, match=message):
+        make_settings(tmp_path, **{key: value})
+
+
+def test_a_wrong_rpc_url_is_named_without_its_secret_parts(tmp_path: Path) -> None:
+    secret = "k3y-1234567890"
+    with pytest.raises(ConfigError) as caught:
+        make_settings(tmp_path, ETH_RPC_URL=f"https://eth.example.com:85x/v2/{secret}")
+    assert "ETH_RPC_URL" in str(caught.value) and secret not in str(caught.value)
+    assert "'https://eth.example.com:85x/…'" in str(caught.value)
+    with pytest.raises(ConfigError) as caught:
+        make_settings(tmp_path, ETH_RPC_URL=f"ftp://user:{secret}@eth.example.com/x")
+    assert secret not in str(caught.value) and "'ftp://…@eth.example.com/…'" in str(caught.value)

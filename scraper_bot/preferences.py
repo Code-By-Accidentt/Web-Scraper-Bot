@@ -17,7 +17,6 @@ from typing import Any, Protocol
 
 from scraper_bot.config import FALSE_WORDS, TRUE_WORDS, Settings
 from scraper_bot.storage import atomic_write_text
-from scraper_bot.telegram.markup import code, escape
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +81,13 @@ class PreferenceSpec:
     unit: str = ""
     scale: float = 1.0  # base value = user value * scale (hours -> seconds = 3600)
     caution: Caution | None = None  # returns a warning for a risky value
+
+    def format(self, value: Any) -> str:
+        """``value`` (in the user's unit) as people read it: ``on``, ``4 s``, ``24 h``."""
+        if self.kind == "bool":
+            return "on" if value else "off"
+        text = f"{value:g}" if self.kind == "float" else str(value)
+        return f"{text} {self.unit}".strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,8 +440,9 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "turbo",
         "float",
         "Longest pause after a suspected block",
-        "While a site answers with 403/429/503 or challenge pages the pause between rounds "
-        "doubles every round, up to this value.",
+        "While a site answers with 401/403/407/429/503, challenge pages or connection "
+        "resets, the pause between rounds doubles every round, up to this value (a longer "
+        "Retry-After from the site is honoured).",
         10,
         3600,
         "s",
@@ -574,45 +581,6 @@ class Preferences:
 
     def save(self) -> None:
         atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
-
-    # ── presentation ────────────────────────────────────────────────────────
-    def format_value(self, spec: PreferenceSpec, value: Any) -> str:
-        if spec.kind == "bool":
-            return "on" if value else "off"
-        text = f"{value:g}" if spec.kind == "float" else str(value)
-        return f"{text} {spec.unit}".strip()
-
-    def overview(self) -> str:
-        lines = ["⚙️ Settings (live values; * = changed from .env)"]
-        for section, title in SECTIONS.items():
-            lines.append(f"\n{title}")
-            for spec in PREFERENCES:
-                if spec.section != section:
-                    continue
-                mark = "*" if self.is_overridden(spec) else ""
-                value = escape(self.format_value(spec, self.current(spec)))
-                lines.append(f"• {code(spec.key)} = {value}{mark}")
-        lines.append(
-            f"\n{code('/settings <key>')} explains one setting, "
-            f"{code('/set <key> <value>')} changes it, "
-            f"{code('/settings reset <key|all>')} restores the .env value."
-        )
-        return "\n".join(lines)
-
-    def describe(self, key: str) -> str:
-        spec = self.spec(key)
-        lines = [f"⚙️ {code(spec.key)}: {escape(spec.label)}", escape(spec.description)]
-        if spec.kind == "bool":
-            lines.append("Values: on / off")
-        else:
-            unit = f" {spec.unit}" if spec.unit else ""
-            lines.append(f"Range: {spec.minimum:g} to {spec.maximum:g}{unit}")
-        lines.append(f"Current: {escape(self.format_value(spec, self.current(spec)))}")
-        lines.append(f"Default from .env: {escape(self.format_value(spec, self.default(spec)))}")
-        if spec.caution is not None:
-            lines.append("Risky values ask you to repeat the command with 'confirm'.")
-        lines.append(f"Change: {code(f'/set {spec.key} <value>')}")
-        return "\n".join(lines)
 
     @staticmethod
     def _parse(spec: PreferenceSpec, raw: str) -> Any:

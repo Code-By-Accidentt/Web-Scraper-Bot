@@ -28,7 +28,7 @@ from scraper_bot.chains.enrichment import TokenEnricher
 from scraper_bot.chains.stoplist import StopList
 from scraper_bot.chains.warmup import ConnectionWarmer
 from scraper_bot.config import ChangedDefault, ConfigError, Settings
-from scraper_bot.models import SiteState
+from scraper_bot.models import Chain, SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.pending import PendingWatch
@@ -64,7 +64,15 @@ HEARTBEAT_FILE = "heartbeat"
 PENDING_FILE = "pending.json"  # addresses watched until they become a token
 KEEPALIVE = 60.0  # seconds an idle HTTP connection is kept for reuse
 IGNORE_FILE = "ignore.txt"  # the operator's own stop-list, one address per line
+NETWORKS_FILE = "evm_networks.txt"  # the EVM networks the caches were built with
 OUTDATED_NOTICE_FILE = "outdated_defaults.txt"  # the old .env values last reported
+SANDBOX_NOTICE_FILE = "no_sandbox_notice.txt"  # the chat heard that Chromium runs unsandboxed
+SANDBOX_HINT = (
+    "Pages are then isolated only by the bot's own user account. The sandbox does not start "
+    "as root or where user namespaces are off (containers, AppArmor on Ubuntu 23.10+): run "
+    "the bot as its own non-root user; Google Chrome (BROWSER_CHANNEL=chrome) brings a "
+    "setuid sandbox helper that may work there."
+)
 SHUTDOWN_STEP = 8.0  # seconds each shutdown step that may talk to Telegram gets
 RPC_STATUS_AFTER = 60.0  # /status names an RPC endpoint failing at least this long
 
@@ -104,12 +112,17 @@ class Runtime:
     validator: ContractValidator
     warmer: ConnectionWarmer
     pending: PendingWatch
+    # Called once the start went through: remembers the EVM networks the caches now match.
+    started_hook: Callable[[], None] | None = None
     _pending_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def start(self) -> None:
         self.pending.load()
         await self.manager.start()
         self._pending_task = asyncio.create_task(self.pending.run(), name="pending-watch")
+        self._pending_task.add_done_callback(_log_crash)
+        if self.started_hook is not None:
+            self.started_hook()
         sites = self.manager.sites()
         running = sum(1 for site in sites if self.manager.is_running(site.url))
         await self.notifier.started(__version__, len(sites), running)
@@ -188,7 +201,19 @@ def build_runtime(
     """
     cfg = settings
     legacy = LegacyStateImporter(legacy_dir)
+    networks_file = cfg.data_dir / NETWORKS_FILE
+    networks_known = networks_file.is_file()
+    current = tuple(net.name for net in cfg.evm_networks)
+    added = added_networks(networks_file, current, existing_data=_has_data(cfg))
     cache = _load_address_cache(cfg, prefs, legacy)
+    if added:
+        # A rejection made without these networks may be a token on one of them.
+        forgotten = cache.forget_rejected(Chain.ETHEREUM)
+        log.info(
+            "EVM network(s) added: %s; %d cached EVM rejection(s) forgotten",
+            ", ".join(sorted(added)),
+            forgotten,
+        )
     stoplist = StopList.load(cfg.data_dir / IGNORE_FILE)
     validator = ContractValidator(
         EvmContractValidator(
@@ -199,7 +224,7 @@ def build_runtime(
         sui=SuiCoinValidator(http, cfg.sui_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
         max_concurrent=cfg.max_concurrent_rpc,
         retry_delay=cfg.rpc_retry_delay,
-        notifier=notifier,
+        on_stuck=notifier.rpc_endpoints_stuck,
     )
     snapshots = SnapshotStore(cfg.data_dir / "snapshots")
     extractor = AddressExtractor(stoplist=stoplist)
@@ -217,7 +242,8 @@ def build_runtime(
     )
     prober = HttpProber(probe_http or http)
     deriver = SubUrlDeriver(cfg.sub_url_patterns)
-    registry = AlertRegistry()  # one token, one alert: shared by every site and mode
+    # One token, one alert, shared by every site and mode; a claim records it as known.
+    registry = AlertRegistry(cache)
     # Addresses that may still become a token; the manager (built below) says which
     # sites are paused.
     pending = PendingWatch(
@@ -228,9 +254,19 @@ def build_runtime(
         notifier=notifier,
         path=cfg.data_dir / PENDING_FILE,
         turbo_interval=lambda: prefs.turbo_recheck_interval,
+        # A site only in turbo (never added) keeps its addresses watched after the session:
+        # the launch may come later. /remove ends a site's session and forgets its addresses.
         is_paused=lambda url: manager.is_paused(url),
         sleep=sleep or asyncio.sleep,
+        health=validator.record,
+        new_networks=added,
+        # A network switched off and on again: its absences from before are stale. (On the
+        # first start with no networks file every network counts as new, but the absences
+        # 2.1 saw on its networks are real.)
+        stale_absences=added if networks_known else frozenset(),
     )
+    # A token Arc or Robinhood Chain reports after its verdict is confirmed at the next tick.
+    validator.on_late_token = pending.hurry
 
     def build_monitor(
         site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
@@ -322,9 +358,45 @@ def build_runtime(
         heartbeat=Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval),
         notifier=notifier,
         validator=validator,
-        warmer=ConnectionWarmer(http, cfg),
+        warmer=ConnectionWarmer(http, cfg, record=validator.record),
         pending=pending,
+        started_hook=lambda: remember_networks(networks_file, current),
     )
+
+
+def added_networks(path: Path, current: Sequence[str], *, existing_data: bool) -> frozenset[str]:
+    """EVM networks the saved verdicts were not made with.
+
+    Without the file (the first start of this version) every network counts as new when
+    there is data from an earlier run, and none on a fresh install.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return frozenset(current) if existing_data else frozenset()
+    except (OSError, ValueError):
+        return frozenset(current)
+    previous = {line.strip() for line in text.splitlines() if line.strip()}
+    return frozenset(current) - previous
+
+
+def remember_networks(path: Path, current: Sequence[str]) -> None:
+    with contextlib.suppress(OSError):
+        atomic_write_text(path, "".join(f"{name}\n" for name in sorted(current)))
+
+
+def _has_data(settings: Settings) -> bool:
+    data = settings.data_dir
+    return any(
+        (data / name).is_file()
+        for name in ("known_contracts.txt", "rejected_addresses.txt", PENDING_FILE)
+    )
+
+
+def _log_crash(task: asyncio.Task[None]) -> None:
+    """A background loop that should never end did: make it visible in the log."""
+    if not task.cancelled() and task.exception() is not None:
+        log.error("%s stopped: %r", task.get_name(), task.exception(), exc_info=task.exception())
 
 
 def _load_address_cache(
@@ -396,6 +468,9 @@ class Application:
             ) and await notifier.outdated_defaults(cfg.outdated_defaults):
                 remember_outdated_notice(notice, cfg.outdated_defaults)
             fetcher = PlaywrightFetcher(cfg, tuning=self._prefs)
+            fetcher.on_sandbox_lost = lambda error: notifier.report_later(
+                "sandbox", "Chromium runs without its sandbox", error, hint=SANDBOX_HINT
+            )
             try:
                 await fetcher.start()
             except BrowserUnavailable as exc:
@@ -406,6 +481,7 @@ class Application:
                     hint="Fix the browser installation and start the bot again.",
                 )
                 raise
+            await tell_about_sandbox(notifier, fetcher, cfg.data_dir / SANDBOX_NOTICE_FILE)
             try:
                 runtime = build_runtime(
                     cfg,
@@ -444,6 +520,32 @@ def _http2(settings: Settings) -> bool:
         )
         return False
     return True
+
+
+class SandboxState(Protocol):
+    @property
+    def sandboxed(self) -> bool: ...
+
+    @property
+    def sandbox_error(self) -> str | None: ...
+
+
+async def tell_about_sandbox(notifier: Notifier, browser: SandboxState, marker: Path) -> None:
+    """One 🛑 when Chromium had to start without its sandbox, again only after it worked.
+
+    ``marker`` notes that the chat heard it; a start with the sandbox removes it.
+    """
+    if browser.sandboxed:
+        with contextlib.suppress(OSError):
+            marker.unlink(missing_ok=True)
+        return
+    if browser.sandbox_error is None or marker.is_file():
+        return  # switched off in BROWSER_ARGS on purpose, or already reported
+    if await notifier.problem(
+        "sandbox", "Chromium runs without its sandbox", browser.sandbox_error, hint=SANDBOX_HINT
+    ):
+        with contextlib.suppress(OSError):
+            atomic_write_text(marker, browser.sandbox_error + "\n")
 
 
 def outdated_notice_due(path: Path, changes: Sequence[ChangedDefault]) -> bool:

@@ -5,18 +5,15 @@ from pathlib import Path
 import httpx
 import pytest
 
+from scraper_bot.chains.networks import EVM_CHAINS
 from scraper_bot.chains.warmup import ConnectionWarmer
 from tests.conftest import make_settings
 
 ENV = {
+    **{chain.env_var: "" for chain in EVM_CHAINS},  # every network off but the three below
     "ETH_RPC_URL": "https://eth.rpc",
     "BASE_RPC_URL": "https://base.rpc",
     "ARB_RPC_URL": "https://arb.rpc",
-    "OPT_RPC_URL": "",
-    "BSC_RPC_URL": "",
-    "FANTOM_RPC_URL": "",
-    "SONIC_RPC_URL": "",
-    "AVAX_RPC_URL": "",
     "SOLANA_RPC_URL": "https://sol.rpc",
     "SUI_RPC_URL": "https://sui.rpc",
 }
@@ -65,3 +62,23 @@ async def test_every_endpoint_is_pinged_each_interval(tmp_path: Path) -> None:
         ("sui.rpc", "sui_getChainIdentifier"),
     ]
     assert len(seen) == 10  # five endpoints, two rounds, no retries
+
+
+async def test_only_failures_feed_the_endpoint_health(tmp_path: Path) -> None:
+    seen: list[tuple[str, str]] = []
+    recorded: list[tuple[str, bool]] = []
+
+    async def stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    async with httpx.AsyncClient(transport=node({"sol.rpc": None}, seen)) as http:
+        warmer = ConnectionWarmer(
+            http,
+            make_settings(tmp_path, **ENV),
+            sleep=stop,
+            record=lambda name, error: recorded.append((name, error is None)),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await warmer.run()
+    # A ping that works says nothing about the heavier calls of a check: not recorded.
+    assert recorded == [("Solana", False)]

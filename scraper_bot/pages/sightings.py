@@ -12,8 +12,12 @@ import re
 from collections.abc import Iterable, Sequence
 from urllib.parse import unquote
 
-from scraper_bot.chains.address_extractor import SUI_CONTEXT_RE, AddressExtractor, sui_package
-from scraper_bot.models import Address, Chain, Sighting, SightingSource, Signature
+from scraper_bot.chains.address_extractor import (
+    SUI_CONTEXT_RE,
+    AddressExtractor,
+    drop_coin_packages,
+)
+from scraper_bot.models import Address, Sighting, SightingSource, Signature
 
 CONTEXT_CHARS = 60
 HINT_WINDOW = 32  # characters before the address that decide the hint (as in X Scraper)
@@ -41,6 +45,28 @@ _RANK = {
 }
 
 
+# Fields a captcha fills with a fresh random token on every render: never an address.
+_CAPTCHA_FIELDS = frozenset({"g-recaptcha-response", "h-captcha-response", "cf-turnstile-response"})
+_CAPTCHA_FIELD_RE = re.compile(
+    r"<(textarea|input)\b[^>]{0,300}?\bname=[\"'](?:g-recaptcha|h-captcha|cf-turnstile)-response"
+    r"[\"'][^>]{0,4000}?>(?:[^<]{0,4000}</textarea>)?",
+    re.IGNORECASE,
+)
+
+
+def shown_on_a_challenge(sightings: Iterable[Sighting]) -> list[Sighting]:
+    """The addresses a page that looks like a challenge shows as its own content.
+
+    Its text, and links that name a token; not its source or form values, where challenge
+    scripts keep fresh random tokens, some of them shaped like a Solana key.
+    """
+    return [
+        s
+        for s in sightings
+        if s.source is SightingSource.TEXT or (s.source is SightingSource.LINK and s.hinted)
+    ]
+
+
 def find_sightings(
     extractor: AddressExtractor,
     signature: Signature,
@@ -59,9 +85,13 @@ def find_sightings(
     # Bare 64-hex ids count as Sui only where the text itself talks about Sui: the page
     # decides for its elements and source, each loaded script for itself.
     sui_context = SUI_CONTEXT_RE.search(html) is not None
+    if "-response" in html:
+        html = _CAPTCHA_FIELD_RE.sub(lambda match: " " * len(match.group(0)), html)
     best: dict[Address, Sighting] = {}
     previous = ""
     for node in signature:
+        if any(name == "name" and value in _CAPTCHA_FIELDS for name, value in node.attrs):
+            continue
         for address, start in extractor.locate(node.text, sui_context=sui_context):
             _offer(best, _sighting(address, SightingSource.TEXT, f"{previous} {node.text[:start]}"))
         for name, value in node.attrs:
@@ -75,7 +105,7 @@ def find_sightings(
     # Frames and shadow roots (``dom``, also among ``extras``) are page content, not scripts.
     _offer_raw(best, extractor, dom, SightingSource.SOURCE, None)
     _offer_raw(best, extractor, extras, SightingSource.SCRIPT, None)
-    return _without_packages_of_coins(list(best.values()))
+    return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
 
 
 def hint_score(before: str) -> int:
@@ -112,21 +142,3 @@ def _offer(best: dict[Address, Sighting], sighting: Sighting) -> None:
 
 def _rank(sighting: Sighting) -> tuple[bool, int]:
     return not sighting.hinted, _RANK[sighting.source]
-
-
-def _without_packages_of_coins(sightings: list[Sighting]) -> list[Sighting]:
-    """A page naming a Sui coin type also shows its package: keep the coin only."""
-    coins = {
-        sui_package(s.address.value)
-        for s in sightings
-        if s.address.chain is Chain.SUI and "::" in s.address.value
-    }
-    return [
-        s
-        for s in sightings
-        if not (
-            s.address.chain is Chain.SUI
-            and "::" not in s.address.value
-            and s.address.value in coins
-        )
-    ]

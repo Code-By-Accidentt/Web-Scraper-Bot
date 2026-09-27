@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 _HOST_LABEL_RE = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class InvalidUrlError(ValueError):
@@ -18,8 +19,10 @@ class InvalidUrlError(ValueError):
 def normalize_url(raw: str) -> str:
     """Canonical form of ``raw``, or :class:`InvalidUrlError`.
 
-    https is assumed, scheme and host are lower-cased, the fragment and a bare ``/``
-    path are dropped, so ``Example.com`` and ``https://example.com/`` share one key.
+    https is assumed, scheme and host are lower-cased, a default port, the fragment and
+    a bare ``/`` path are dropped, so ``Example.com`` and ``https://example.com:443/``
+    share one key. A fragment that is a route of a single-page app (``#/presale``,
+    ``#!/presale``) names another view and is kept.
     """
     text = raw.strip()
     if not text or any(ch.isspace() for ch in text):
@@ -39,9 +42,14 @@ def normalize_url(raw: str) -> str:
         raise InvalidUrlError(f"{raw!r} has an invalid host name")
     if len(labels) < 2 and host != "localhost":
         raise InvalidUrlError(f"{raw!r} has an invalid host name")
-    netloc = f"{host}:{port}" if port else host
+    netloc = f"{host}:{port}" if port and port != _DEFAULT_PORTS[parts.scheme] else host
     path = parts.path if parts.path not in {"", "/"} else ""
-    return urlunsplit((parts.scheme, netloc, path, parts.query, ""))
+    route = parts.fragment if parts.fragment.startswith(("/", "!/")) else ""
+    if route in {"/", "!/"}:
+        route = ""  # the root view: the site itself
+    if route and not path:
+        path = "/"  # https://app.io/#/presale, the form a browser shows
+    return urlunsplit((parts.scheme, netloc, path, parts.query, route))
 
 
 def registrable_domain(url: str) -> str:

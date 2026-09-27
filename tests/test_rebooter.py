@@ -203,16 +203,24 @@ def test_terminate_without_a_process_is_a_noop(tmp_path: Path) -> None:
 
 # ── _find_running / _is_our_script ──────────────────────────────────────────
 class FakeProcess:
-    def __init__(self, pid: int, cmdline: list[str] | None, *, denied: bool = False) -> None:
+    def __init__(
+        self,
+        pid: int,
+        cmdline: list[str] | None,
+        *,
+        denied: bool = False,
+        cwd: str | None = None,
+    ) -> None:
         self.pid = pid
         self._cmdline = cmdline
         self._denied = denied
+        self._cwd = cwd
 
     @property
     def info(self) -> dict[str, Any]:
         if self._denied:
             raise psutil.AccessDenied(pid=self.pid)
-        return {"pid": self.pid, "cmdline": self._cmdline}
+        return {"pid": self.pid, "cmdline": self._cmdline, "cwd": self._cwd}
 
 
 def patch_process_iter(monkeypatch: pytest.MonkeyPatch, processes: list[FakeProcess]) -> None:
@@ -223,15 +231,48 @@ def patch_process_iter(monkeypatch: pytest.MonkeyPatch, processes: list[FakeProc
     monkeypatch.setattr(rebooter.psutil, "process_iter", process_iter)
 
 
-def test_is_our_script_compares_resolved_paths(tmp_path: Path) -> None:
+def test_the_bot_is_recognised_by_its_command_line(tmp_path: Path) -> None:
     supervisor = make(tmp_path)
-    script = tmp_path / "main.py"
-    assert supervisor._is_our_script(str(script)) is True
-    assert supervisor._is_our_script(str(tmp_path / "sub" / ".." / "main.py")) is True
-    assert supervisor._is_our_script(str(tmp_path / "other.py")) is False
-    assert supervisor._is_our_script("main.py") is False  # relative to some other cwd
-    assert supervisor._is_our_script("") is False
-    assert supervisor._is_our_script("-c") is False
+    script = str(tmp_path / "main.py")
+    here, elsewhere = str(tmp_path), str(tmp_path / "elsewhere")
+    bot = supervisor.is_our_bot
+    assert bot([sys.executable, script], None)
+    assert bot(["python3", "-u", str(tmp_path / "sub" / ".." / "main.py")], None)
+    assert bot(["python", "main.py"], here)  # relative to the process's working directory
+    assert not bot(["python", "main.py"], elsewhere)
+    assert bot(["python3.12", "-m", "scraper_bot"], here)  # the documented other way
+    assert not bot(["python3.12", "-m", "scraper_bot"], elsewhere)
+    assert not bot(["python", "-m", "pytest"], here)
+    assert not bot(["vim", script], here)  # an editor with main.py open
+    assert not bot(["python", "rebooter.py", "--script", script], here)  # another supervisor
+    assert not bot(["python", str(tmp_path / "other.py")], None)
+    assert not bot([], here) and not bot(["python"], here)
+    # Interpreter options with a value of their own come before the script.
+    assert bot(["python", "-X", "utf8", "main.py"], here)
+    assert bot(["python", "-Xutf8", "-W", "ignore", "main.py"], here)
+    assert bot(["python", "-X", "utf8", "-m", "scraper_bot"], here)
+    assert bot(["python", "-mscraper_bot"], here)
+    assert bot(["python", "-um", "scraper_bot"], here)
+    assert not bot(["python", "-Wmodule", "other.py"], here)
+    assert not bot(["python", "-c", "import main"], here)
+
+
+def test_a_bot_failing_at_start_is_restarted_after_growing_pauses(tmp_path: Path) -> None:
+    supervisor = make(tmp_path)
+    assert [supervisor.restart_pause(3, 1) for _ in range(3)] == [5.0, 30.0, 60.0]
+    assert supervisor.restart_pause(3600, 1) == 0.0  # it ran for an hour: at once, and reset
+    assert supervisor.restart_pause(3, 1) == 5.0
+    # A missing browser or a broken .env will not heal itself: a minute, then longer.
+    fresh = make(tmp_path)
+    assert [fresh.restart_pause(2, 3) for _ in range(7)] == [
+        60.0,
+        120.0,
+        300.0,
+        600.0,
+        900.0,
+        900.0,
+        900.0,
+    ]
 
 
 def test_find_running_adopts_the_bot_and_skips_itself(
@@ -239,12 +280,14 @@ def test_find_running_adopts_the_bot_and_skips_itself(
 ) -> None:
     supervisor = make(tmp_path)
     script = str(tmp_path / "main.py")
-    me = psutil.Process().pid
+    me = psutil.Process()
+    parent = me.parents()[0].pid if me.parents() else 1
     bot = FakeProcess(5001, [sys.executable, str(tmp_path / "sub" / ".." / "main.py")])
     patch_process_iter(
         monkeypatch,
         [
-            FakeProcess(me, [sys.executable, script]),  # the supervisor itself
+            FakeProcess(me.pid, [sys.executable, script]),  # the supervisor itself
+            FakeProcess(parent, [sys.executable, script]),  # its launcher (a venv stub)
             FakeProcess(5000, None),  # kernel thread: no cmdline
             FakeProcess(5002, ["python", "other.py"], denied=True),  # info raises
             FakeProcess(5003, ["python", str(tmp_path / "other.py")]),

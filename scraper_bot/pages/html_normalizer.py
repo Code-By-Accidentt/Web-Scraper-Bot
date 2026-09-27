@@ -62,7 +62,11 @@ _PARSERS = threading.local()
 def _parser() -> lxml_html.HTMLParser:
     parser = getattr(_PARSERS, "parser", None)
     if parser is None:
-        parser = lxml_html.HTMLParser(encoding="utf-8", remove_comments=True, remove_pis=True)
+        # huge_tree: without it libxml2 stops at a text node over 10 MB (an inline bundle)
+        # and silently drops the rest of the page.
+        parser = lxml_html.HTMLParser(
+            encoding="utf-8", remove_comments=True, remove_pis=True, huge_tree=True
+        )
         _PARSERS.parser = parser
     return parser
 
@@ -141,7 +145,10 @@ class HtmlNormalizer:
     def _strip_tracking(url: str) -> str:
         if "?" not in url:
             return url
-        parts = urlsplit(url)
+        try:
+            parts = urlsplit(url)
+        except ValueError:  # "https://[YOUR_HOST]/x?y": not a URL, just text to compare
+            return url
         kept = [
             (name, val)
             for name, val in parse_qsl(parts.query, keep_blank_values=True)

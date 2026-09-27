@@ -30,6 +30,16 @@ def format_utc_offset(timestamp: float) -> str:
     return f"UTC{sign}{hours:02d}:{rest:02d}"
 
 
+def format_schedule(timestamp: float, now: float) -> str:
+    """``2026-09-28 15:30 (UTC+03:00, in 3h 12m)``.
+
+    The zone is that of the machine the bot runs on: shown, so that a server in UTC does
+    not fire a session planned in local time hours off unnoticed.
+    """
+    zone = format_utc_offset(timestamp)
+    return f"{format_clock(timestamp)} ({zone}, in {format_duration(timestamp - now)})"
+
+
 def format_duration(seconds: float) -> str:
     """``5s``, ``1m 5s``, ``1h 2m`` or ``1d 1h``; negative values read as ``0s``."""
     seconds = max(int(seconds), 0)

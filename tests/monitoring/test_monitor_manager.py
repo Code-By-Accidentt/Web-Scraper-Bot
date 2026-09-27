@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -124,8 +125,8 @@ async def test_pause_and_resume(tmp_path: Path) -> None:
         assert h.state.load()[ROOT].paused is True
         with pytest.raises(SiteAlreadyPaused):
             await h.manager.pause_site(ROOT)
-        resumed = await h.manager.resume_site(ROOT)
-        assert not resumed.paused and h.manager.is_running(ROOT)
+        resumed, restarted = await h.manager.resume_site(ROOT)
+        assert not resumed.paused and not restarted and h.manager.is_running(ROOT)
         assert len(h.monitors) == 2
         with pytest.raises(SiteNotTracked):
             await h.manager.pause_site("https://unknown.io")
@@ -258,8 +259,8 @@ async def test_auto_pause_from_inside_the_monitor_task(tmp_path: Path) -> None:
         assert h.state.load()[ROOT].paused is True
         assert h.notifier.problems == []  # a normal end is not a crash
         assert len(h.monitors) == 1  # and a paused site gets no restart
-        resumed = await h.manager.resume_site(ROOT)
-        assert not resumed.paused and h.manager.is_running(ROOT)
+        resumed, restarted = await h.manager.resume_site(ROOT)
+        assert not resumed.paused and not restarted and h.manager.is_running(ROOT)
         assert len(h.monitors) == 2
     finally:
         await h.manager.shutdown()
@@ -370,5 +371,157 @@ async def test_pause_state_and_removal_are_reported_to_the_pending_watch(tmp_pat
         assert h.manager.is_paused(ROOT) and not h.manager.is_paused("https://other.io")
         await h.manager.remove_site(ROOT)
         assert removed == [ROOT]  # its watched addresses are forgotten with it
+    finally:
+        await h.manager.shutdown()
+
+
+class SwallowingMonitor(StubMonitor):
+    """Ends normally when stopped, the way asyncio.wait_for on Python 3.11 lets it."""
+
+    async def run(self) -> None:
+        self.started = True
+        try:
+            await self._stop.wait()
+        except asyncio.CancelledError:
+            return
+
+
+async def test_a_monitor_ending_normally_during_shutdown_is_not_restarted(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path, kind=SwallowingMonitor)
+    await h.manager.start()
+    await h.manager.add_site(ROOT)
+    await h.manager.shutdown()
+    await asyncio.sleep(0.05)
+    assert len(h.monitors) == 1 and not h.manager.is_running(ROOT)
+
+
+async def test_a_crash_restart_timer_does_not_fire_after_shutdown(tmp_path: Path) -> None:
+    h = Harness(tmp_path, restart_delay=0.05, crash_first=True)
+    await h.manager.start()
+    await h.manager.add_site(ROOT)
+    await asyncio.sleep(0.01)  # the first monitor crashed; its restart is 0.05 s away
+    await h.manager.shutdown()
+    await asyncio.sleep(0.1)
+    assert len(h.monitors) == 1 and not h.manager.is_running(ROOT)
+
+
+async def test_a_damaged_state_file_keeps_the_snapshots_and_is_reported(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.snapshots.save(ROOT, Snapshot(SIGNATURE))
+    (tmp_path / "state.json").write_text("{broken", encoding="utf-8")
+    await h.manager.start()
+    try:
+        assert h.manager.sites() == []
+        assert h.snapshots.load(ROOT) is not None  # not pruned: the site may come back
+        [(key, title, detail, _hint)] = h.notifier.problems
+        assert key == "state" and "damaged" in title and "broken-" in detail
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_a_failed_save_is_reported_and_the_command_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = Harness(tmp_path)
+    await h.manager.start()
+
+    def full_disk(_sites: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(h.state, "save", full_disk)
+    try:
+        site = await h.manager.add_site(ROOT)
+        assert site.url == ROOT and h.manager.is_running(ROOT)
+        assert [problem[0] for problem in h.notifier.problems] == ["state-save"]
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_a_site_stored_with_a_default_port_is_still_found(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    legacy = "https://example.com:443"  # how 2.1 stored "/add example.com:443"
+    h.state.save({legacy: SiteState(legacy, paused=True)})
+    await h.manager.start()
+    try:
+        assert [site.url for site in h.manager.sites()] == [ROOT]  # stored anew at load
+        assert list(StateStore(tmp_path / "state.json").load()) == [ROOT]
+        assert (await h.manager.remove_site("example.com:443")).url == ROOT
+        assert h.manager.sites() == []
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_a_site_added_with_a_route_before_2_1_1_is_found_by_it(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.state.save({"https://app.io": SiteState("https://app.io", paused=True)})
+    await h.manager.start()
+    try:
+        assert (await h.manager.remove_site("https://app.io/#/presale")).url == "https://app.io"
+        await h.manager.add_site("https://app.io/v2/")
+        assert (await h.manager.remove_site("app.io/v2/#/x")).url == "https://app.io/v2/"
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_removing_a_site_keeps_the_snapshots_another_site_renders(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    await h.manager.start()
+    try:
+        await h.manager.add_site(ROOT)
+        www = (await h.manager.add_site("www.example.com")).url
+        assert h.manager.sharing_pages(ROOT) == [www]
+        shared = "https://app.example.com"
+        for page in (ROOT, shared, www):
+            h.snapshots.save(page, Snapshot(SIGNATURE))
+        await h.manager.remove_site(www)
+        assert h.snapshots.load(www) is None
+        assert h.snapshots.load(shared) is not None  # still rendered for example.com
+        assert h.manager.sharing_pages(ROOT) == []
+    finally:
+        await h.manager.shutdown()
+
+
+async def test_after_a_damaged_state_file_the_next_start_still_has_the_readable_sites(
+    tmp_path: Path,
+) -> None:
+    good = SiteState(ROOT).to_dict()
+    (tmp_path / "state.json").write_text(
+        json.dumps({"sites": {ROOT: good, "https://b.io": {"added_at": "abc"}}}), encoding="utf-8"
+    )
+    (tmp_path / "monitored_sites.txt").write_text("https://old-v1.io\n", encoding="utf-8")
+    first = Harness(tmp_path, legacy=LegacyStateImporter(tmp_path))
+    first.snapshots.save("https://b.io", Snapshot(SIGNATURE))
+    await first.manager.start()
+    await first.manager.shutdown()
+    second = Harness(tmp_path, legacy=LegacyStateImporter(tmp_path))
+    await second.manager.start()
+    try:
+        assert [site.url for site in second.manager.sites()] == [ROOT]  # no v1 import either
+        assert second.snapshots.load("https://b.io") is not None  # kept while the copy waits
+        assert second.notifier.problems == []  # reported once, at the first start
+    finally:
+        await second.manager.shutdown()
+
+
+async def test_a_damaged_state_file_that_cannot_be_set_aside_is_not_saved_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scraper_bot.storage as storage_module
+
+    def refuse(*_args: Any) -> None:
+        raise PermissionError("locked by another program")
+
+    monkeypatch.setattr(storage_module.os, "replace", refuse)
+    monkeypatch.setattr(storage_module.shutil, "copyfile", refuse)
+    (tmp_path / "state.json").write_text("{broken", encoding="utf-8")
+    h = Harness(tmp_path)
+    await h.manager.start()
+    try:
+        await h.manager.add_site("https://new.io")
+        assert (tmp_path / "state.json").read_text(encoding="utf-8") == "{broken"
+        [(_, _, detail, _)] = h.notifier.problems
+        assert "could not be moved aside" in detail
     finally:
         await h.manager.shutdown()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
@@ -29,13 +30,21 @@ log = logging.getLogger(__name__)
 
 STATE_VERSION = 1
 SNAPSHOT_VERSION = 2
+_SWEEP_EVERY = 1000  # rejections added between two sweeps of the expired ones
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` so that readers never observe a partial file."""
+    """Write ``text`` to ``path`` so that readers never observe a partial file.
+
+    The data reaches the disk before the rename, so a power cut leaves the old file or
+    the new one, never an empty one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp, path)
 
 
@@ -44,24 +53,60 @@ class StateStore:
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        # Set when load() found the file damaged: (what was wrong, where it was moved).
+        self.broken: tuple[str, Path | None] | None = None
 
     def exists(self) -> bool:
         return self._path.is_file()
 
+    def broken_copies(self) -> list[Path]:
+        """Damaged files moved aside at earlier starts and not cleaned up yet."""
+        return sorted(self._path.parent.glob(f"{self._path.name}.broken-*"))
+
     def load(self) -> dict[str, SiteState]:
+        """Every readable site; a damaged file is moved aside, never overwritten."""
+        self.broken = None
         if not self._path.is_file():
             return {}
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
+            raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
+            if not isinstance(raw_sites, dict):
+                raise ValueError("'sites' is not an object")
         except (OSError, ValueError) as exc:
-            log.error("state file %s is unreadable (%s); starting with no sites", self._path, exc)
+            self._set_aside(f"unreadable: {exc}")
             return {}
-        raw_sites = data.get("sites", {}) if isinstance(data, dict) else {}
         sites: dict[str, SiteState] = {}
+        bad: list[str] = []
         for url, raw in raw_sites.items():
-            if isinstance(raw, dict):
+            try:
                 sites[url] = SiteState.from_dict(url, raw)
+            except (TypeError, ValueError, AttributeError) as exc:
+                bad.append(f"{url}: {exc}")
+        if bad:
+            self._set_aside("sites left out: " + "; ".join(bad))
         return sites
+
+    def _set_aside(self, problem: str) -> None:
+        """Keep the damaged file for a person to repair; the next save starts a new one.
+
+        When it can be neither moved nor copied, ``broken`` names no copy: the caller must
+        then not save over it.
+        """
+        target: Path | None = self._path.with_name(
+            f"{self._path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        try:
+            os.replace(self._path, target)  # type: ignore[arg-type]
+        except OSError:
+            try:
+                shutil.copyfile(self._path, target)  # type: ignore[arg-type]
+            except OSError:
+                target = None
+        self.broken = (problem, target)
+        log.error(
+            "state file %s: %s; the damaged file was moved to %s", self._path, problem, target
+        )
 
     def save(self, sites: Mapping[str, SiteState]) -> None:
         payload = {
@@ -217,6 +262,7 @@ class AddressCache:
         self._clock = clock
         self._known: dict[Address, str] = {}
         self._rejected: dict[Address, float] = {}
+        self._since_sweep = 0  # rejections added since expired ones were last swept out
 
     @property
     def known_count(self) -> int:
@@ -224,9 +270,11 @@ class AddressCache:
 
     @property
     def rejected_count(self) -> int:
-        return len(self._rejected)
+        now = self._clock()
+        return sum(1 for at in self._rejected.values() if not self._expired(at, now))
 
     def load(self) -> None:
+        self._end_line(self._known_path)
         self._known = {}
         for fields in self._read_rows(self._known_path):
             address = self._parse_address(fields)
@@ -264,22 +312,54 @@ class AddressCache:
         return True
 
     def add_known(self, contract: ConfirmedContract) -> bool:
-        """Remember a confirmed contract; False when it was already known."""
+        """Remember a confirmed contract; False when it was already known.
+
+        A failed write (disk full, a file locked by another program) is logged, not
+        raised: the token's alert matters more; after a restart it may come once more.
+        """
         if contract.address in self._known:
             return False
         self._known[contract.address] = contract.network
         self._rejected.pop(contract.address, None)
         stamp = datetime.now(UTC).isoformat(timespec="seconds")
-        self._append(
-            self._known_path,
-            (contract.address.chain.value, contract.address.value, contract.network, stamp),
-        )
+        fields = (contract.address.chain.value, contract.address.value, contract.network, stamp)
+        try:
+            # Synced: after a power cut an announced token must not be announced again.
+            self._append(self._known_path, fields, sync=True)
+        except OSError as exc:
+            log.error("could not record %s in %s: %s", contract.address, self._known_path, exc)
         return True
+
+    def forget_rejected(self, chain: Chain) -> int:
+        """Drop every rejection of ``chain``: they were made before a network was added."""
+        stale = [address for address in self._rejected if address.chain is chain]
+        for address in stale:
+            del self._rejected[address]
+        if stale:
+            self._rewrite_rejected()
+        return len(stale)
 
     def add_rejected(self, address: Address) -> None:
         now = self._clock()
         self._rejected[address] = now
-        self._append(self._rejected_path, (address.chain.value, address.value, f"{now:.0f}"))
+        try:
+            self._append(self._rejected_path, (address.chain.value, address.value, f"{now:.0f}"))
+        except OSError as exc:
+            log.warning("could not record a rejection in %s: %s", self._rejected_path, exc)
+        self._since_sweep += 1
+        if self._since_sweep >= _SWEEP_EVERY:
+            self.sweep()
+
+    def sweep(self) -> int:
+        """Forget expired rejections, in memory and in the file; returns how many went."""
+        now = self._clock()
+        expired = [a for a, at in self._rejected.items() if self._expired(at, now)]
+        for address in expired:
+            del self._rejected[address]
+        self._since_sweep = 0
+        if expired:
+            self._rewrite_rejected()
+        return len(expired)
 
     def import_known(self, addresses: Iterable[Address]) -> int:
         return sum(
@@ -318,7 +398,24 @@ class AddressCache:
         return canonical_address(chain, fields[1])
 
     @staticmethod
-    def _append(path: Path, fields: tuple[str, ...]) -> None:
+    def _end_line(path: Path) -> None:
+        """A crash mid-append leaves a torn last line; the next append must not join it."""
+        try:
+            with path.open("rb+") as handle:
+                if handle.seek(0, os.SEEK_END) == 0:
+                    return
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(b"\n")
+        except FileNotFoundError:
+            return
+
+    @staticmethod
+    def _append(path: Path, fields: tuple[str, ...], *, sync: bool = False) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write("\t".join(fields) + "\n")
+            if sync:
+                handle.flush()
+                os.fsync(handle.fileno())

@@ -15,15 +15,22 @@ from collections.abc import Awaitable, Callable
 import httpx
 
 from scraper_bot.chains.rpc import NO_RETRY, JsonRpcClient
-from scraper_bot.config import EXPECTED_CHAIN_IDS, Settings
+from scraper_bot.config import Settings
 
 log = logging.getLogger(__name__)
 
 WARM_INTERVAL = 30.0
 
+# Told an endpoint's failure: the endpoint health of the validators.
+Recorder = Callable[[str, BaseException | None], None]
+
 
 class ConnectionWarmer:
-    """Pings every configured endpoint periodically; never alerts on its own failures."""
+    """Pings every configured endpoint periodically; its failures feed the endpoint health.
+
+    Only failures: a cheap ping that works says nothing about the heavier calls of an
+    address check, whose own answers end an outage.
+    """
 
     def __init__(
         self,
@@ -32,13 +39,14 @@ class ConnectionWarmer:
         *,
         interval: float = WARM_INTERVAL,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        record: Recorder | None = None,
     ) -> None:
         timeout = settings.rpc_timeout
         self._evm = [
-            (net.name, JsonRpcClient(http, net.rpc_url, timeout, retry=NO_RETRY))
+            (net, JsonRpcClient(http, net.rpc_url, timeout, retry=NO_RETRY))
             for net in settings.evm_networks
         ]
-        self._pings = [(name, client, "eth_chainId") for name, client in self._evm] + [
+        self._pings = [(net.name, client, "eth_chainId") for net, client in self._evm] + [
             (
                 "Solana",
                 JsonRpcClient(http, settings.solana_rpc_url, timeout, retry=NO_RETRY),
@@ -52,6 +60,7 @@ class ConnectionWarmer:
         ]
         self._interval = interval
         self._sleep = sleep
+        self._record = record  # each failure feeds the endpoint health
 
     async def wrong_chains(self) -> list[str]:
         """EVM endpoints that answer eth_chainId with another chain, e.g. ``Base: chain 1``."""
@@ -59,16 +68,15 @@ class ConnectionWarmer:
             *(client.call("eth_chainId", []) for _, client in self._evm), return_exceptions=True
         )
         wrong: list[str] = []
-        for (name, _), answer in zip(self._evm, answers, strict=True):
-            expected = EXPECTED_CHAIN_IDS.get(name)
-            if expected is None or not isinstance(answer, str):
+        for (net, _), answer in zip(self._evm, answers, strict=True):
+            if net.chain_id is None or not isinstance(answer, str):
                 continue  # unknown network or no answer now: the validators will notice
             try:
                 actual = int(answer, 16)
             except ValueError:
                 continue
-            if actual != expected:
-                wrong.append(f"{name}: chain {actual}, expected {expected}")
+            if actual != net.chain_id:
+                wrong.append(f"{net.name}: chain {actual}, expected {net.chain_id}")
         return wrong
 
     async def run(self) -> None:
@@ -80,4 +88,6 @@ class ConnectionWarmer:
             for (name, _, _), result in zip(self._pings, results, strict=True):
                 if isinstance(result, BaseException):
                     log.debug("warm-up call to %s failed: %s", name, result)
+                    if self._record is not None:
+                        self._record(name, result)
             await self._sleep(self._interval)

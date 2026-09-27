@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from itertools import islice
 
 from scraper_bot.models import (
     Address,
@@ -23,6 +23,7 @@ from scraper_bot.models import (
 )
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.pending import PendingWatch
+from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
 from scraper_bot.pages.fetcher import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
@@ -147,7 +148,7 @@ class SiteMonitor:
         """One round over every live page; each outcome is handled as soon as it arrives."""
         started = time.perf_counter()
         self._round_tokens = {}
-        pages = await self._live_pages()
+        pages = await live_pages(self._prober, self._deriver, self._site.url)
         results = await asyncio.gather(
             *(self._check_and_handle(url) for url in pages), return_exceptions=True
         )
@@ -189,16 +190,6 @@ class SiteMonitor:
             delay = max(delay, self._stats.retry_after)
         return delay
 
-    async def _live_pages(self) -> list[str]:
-        root = self._site.url
-        sub_pages = self._deriver.derive(root)
-        probes = await asyncio.gather(*(self._prober.probe(url) for url in sub_pages))
-        live = [root, *(probe.url for probe in probes if probe.worth_rendering)]
-        skipped = [probe.url for probe in probes if not probe.worth_rendering]
-        if skipped:
-            log.debug("[%s] not rendering absent pages: %s", root, ", ".join(skipped))
-        return live
-
     async def _check_and_handle(self, page_url: str) -> PageCheckOutcome:
         health = self._health.get(page_url)
         stretched = None
@@ -222,11 +213,15 @@ class SiteMonitor:
         # A render shows the page as it was at some moment between its start and end, so
         # the next appearance window opens at the render's start and always contains it.
         started = observation.started_at
-        self._last_read[page] = started if started is not None else seen_at
-        if len(self._first_seen) > _FIRST_SEEN_MEMORY:
-            self._first_seen.clear()
+        if observation.read:  # a challenge or a blank render did not show the page
+            self._last_read[page] = started if started is not None else seen_at
         for sighting in observation.sightings:
-            self._first_seen.setdefault((page, sighting.address), seen_at)
+            key = (page, sighting.address)
+            # Seen again: moved to the end, so the memory forgets the pairs gone longest.
+            self._first_seen[key] = self._first_seen.pop(key, seen_at)
+        excess = max(len(self._first_seen) - _FIRST_SEEN_MEMORY, 0)
+        for key in list(islice(self._first_seen, excess)):
+            del self._first_seen[key]
         sightings = {sighting.address: sighting for sighting in observation.sightings}
         found: list[tuple[ConfirmedContract, Sighting | None, Timeline]] = []
         for result in observation.results:
@@ -259,7 +254,7 @@ class SiteMonitor:
         When a page reaches ``contract_pause_threshold`` tokens in one round, they go out as
         a document instead and the site is paused.
         """
-        new = [item for item in found if self._registry.claim(item[0].address)]
+        new = [item for item in found if self._registry.claim(item[0])]
         if not new:
             return
         if self._pending is not None:
@@ -282,10 +277,15 @@ class SiteMonitor:
         if self._stop.is_set():
             return  # another page of this round already paused the site
         self.request_stop()
-        await self._notifier.site_auto_paused(
-            site.url, page_url, count, self._deriver.pages(site.url)
-        )
+        # Paused (and saved) first: the notice waits for the document and flood limits.
         await self._on_auto_pause(site.url, page_url)
+        await self._notifier.site_auto_paused(
+            site.url,
+            page_url,
+            count,
+            self._deriver.pages(site.url),
+            first_check=self._stats.rounds == 0,  # most likely tokens the page already listed
+        )
 
     async def _track_timeouts(self, outcome: PageCheckOutcome) -> None:
         """Count load timeouts in a row per page; stretch its timeout and tell the user once."""
@@ -326,6 +326,8 @@ class SiteMonitor:
         else:
             log.info("[%s] %s: %s", site.url, outcome.url, outcome.status.value)
             await self._announce_if_new(outcome.url)
+            if outcome.captcha is not None:
+                await self._announce_captcha(outcome.url, outcome.captcha)
 
         # Tokens were announced by _observed as soon as the renders showed them.
         if self._watcher is not None and outcome.candidates:
@@ -351,6 +353,17 @@ class SiteMonitor:
         self._persist()
         await self._notifier.page_discovered(page_url)
 
+    async def _announce_captcha(self, page_url: str, widget: str) -> None:
+        """Tell the user once per page (and widget) that a captcha stands on the page."""
+        site = self._site
+        told = site.captcha_pages.setdefault(page_url, [])
+        if widget in told:
+            return
+        told.append(widget)
+        self._persist()
+        log.info("[%s] %s shows a %s widget", site.url, page_url, widget)
+        await self._notifier.captcha_shown(page_url, widget)
+
     async def _update_block_state(self, outcomes: Sequence[PageCheckOutcome]) -> None:
         """Slow down on block signals; restore the pace (and tell the user) on recovery."""
         site, stats = self._site, self._stats
@@ -359,7 +372,7 @@ class SiteMonitor:
             page_url, signal = signals[0]
             first_time = stats.blocked_since is None
             stats.block_level = min(stats.block_level + 1, _MAX_BLOCK_LEVEL)
-            stats.block_reason = signal.reason
+            stats.block_reason = signal.describe()
             stats.retry_after = signal.retry_after
             if first_time:
                 stats.blocked_since = time.time()
@@ -368,24 +381,25 @@ class SiteMonitor:
                 "[%s] possible block on %s (%s); next round in %.0fs",
                 site.url,
                 page_url,
-                signal.reason,
+                stats.block_reason,
                 self._planned_delay,
             )
             if first_time:
-                await self._notifier.site_blocked(
-                    site.url, page_url, signal.reason, self._planned_delay
-                )
+                await self._notifier.site_blocked(site.url, page_url, signal, self._planned_delay)
             return
         root_answered = any(
             o.url == site.url and o.status is not PageStatus.UNAVAILABLE for o in outcomes
         )
         if stats.blocked and root_answered:
+            since = stats.blocked_since
             stats.block_level = 0
             stats.block_reason = None
             stats.blocked_since = None
             stats.retry_after = None
             log.info("[%s] answers normally again; normal interval restored", site.url)
-            await self._notifier.site_recovered(site.url)
+            await self._notifier.site_recovered(
+                site.url, time.time() - since if since is not None else None
+            )
 
     async def _sleep_between_rounds(self) -> None:
         delay = self._planned_delay if self._planned_delay is not None else self.next_delay()
@@ -393,5 +407,4 @@ class SiteMonitor:
         if self._sleep is not None:
             await self._sleep(delay)
             return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop.wait(), timeout=delay)
+        await wait_or_stop(self._stop, delay)

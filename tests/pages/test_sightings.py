@@ -2,7 +2,7 @@ import pytest
 
 from scraper_bot.chains.address_extractor import AddressExtractor, to_checksum_address
 from scraper_bot.chains.stoplist import StopList
-from scraper_bot.models import Address, Chain, SightingSource
+from scraper_bot.models import Address, Chain, Sighting, SightingSource
 from scraper_bot.pages.html_normalizer import HtmlNormalizer
 from scraper_bot.pages.sightings import CONTEXT_CHARS, find_sightings, hint_score
 
@@ -115,3 +115,31 @@ def test_a_sui_coin_type_in_a_link_query_stays_a_link() -> None:
     html = f'<html><body><a href="https://app.cetus.zone/swap?to={coin}&utm_source=x">buy</a></body></html>'
     [found] = sightings(html)
     assert found.source is SightingSource.LINK and found.address.value.endswith("::coin::COIN")
+
+
+def test_captcha_response_tokens_are_never_addresses() -> None:
+    from scraper_bot.pages.html_normalizer import HtmlNormalizer
+
+    token = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"  # shaped like a mint
+    html = (
+        "<html><body><form>"
+        f"<textarea name='g-recaptcha-response'>{token}</textarea>"
+        f"<input type='hidden' name='cf-turnstile-response' value='{token}'>"
+        "</form></body></html>"
+    )
+    signature = HtmlNormalizer().signature(html)
+    assert find_sightings(AddressExtractor(), signature, html) == []
+
+
+def test_a_challenge_page_counts_only_its_text_and_token_links() -> None:
+    from scraper_bot.pages.sightings import shown_on_a_challenge
+
+    mint = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
+    sightings = [
+        Sighting(mint, SightingSource.SOURCE, "window._cf_chl_opt"),
+        Sighting(mint, SightingSource.LINK, "value=", False),
+        Sighting(mint, SightingSource.LINK, "href=https://pump.fun/coin/", True),
+        Sighting(mint, SightingSource.TEXT, "CA:"),
+    ]
+    kept = shown_on_a_challenge(sightings)
+    assert [s.source for s in kept] == [SightingSource.LINK, SightingSource.TEXT]

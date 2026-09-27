@@ -22,7 +22,6 @@ from scraper_bot.pages.fetcher import (
     HttpProber,
     PlaywrightFetcher,
     ProbeResult,
-    _parse_retry_after,
 )
 from tests.conftest import make_settings
 
@@ -66,29 +65,6 @@ def test_fetch_result_ok_and_reason(
     result = FetchResult(URL, status, "<html></html>", error=error)
     assert result.ok is ok
     assert result.reason == reason
-
-
-def test_fetch_result_scan_texts_puts_the_dom_first() -> None:
-    result = FetchResult(URL, 200, "<p>dom</p>", extra_texts=("frame", "bundle.js"))
-    assert result.scan_texts == ("<p>dom</p>", "frame", "bundle.js")
-    assert FetchResult(URL, 200, "<p>dom</p>").scan_texts == ("<p>dom</p>",)
-
-
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("120", 120.0),
-        (" 5 ", 5.0),
-        ("0", 0.0),
-        ("1.5", 1.5),
-        ("-1", None),
-        ("Wed, 21 Oct 2015 07:28:00 GMT", None),
-        ("", None),
-        (None, None),
-    ],
-)
-def test_parse_retry_after(value: str | None, expected: float | None) -> None:
-    assert _parse_retry_after(value) == expected
 
 
 # ── HttpProber ──────────────────────────────────────────────────────────────
@@ -264,6 +240,7 @@ class FakeResponse:
     body_error: str | None = None
     body_calls: int = 0
     url: str = URL
+    length: int | None = None  # the Content-Length header
 
     @property
     def request(self) -> FakeRequest:
@@ -271,7 +248,10 @@ class FakeResponse:
 
     @property
     def headers(self) -> dict[str, str]:
-        return {} if self.content_type is None else {"content-type": self.content_type}
+        headers = {} if self.content_type is None else {"content-type": self.content_type}
+        if self.length is not None:
+            headers["content-length"] = str(self.length)
+        return headers
 
     async def body(self) -> bytes:
         self.body_calls += 1
@@ -515,19 +495,31 @@ async def test_route_drops_prefetches_and_beacons(
 
 
 class FakeChromium:
-    def __init__(self) -> None:
+    def __init__(self, sandbox_error: str | None = None) -> None:
         self.launches: list[dict[str, object]] = []
         self.routes: list[str] = []
+        self.sandbox_error = sandbox_error  # what a launch with the sandbox fails with
+        self.closed = 0
 
     async def launch(self, **kwargs: object) -> FakeChromium:
         self.launches.append(kwargs)
+        if kwargs.get("chromium_sandbox") and self.sandbox_error is not None:
+            raise pw.Error(self.sandbox_error)
         return self
 
-    async def new_context(self, **_kwargs: object) -> FakeChromium:
-        return self
+    async def close(self) -> None:
+        self.closed += 1
+
+    async def new_context(self, **_kwargs: object) -> FakeContext:
+        return FakeContext(self)
+
+
+class FakeContext:
+    def __init__(self, browser: FakeChromium) -> None:
+        self.browser = browser
 
     async def route(self, pattern: str, _handler: object) -> None:
-        self.routes.append(pattern)
+        self.browser.routes.append(pattern)
 
 
 @dataclass
@@ -553,7 +545,47 @@ async def test_launch_passes_the_browser_args_and_always_installs_the_filter(
     await fetcher._launch()
     [launch] = playwright.chromium.launches
     assert launch["args"] == expected
+    assert launch["chromium_sandbox"] is True and fetcher.sandboxed
     assert playwright.chromium.routes == ["**/*"]  # beacons are dropped even with no types
+
+
+async def test_without_a_usable_sandbox_the_browser_starts_without_it(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    playwright = FakePlaywright(FakeChromium(sandbox_error="No usable sandbox!\nmore"))
+    fetcher._playwright = playwright  # type: ignore[assignment]
+    await fetcher._launch()
+    assert [launch["chromium_sandbox"] for launch in playwright.chromium.launches] == [
+        True,
+        False,
+    ]
+    assert not fetcher.sandboxed and fetcher.sandbox_error == "No usable sandbox!"
+    await fetcher._launch()  # a relaunch remembers: no second try with the sandbox
+    assert playwright.chromium.launches[-1]["chromium_sandbox"] is False
+
+
+async def test_no_sandbox_in_the_browser_args_is_respected(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path, BROWSER_ARGS="--no-sandbox"))
+    playwright = FakePlaywright()
+    fetcher._playwright = playwright  # type: ignore[assignment]
+    await fetcher._launch()
+    [launch] = playwright.chromium.launches
+    assert launch["chromium_sandbox"] is False
+    assert not fetcher.sandboxed and fetcher.sandbox_error is None  # nothing to report
+
+
+async def test_a_tab_that_notices_a_crash_late_keeps_the_relaunched_browser(
+    tmp_path: Path,
+) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    fetcher._playwright = FakePlaywright()  # type: ignore[assignment]
+    await fetcher._launch()
+    old = fetcher._context
+    browser = fetcher._browser
+    await fetcher._launch()  # another tab relaunched the browser meanwhile
+    await fetcher._discard(old)  # type: ignore[arg-type]
+    assert fetcher._browser is browser and browser.closed == 0  # type: ignore[union-attr]
+    await fetcher._discard(fetcher._context)  # type: ignore[arg-type]
+    assert fetcher._browser is None and browser.closed == 1  # type: ignore[union-attr]
 
 
 async def test_a_service_worker_rsc_fetch_is_not_mistaken_for_a_prefetch(tmp_path: Path) -> None:
@@ -561,3 +593,49 @@ async def test_a_service_worker_rsc_fetch_is_not_mistaken_for_a_prefetch(tmp_pat
     route = FakeRoute("fetch", "https://x.io/other?_rsc=1", {"rsc": "1"}, frame_url=None)
     await fetcher._route(route)  # type: ignore[arg-type]
     assert route.continued
+
+
+async def test_deep_scan_does_not_fetch_a_body_announced_as_too_big(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    big = FakeResponse("script", "application/javascript", b"x", length=20 * 1024 * 1024)
+    small = FakeResponse("script", "application/javascript", b"window.a=1", length=10)
+    page = FakePage(main_frame=FakeFrame("<html/>"))
+    _, bodies = await fetcher._deep_scan(page, [big, small])  # type: ignore[arg-type]
+    assert big.body_calls == 0 and small.body_calls == 1
+    assert bodies == ("window.a=1",)
+
+
+async def test_a_launch_failure_unrelated_to_the_sandbox_is_not_retried_without_it(
+    tmp_path: Path,
+) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    playwright = FakePlaywright(FakeChromium(sandbox_error="Timeout 180000ms exceeded"))
+    fetcher._playwright = playwright  # type: ignore[assignment]
+    with pytest.raises(pw.Error, match="Timeout"):
+        await fetcher._launch()
+    assert len(playwright.chromium.launches) == 1 and fetcher.sandboxed
+
+
+async def test_a_relaunch_that_loses_the_sandbox_is_reported(tmp_path: Path) -> None:
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    chromium = FakeChromium()
+    fetcher._playwright = FakePlaywright(chromium)  # type: ignore[assignment]
+    lost: list[str] = []
+    fetcher.on_sandbox_lost = lost.append
+    await fetcher._launch()  # the start: the sandbox works
+    chromium.sandbox_error = "Chromium sandboxing failed!"
+    await fetcher._launch()  # after a crash it does not any more
+    assert lost == ["Chromium sandboxing failed!"] and not fetcher.sandboxed
+
+
+async def test_a_browser_whose_context_fails_is_closed(tmp_path: Path) -> None:
+    class BrokenContext(FakeChromium):
+        async def new_context(self, **_kwargs: object) -> FakeContext:
+            raise pw.Error("Protocol error (Target.createBrowserContext)")
+
+    fetcher = PlaywrightFetcher(make_settings(tmp_path))
+    chromium = BrokenContext()
+    fetcher._playwright = FakePlaywright(chromium)  # type: ignore[assignment]
+    with pytest.raises(pw.Error):
+        await fetcher._launch()
+    assert chromium.closed == 1 and fetcher._browser is None
