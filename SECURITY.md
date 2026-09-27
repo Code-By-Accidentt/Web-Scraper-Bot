@@ -39,6 +39,9 @@ DexScreener. It holds no keys, signs nothing and never sends a transaction.
   minutes per chat), so you can find the id to put into `.env`. Its other commands are
   ignored and logged.
 - With both lists empty nobody can control the bot; only `/start` answers.
+- Commands are read from messages only: posts in a channel are ignored, so a channel
+  cannot command the bot. In an allowed group every member can run every command. A
+  command addressed to another bot (`/pause@OtherBot`) is ignored.
 
 ## Rendering untrusted pages
 
@@ -55,8 +58,11 @@ Keep these points in mind:
   broken or intercepted certificate still renders. The bot only reads pages, but the
   content it reports could be tampered with on the way.
 - Images, media and fonts are not downloaded, nor are Next.js prefetches and analytics
-  beacons; scripts run. WebGL is off by default (`BROWSER_ARGS`). Chromium's own sandbox
-  applies. Keep Playwright and the bundled browser current: raise the `playwright` pin in
+  beacons; scripts run. WebGL is off by default (`BROWSER_ARGS`). Chromium runs with its
+  own sandbox. Where the sandbox cannot start (as root, or without user namespaces, as in
+  containers) the bot runs the browser without it and sends one 🛑; the dedicated user
+  is then the only isolation (`--no-sandbox` in `BROWSER_ARGS` does the same on purpose).
+  Keep Playwright and the bundled browser current: raise the `playwright` pin in
   `requirements.txt`, `pip install -r requirements.txt`, then `playwright install chromium`.
 - Everything the bot sends to Telegram is HTML-escaped (`scraper_bot/telegram/markup.py`),
   so page text and URLs cannot inject markup into your chat. If Telegram still rejects a
@@ -69,15 +75,19 @@ Keep these points in mind:
 - DexScreener sees every confirmed contract address (token details).
 - The monitored sites see a headless Chrome that says so (its user agent contains
   `HeadlessChrome` and `navigator.webdriver` is true) coming from your IP, at the pace set
-  by `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`. Their analytics services do not: the bot
-  drops the beacons.
+  by `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`, plus, per derived sub-page and round, a
+  HEAD request (a GET when it answers 404/405/410/501; redirects followed) with a desktop
+  Chrome user agent: the probes that find which sub-pages exist. Their analytics services
+  do not: the bot drops the beacons.
 
 ## What the bot never does
 
-- No captcha solving, no proxy or IP rotation, no fingerprint spoofing. When a site
-  answers 401/403/407/429/503, shows a challenge page or resets connections, the bot slows
-  down (the interval doubles up to `BLOCK_MAX_BACKOFF`), tells you once, and resumes the
-  normal pace when the root page answers again.
+- No captcha solving, no proxy or IP rotation, no fingerprint spoofing in the browser.
+  When a site answers 401/403/407/429/503, shows a challenge page or resets connections,
+  the bot slows down (the interval doubles up to `BLOCK_MAX_BACKOFF`; a longer
+  `Retry-After` from the site is honoured), tells you once, naming the protection when it
+  can, and resumes the normal pace after a round without block signals in which the root
+  page answered.
 - No writes to any blockchain, no wallets, no private keys.
 - No outbound traffic other than Telegram, the configured RPC endpoints, DexScreener and
   the sites you asked it to watch, including the third-party hosts their pages load
@@ -86,13 +96,15 @@ Keep these points in mind:
 ## Operating safely
 
 - Run the bot under a dedicated user with access only to its own directory; `.env`
-  should be readable by that user alone.
+  should be readable by that user alone (`chmod 600 .env`).
 - Rotate the token in @BotFather (`/revoke`) if it ever leaks; the bot fails fast with
   exit code 2 on a rejected token.
 - Keep dependencies current: `requirements.txt` pins exact versions, so check `pip list
   --outdated`, raise the pins you want, then `pip install -r requirements-dev.txt`
   (runtime dependencies plus the test and lint tools) and `playwright install chromium`. Run `pytest -q`
   afterwards.
-- Watch the 🛑 alerts: they report crashed monitors, failing RPC endpoints, an RPC
-  endpoint that serves another chain and a browser that could not start, at most once
-  per ten minutes per problem.
+- Watch the 🛑 alerts: they report crashed monitors and turbo sessions, page checks that
+  raised, a failing pending watch, RPC endpoints silent for minutes (once per outage), an
+  RPC endpoint that serves another chain, a browser that could not start, Chromium running
+  without its sandbox, and a damaged or unsaved `state.json`, at most once per ten minutes
+  per problem while the bot runs (a restart may repeat one).

@@ -12,9 +12,12 @@ from typing import Any
 
 import pytest
 
+from scraper_bot.chains.address_extractor import AddressExtractor, drop_coin_packages
+from scraper_bot.chains.contract_validators import FailingEndpoint
 from scraper_bot.config import Settings
 from scraper_bot.models import (
     Address,
+    BlockSignal,
     ChangeReport,
     ConfirmedContract,
     Node,
@@ -32,6 +35,12 @@ from scraper_bot.monitoring.site_monitor import MonitorStats
 from scraper_bot.monitoring.turbo import TurboStats
 from scraper_bot.pages.fetcher import FetchResult, ProbeResult
 from scraper_bot.telegram.client import SentMessage
+
+
+def extract(extractor: AddressExtractor, text: str) -> list[Address]:
+    """Unique addresses of ``text`` in order of appearance, Sui coins without their packages."""
+    unique = list(dict.fromkeys(address for address, _ in extractor.locate(text)))
+    return drop_coin_packages(unique, lambda address: address)
 
 
 @dataclass
@@ -203,12 +212,17 @@ class FakeNotifier:
         self.contract_details: list[tuple[Sighting | None, Timeline | None]] = []
         self.batches: list[tuple[str, str, tuple[ConfirmedContract, ...]]] = []
         self.paused: list[tuple[str, str, int]] = []
+        self.first_check_pauses: list[bool] = []  # ``first_check`` of each auto-pause
+        self.stuck: list[tuple[tuple[FailingEndpoint, ...], float]] = []
         self.turbo_started_calls: list[tuple[str, int, float, float, int]] = []
         self.unverified: list[tuple[Address, str]] = []
         self.confirmed: list[tuple[ConfirmedContract, str]] = []
         self.turbo_finished_calls: list[tuple[str, str, int]] = []
-        self.blocked: list[tuple[str, str, str, float]] = []
+        self.blocked: list[tuple[str, str, str, float]] = []  # reason: signal.describe()
+        self.block_signals: list[BlockSignal] = []
         self.recovered: list[str] = []
+        self.blocked_for: list[float | None] = []
+        self.captchas: list[tuple[str, str]] = []
         self.digests: list[tuple[str, int]] = []
         self.problems: list[tuple[str, str, str, str | None]] = []
         self.started_calls: list[tuple[str, int, int]] = []
@@ -227,6 +241,9 @@ class FakeNotifier:
     async def page_renders_again(self, page_url: str, timeout: float) -> None:
         self.renders_again.append((page_url, timeout))
 
+    async def captcha_shown(self, page_url: str, widget: str) -> None:
+        self.captchas.append((page_url, widget))
+
     async def contract_found(
         self,
         contract: ConfirmedContract,
@@ -244,9 +261,15 @@ class FakeNotifier:
         self.batches.append((site_url, page_url, tuple(contracts)))
 
     async def site_auto_paused(
-        self, site_url: str, page_url: str, count: int, pages: Sequence[str]
+        self,
+        site_url: str,
+        page_url: str,
+        count: int,
+        pages: Sequence[str],
+        first_check: bool = False,
     ) -> None:
         self.paused.append((site_url, page_url, count))
+        self.first_check_pauses.append(first_check)
 
     async def turbo_started(
         self, site_url: str, pages: int, interval: float, minutes: float, stop_after: int
@@ -279,12 +302,14 @@ class FakeNotifier:
         self.turbo_finished_calls.append((site_url, reason, len(contracts)))
 
     async def site_blocked(
-        self, site_url: str, page_url: str, reason: str, next_delay: float
+        self, site_url: str, page_url: str, signal: BlockSignal, next_delay: float
     ) -> None:
-        self.blocked.append((site_url, page_url, reason, next_delay))
+        self.blocked.append((site_url, page_url, signal.describe(), next_delay))
+        self.block_signals.append(signal)
 
-    async def site_recovered(self, site_url: str) -> None:
+    async def site_recovered(self, site_url: str, blocked_for: float | None = None) -> None:
         self.recovered.append(site_url)
+        self.blocked_for.append(blocked_for)
 
     async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
         self.problems.append((key, title, detail, hint))
@@ -293,6 +318,9 @@ class FakeNotifier:
     def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
         self.problems.append((key, title, detail, hint))
 
+    def rpc_endpoints_stuck(self, endpoints: Sequence[FailingEndpoint], retry_delay: float) -> None:
+        self.stuck.append((tuple(endpoints), retry_delay))
+
     async def started(self, version: str, total_sites: int, running: int) -> None:
         self.started_calls.append((version, total_sites, running))
 
@@ -300,12 +328,14 @@ class FakeNotifier:
 class FakeChecker:
     """Scripted stand-in for PageChecker.
 
-    Like the real one it reports the outcome's addresses to ``on_observation`` first:
-    its contracts as CONFIRMED, the other candidates as REJECTED, all seen in page text.
+    Like the real one it reports a page's addresses to ``on_observation`` first: the
+    scripted ``tokens`` as CONFIRMED, the outcome's other candidates as REJECTED, all seen
+    in page text.
     """
 
     def __init__(self) -> None:
         self.outcomes: dict[str, PageCheckOutcome] = {}
+        self.tokens: dict[str, tuple[ConfirmedContract, ...]] = {}
         self.calls: list[str] = []
         self.timeouts: list[float | None] = []  # the ``load_timeout`` passed to each check
 
@@ -319,7 +349,7 @@ class FakeChecker:
         self.calls.append(page_url)
         self.timeouts.append(load_timeout)
         outcome = self.outcomes.get(page_url, PageCheckOutcome(page_url, PageStatus.UNCHANGED))
-        confirmed = {contract.address: contract for contract in outcome.contracts}
+        confirmed = {contract.address: contract for contract in self.tokens.get(page_url, ())}
         addresses = list(dict.fromkeys([*outcome.candidates, *confirmed]))
         if on_observation is not None and addresses:
             results = tuple(
@@ -336,18 +366,23 @@ class FakeChecker:
 class FakeTelegram:
     """Records what the bot sends; an edit replaces the recorded text of its message."""
 
+    username: str | None = None  # the bot's own name; unknown, as when getMe failed
+
     def __init__(self) -> None:
         self.messages: list[tuple[int, str]] = []
         self.documents: list[tuple[int, str, bytes, str]] = []
         self.updates: list[list[dict[str, Any]] | None] = []
         self.offsets: list[int | None] = []
         self.edits: list[tuple[int, str]] = []
+        self.profile_calls = 0
 
-    async def send_message(self, chat_id: int, text: str) -> bool:
+    async def send_message(self, chat_id: int, text: str, *, patient: bool = False) -> bool:
         self.messages.append((chat_id, text))
         return True
 
-    async def send_tracked(self, chat_id: int, text: str) -> SentMessage | None:
+    async def send_tracked(
+        self, chat_id: int, text: str, *, patient: bool = False
+    ) -> SentMessage | None:
         self.messages.append((chat_id, text))
         return SentMessage(chat_id, len(self.messages) - 1)
 
@@ -356,18 +391,35 @@ class FakeTelegram:
         self.messages[message.message_id] = (message.chat_id, text)
         return True
 
-    async def broadcast(self, chat_ids: Iterable[int], text: str) -> None:
+    async def broadcast(self, chat_ids: Iterable[int], text: str, *, patient: bool = False) -> bool:
         for chat_id in chat_ids:
             await self.send_message(chat_id, text)
+        return bool(chat_ids)
+
+    async def get_me(self) -> dict[str, Any] | None:
+        self.profile_calls += 1
+        return None
 
     async def send_document(
-        self, chat_id: int, filename: str, content: bytes, caption: str = ""
+        self,
+        chat_id: int,
+        filename: str,
+        content: bytes,
+        caption: str = "",
+        *,
+        patient: bool = False,
     ) -> bool:
         self.documents.append((chat_id, filename, content, caption))
         return True
 
     async def broadcast_document(
-        self, chat_ids: Iterable[int], filename: str, content: bytes, caption: str = ""
+        self,
+        chat_ids: Iterable[int],
+        filename: str,
+        content: bytes,
+        caption: str = "",
+        *,
+        patient: bool = False,
     ) -> None:
         for chat_id in chat_ids:
             await self.send_document(chat_id, filename, content, caption)

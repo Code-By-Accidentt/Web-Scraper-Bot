@@ -125,6 +125,39 @@ def test_paragraphs_without_attributes_are_keyed_by_first_word() -> None:
     other = node("p", "Whitelist opens tomorrow")
     assert NoiseFilter.node_key(online_1) == NoiseFilter.node_key(online_2)
     assert NoiseFilter.node_key(online_1) != NoiseFilter.node_key(other)
+    # A number as the first word is masked: the counter stays one element while it counts.
+    assert NoiseFilter.node_key(node("td", "1203")) == NoiseFilter.node_key(node("td", "1,204.5"))
+    assert NoiseFilter.node_key(node("td", "12.5 SOL")) == NoiseFilter.node_key(
+        node("td", "13 SOL")
+    )
+
+
+def test_a_counting_cell_without_attributes_is_silenced() -> None:
+    noise = NoiseFilter(window=3600, threshold=2)
+    memory: dict[str, NoiseEntry] = {}
+    passed = 0
+    for step in range(1, 6):
+        before = (node("td", "Holders"), node("td", str(1200 + step - 1)))
+        after = (node("td", "Holders"), node("td", str(1200 + step)))
+        filtered, memory = noise.apply(
+            report(removed=[before[1]], added=[after[1]]),
+            memory,
+            100.0 * step,
+            before=before,
+            after=after,
+        )
+        passed += not filtered.is_empty
+    assert passed == 2
+
+
+def test_a_new_element_is_not_silenced_by_a_rotating_look_alike() -> None:
+    noise = NoiseFilter(window=3600, threshold=1)
+    banner = node("li", "New: partner AMA")
+    memory = {NoiseFilter.node_key(banner, 0): NoiseEntry(5, 50.0)}  # rotates all day
+    fresh = node("li", "New: token live, CA below")
+    after = (node("li", "New: meme contest"), node("li", "Roadmap Q4"), fresh)
+    filtered, _ = noise.apply(report(added=[fresh]), memory, 100.0, before=after[:2], after=after)
+    assert filtered.added == (fresh,)  # second "New:" item, not the banner in first place
 
 
 def test_disabled_filter_passes_everything_and_keeps_no_memory() -> None:
@@ -136,3 +169,18 @@ def test_disabled_filter_passes_everything_and_keeps_no_memory() -> None:
     )
     assert filtered == original
     assert memory == {}
+
+
+def test_a_page_that_keeps_swapping_wholesale_is_silenced_as_a_whole() -> None:
+    noise = NoiseFilter(window=3600, threshold=2)
+    page = tuple(node("p", f"row {i}") for i in range(30))
+    error = (node("h1", "502 Bad Gateway"),)
+    memory: dict[str, NoiseEntry] = {}
+    alerts = 0
+    for step in range(4):
+        filtered, memory = noise.apply(
+            report(removed=page, added=error), memory, 100.0 * step, before=page, after=error
+        )
+        alerts += not filtered.is_empty
+    assert alerts == 2  # then silenced, like any element that keeps changing
+    assert set(memory) == {"page|wholesale"}  # no element of the page was counted

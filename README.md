@@ -17,10 +17,12 @@ bothers you.
   announced once when it first appears.
 - **Change detection that does not lie.** Structural diff of the rendered DOM (text and
   attributes), every change confirmed by a second render, whatever differs between the two
-  renders (timers, counters, banners) is ignored, elements that keep flapping are silenced.
-  Alerts say *what* changed, not only how much.
-- **Token discovery on three chain families.** ERC-20 tokens on 8 EVM networks, SPL /
-  Token-2022 mints on Solana, Sui coins. An LP pair leads to its token; wallets
+  renders (timers, counters, banners) is ignored (a real change that lands between them is
+  reported by the next round), elements that keep flapping are silenced. Alerts say *what*
+  changed, not only how much.
+- **Token discovery on three chain families.** ERC-20 tokens on 10 EVM networks
+  (Ethereum, Base, Arbitrum, Optimism, BSC, Fantom, Sonic, Avalanche, Arc, Robinhood
+  Chain), SPL / Token-2022 mints on Solana, Sui coins. An LP pair leads to its token; wallets
   (EIP-7702 included), NFTs, vaults, programs, stablecoins and wrapped natives never
   count. Candidates are taken from the whole rendered page and, with deep scan (off by
   default), from iframes, shadow DOM and every script or JSON answer the page loaded.
@@ -41,14 +43,16 @@ bothers you.
   once and keeps re-checking it on-chain for a day.
 - **Live settings.** `/settings` explains every tunable knob, `/set` changes it without a
   restart, risky values ask for `confirm`.
-- **Block awareness.** 401/403/407/429/503, WAF challenges (Cloudflare, Vercel) and connection
-  resets slow the site's
-  interval down (doubling, bounded), with one warning and one recovery notice. No proxy
-  rotation, no captcha bypass.
+- **Block awareness.** 401/403/407/429/503, WAF challenges and connection resets slow the
+  site's interval down (doubling up to a cap, or longer when the site sends `Retry-After`),
+  with one warning that names the protection (Cloudflare, Vercel, AWS WAF, DataDome, ...)
+  and one recovery notice. A captcha widget on a page is reported once. No proxy rotation,
+  no captcha solving.
 - **Pages that keep timing out** get one alert and a longer load timeout until they render
   again.
 - **Persistent and supervised.** Sites, flags, snapshots and caches live under `data/` and
-  survive restarts; `rebooter.py` restarts the bot when it dies or stops heart-beating.
+  survive restarts; `rebooter.py` restarts the bot when it dies or stops heart-beating,
+  with growing pauses when it keeps failing at start.
 
 ## Quick start
 
@@ -109,11 +113,11 @@ scraper_bot/
   app.py config.py preferences.py models.py storage.py    core and state
   pages/        rendering, HTML normalisation, diffing, noise filter, block detection,
                 where on a page an address stands (sightings)
-  chains/       address extraction, stop-list, JSON-RPC, EVM / Solana / Sui validation,
-                token details, connection warm-up
+  chains/       the network table, address extraction, stop-list, JSON-RPC, EVM / Solana /
+                Sui validation, token details, connection warm-up
   monitoring/   site monitor, monitor manager, turbo mode, unverified mode, pending watch
                 (addresses published before deployment), alert registry
-  telegram/     Bot API client, commands, alerts, /status, HTML markup
+  telegram/     Bot API client, commands, alerts, /status, /settings view, HTML markup
 tests/          pytest suite mirroring the packages, offline; browser tests behind a flag
 docs/           the pages above
 data/           runtime data, git-ignored, created on first start

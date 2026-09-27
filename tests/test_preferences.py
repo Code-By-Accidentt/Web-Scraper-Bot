@@ -10,7 +10,6 @@ from scraper_bot.preferences import (
     PreferenceError,
     Preferences,
 )
-from scraper_bot.telegram.markup import strip_markup
 from tests.conftest import make_settings
 
 
@@ -111,16 +110,13 @@ def test_invalid_entries_in_the_file_are_dropped(tmp_path: Path) -> None:
     assert prefs.flap_threshold == 2
 
 
-def test_overview_and_describe_are_human_readable(tmp_path: Path) -> None:
+def test_values_are_shown_in_the_users_unit(tmp_path: Path) -> None:
     prefs = make_prefs(tmp_path)
-    prefs.set("settle_delay", "0.3")
-    overview = strip_markup(prefs.overview())
-    assert "<code>settle_delay</code>" in prefs.overview()
-    assert "Monitoring & rendering" in overview
-    assert "• settle_delay = 0.3 s*" in overview
-    assert "• require_erc20 = on" in overview
-    text = strip_markup(prefs.describe("turbo_max_pages"))
-    assert "root included" in text and "Range: 1 to 10" in text and "/set turbo_max_pages" in text
+    assert prefs.spec("settle_delay").format(0.3) == "0.3 s"
+    assert prefs.spec("require_erc20").format(True) == "on"
+    assert prefs.spec("require_erc20").format(False) == "off"
+    assert prefs.spec("rejected_ttl_hours").format(6.0) == "6 h"
+    assert prefs.spec("flap_threshold").format(2) == "2"
 
 
 def test_non_finite_numbers_are_rejected(tmp_path: Path) -> None:

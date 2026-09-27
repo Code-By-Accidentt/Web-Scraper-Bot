@@ -593,3 +593,121 @@ async def test_the_outdated_notice_counts_as_sent_only_when_a_chat_got_it() -> N
     telegram = FakeTelegram()
     assert await Notifier(telegram, (1,)).outdated_defaults(old) is True  # type: ignore[arg-type]
     assert await Notifier(telegram, ()).outdated_defaults(old) is False  # type: ignore[arg-type]
+
+
+def test_new_networks_are_those_the_saved_verdicts_never_saw(tmp_path: Path) -> None:
+    from scraper_bot.app import added_networks, remember_networks
+
+    path = tmp_path / "evm_networks.txt"
+    current = ("Ethereum", "Base", "Arc")
+    assert added_networks(path, current, existing_data=False) == frozenset()  # fresh install
+    assert added_networks(path, current, existing_data=True) == frozenset(current)  # from 2.1
+    remember_networks(path, ("Ethereum", "Base"))
+    assert added_networks(path, current, existing_data=True) == {"Arc"}
+    remember_networks(path, current)
+    assert added_networks(path, current, existing_data=True) == frozenset()
+    assert added_networks(path, ("Ethereum",), existing_data=True) == frozenset()  # one less
+
+
+async def test_an_upgrade_that_adds_networks_forgets_old_evm_verdicts(tmp_path: Path) -> None:
+    from scraper_bot.models import Address, AddressKind, Chain, ValidationResult
+    from scraper_bot.models import ValidationStatus as Status
+
+    settings = make_settings(tmp_path)
+    data = settings.data_dir
+    data.mkdir(parents=True)
+    wallet = Address(Chain.ETHEREUM, "0x" + "4d" * 20)
+    mint = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
+    # What a 2.1 run left behind: rejections made without Arc and Robinhood Chain.
+    (data / "rejected_addresses.txt").write_text(
+        f"Ethereum\t{wallet.value}\t{time.time():.0f}\nSolana\t{mint.value}\t{time.time():.0f}\n",
+        encoding="utf-8",
+    )
+    transport = OfflineTransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        first = Wired(tmp_path, http, transport)
+        first.runtime.pending.offer(
+            SITE, SITE, None, ValidationResult(wallet, Status.REJECTED, kind=AddressKind.NO_CODE)
+        )
+        first.runtime.pending.save()
+        second = Wired(tmp_path, http, transport)  # the next start, with no networks file yet
+        runtime = second.runtime
+        assert not runtime.validator._cache.is_rejected(wallet)  # EVM: checked again
+        assert runtime.validator._cache.is_rejected(mint)  # Solana is not affected
+        try:
+            await runtime.start()
+            assert runtime.pending._entries[wallet].baseline  # old news if on a new network
+            names = (data / "evm_networks.txt").read_text(encoding="utf-8").splitlines()
+            assert sorted(names) == sorted(net.name for net in settings.evm_networks)
+        finally:
+            await runtime.shutdown()
+        third = Wired(tmp_path, http, transport)  # a later start forgets nothing
+        assert third.runtime.pending._new_networks == frozenset()
+
+
+async def test_a_site_only_in_turbo_keeps_its_addresses_watched(tmp_path: Path) -> None:
+    transport = OfflineTransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        runtime = Wired(tmp_path, http, transport).runtime
+        await runtime.start()
+        try:
+            await runtime.manager.add_site(SITE)
+            await runtime.manager.pause_site(SITE)
+            assert runtime.pending._is_paused(SITE)
+            # /turbo works on a URL that is not monitored; the launch may come after it.
+            assert not runtime.pending._is_paused("https://turbo-only.example")
+        finally:
+            await runtime.shutdown()
+
+
+class SandboxState:
+    def __init__(self, sandboxed: bool, error: str | None = None) -> None:
+        self.sandboxed = sandboxed
+        self.sandbox_error = error
+
+
+async def test_the_chat_hears_once_that_chromium_runs_without_its_sandbox(tmp_path: Path) -> None:
+    from scraper_bot.app import tell_about_sandbox
+    from tests.conftest import FakeNotifier
+
+    notifier = FakeNotifier()
+    marker = tmp_path / "no_sandbox_notice.txt"
+    unsandboxed = SandboxState(False, "No usable sandbox!")
+    await tell_about_sandbox(notifier, unsandboxed, marker)  # type: ignore[arg-type]
+    await tell_about_sandbox(notifier, unsandboxed, marker)  # type: ignore[arg-type]
+    [(key, title, detail, hint)] = notifier.problems
+    assert (key, title, detail) == (
+        "sandbox",
+        "Chromium runs without its sandbox",
+        unsandboxed.sandbox_error,
+    )
+    assert hint is not None and "non-root user" in hint
+    await tell_about_sandbox(notifier, SandboxState(False), marker)  # type: ignore[arg-type]
+    assert len(notifier.problems) == 1  # switched off on purpose in BROWSER_ARGS
+    await tell_about_sandbox(notifier, SandboxState(True), marker)  # type: ignore[arg-type]
+    assert not marker.exists()  # works again: a later failure is reported anew
+    await tell_about_sandbox(notifier, unsandboxed, marker)  # type: ignore[arg-type]
+    assert len(notifier.problems) == 2
+
+
+async def test_the_sandbox_notice_is_remembered_only_when_a_chat_got_it(tmp_path: Path) -> None:
+    from scraper_bot.app import tell_about_sandbox
+    from tests.conftest import FakeNotifier
+
+    class Unreachable(FakeNotifier):
+        async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
+            await super().problem(key, title, detail, hint)
+            return False  # Telegram down, or no alert chat configured yet
+
+    marker = tmp_path / "no_sandbox_notice.txt"
+    notifier = Unreachable()
+    await tell_about_sandbox(notifier, SandboxState(False, "No usable sandbox!"), marker)  # type: ignore[arg-type]
+    assert not marker.exists()  # the next start tries again
+
+
+async def test_late_tokens_reach_the_pending_watch(tmp_path: Path) -> None:
+    transport = OfflineTransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        runtime = Wired(tmp_path, http, transport).runtime
+        assert runtime.validator.on_late_token == runtime.pending.hurry
+        assert runtime.pending._stale_absences == frozenset()  # a fresh install

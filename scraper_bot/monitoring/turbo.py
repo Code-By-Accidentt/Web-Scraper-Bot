@@ -29,10 +29,11 @@ from scraper_bot.models import (
 )
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.pending import PendingWatch
+from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.pages.blocking import BlockDetector
-from scraper_bot.pages.fetcher import FetchResult, HttpProber, PageFetcher
+from scraper_bot.pages.fetcher import HttpProber, PageFetcher
 from scraper_bot.pages.html_normalizer import HtmlNormalizer
-from scraper_bot.pages.sightings import find_sightings
+from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
 from scraper_bot.pages.urls import SubUrlDeriver, normalize_url
 from scraper_bot.preferences import Tuning
 from scraper_bot.storage import AddressCache
@@ -190,12 +191,12 @@ class TurboSession:
                     break
                 cycle_started = time.perf_counter()
                 signal = await self._cycle()
-                if signal is not None:
-                    reason = f"possible IP block ({signal.reason})"
-                    break
                 limits = self.limits  # /set may have changed the pace or the stop rule
                 if limits.stop_after and len(stats.found) >= limits.stop_after:
                     reason = f"found {len(stats.found)} confirmed contract(s)"
+                    break
+                if signal is not None:
+                    reason = f"possible IP block ({signal.describe()})"
                     break
                 await self._pause(limits.interval - (time.perf_counter() - cycle_started))
         except asyncio.CancelledError:
@@ -221,18 +222,32 @@ class TurboSession:
         seen_at = self._clock()
         self._stats.cycles += 1
         self._stats.renders += len(results)
-        for result in results:
-            signal = self._blocks.inspect(result)
-            if signal is not None:
-                return signal
+        signals = {result.url: self._blocks.inspect(result) for result in results}
         # Pages read before go first: an address a late page shows on its baseline render is
-        # then already known from them as news, not taken for old news.
+        # then already known from them as news, not taken for old news. A page that answers
+        # normally is read even when another one is blocked in the same cycle: the CA may be
+        # on it (challenges come most often at the launch). So is what a 2xx answer that looks
+        # like a challenge shows (not its scripts): it may be the real page.
         for result in sorted(results, key=lambda r: r.url not in self._last_read):
             if not result.ok:
                 continue
+            signature = await asyncio.to_thread(self._normalizer.signature, result.html)
+            if not signature:
+                continue  # a blank render (hydrating, a deploy in progress) shows nothing yet
             # A page's first good render is its baseline, even when an earlier cycle failed.
             baseline = result.url not in self._last_read
-            fresh = [s for s in await self._sightings(result) if s.address not in self._seen]
+            found = await asyncio.to_thread(
+                find_sightings,
+                self._extractor,
+                signature,
+                result.html,
+                result.extra_texts,
+                result.dom_texts,
+            )
+            blocked = signals[result.url] is not None
+            if blocked:
+                found = shown_on_a_challenge(found)
+            fresh = [s for s in found if s.address not in self._seen]
             self._seen.update(sighting.address for sighting in fresh)
             # Known tokens (a trending list, an old token, one the regular monitor just
             # announced and the pending watch passed on) are not news for this session.
@@ -244,19 +259,10 @@ class TurboSession:
             elif fresh:
                 await self._check(result.url, fresh, seen_at)
             # What this cycle read may predate its end, so the next window opens at its start.
-            self._last_read[result.url] = result.started_at or started
-        return None
-
-    async def _sightings(self, result: FetchResult) -> list[Sighting]:
-        signature = await asyncio.to_thread(self._normalizer.signature, result.html)
-        return await asyncio.to_thread(
-            find_sightings,
-            self._extractor,
-            signature,
-            result.html,
-            result.extra_texts,
-            result.dom_texts,
-        )
+            # A challenge render did not show the page: the next good one is still the baseline.
+            if not blocked:
+                self._last_read[result.url] = result.started_at or started
+        return next((signal for signal in signals.values() if signal is not None), None)
 
     async def _check(self, page_url: str, sightings: Sequence[Sighting], seen_at: float) -> None:
         """A new address: announce it if it is a token, else let the pending watch wait."""
@@ -267,8 +273,9 @@ class TurboSession:
         for result in results:
             sighting = by_address.get(result.via or result.address)
             if result.contract is not None:
+                claimed = self._registry.claim(result.contract)  # records it as known
                 self._deployed(result.contract.address)
-                if self._registry.claim(result.contract.address):
+                if claimed:
                     timeline = Timeline(seen_at, missing_at=self._last_read.get(page_url))
                     await self._notifier.contract_found(
                         result.contract, page_url, sighting=sighting, timeline=timeline
@@ -291,11 +298,7 @@ class TurboSession:
         if self._sleep is not None:
             await self._sleep(max(seconds, 0.0))
             return
-        if seconds <= 0:
-            await asyncio.sleep(0)
-            return
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+        await wait_or_stop(self._stop, seconds)
 
 
 SessionFactory = Callable[[str, list[str], float, LimitsSource], TurboSession]
@@ -326,6 +329,8 @@ class TurboManager:
         self._tasks: dict[str, asyncio.Task[TurboStats]] = {}
         self._scheduled: dict[str, tuple[ScheduledTurbo, asyncio.Task[None]]] = {}
         self._launching: set[str] = set()
+        self._closing = False  # shutting down: no session starts any more
+        self._called_off: set[str] = set()  # launches stopped while probing their pages
 
     @property
     def limits(self) -> TurboLimits:
@@ -376,6 +381,9 @@ class TurboManager:
         if scheduled is not None:
             scheduled[1].cancel()
             return url
+        if url in self._launching:
+            self._called_off.add(url)  # still probing its sub-pages: it will not start
+            return url
         session, task = self._sessions.get(url), self._tasks.get(url)
         if session is None or task is None or task.done():
             raise TurboNotRunning(url)
@@ -386,6 +394,7 @@ class TurboManager:
         return url
 
     async def shutdown(self) -> None:
+        self._closing = True
         tasks = [task for _, task in self._scheduled.values()] + list(self._tasks.values())
         for task in tasks:
             task.cancel()
@@ -401,19 +410,21 @@ class TurboManager:
         )
 
     def _reserved_count(self) -> int:
-        """Everything that holds a ``max_sites`` slot."""
-        return len(self.active()) + len(self._scheduled) + len(self._launching)
+        """Everything that holds a ``max_sites`` slot (a scheduled one that is launching once)."""
+        running = {session.url for session in self.active()}
+        return len(running | set(self._scheduled) | self._launching)
 
     async def _start_later(self, plan: ScheduledTurbo) -> None:
+        # The plan stays in _scheduled until its session runs, so /turbo stop can still
+        # cancel it while the sub-pages are probed (the cancellation ends _launch).
         try:
             await self._sleep(max(plan.start_at - self._clock(), 0.0))
-        except asyncio.CancelledError:
-            self._scheduled.pop(plan.url, None)
-            raise
-        # No await between dropping the timer entry and _launch reserving the slot, so a
-        # concurrent /turbo cannot slip in.
-        self._scheduled.pop(plan.url, None)
-        await self._launch(plan.url, plan.minutes * 60)
+            if not self._closing:
+                await self._launch(plan.url, plan.minutes * 60)
+        finally:
+            entry = self._scheduled.get(plan.url)
+            if entry is not None and entry[0] is plan:
+                del self._scheduled[plan.url]
 
     async def _launch(self, url: str, duration: float) -> TurboSession:
         # Probing the sub-pages takes a moment; keep the URL reserved meanwhile so a
@@ -422,6 +433,9 @@ class TurboManager:
         try:
             limits = self.limits
             pages = await self._pick_pages(url, limits.max_pages)
+            if self._closing or url in self._called_off:
+                self._called_off.discard(url)
+                raise TurboNotRunning(url)  # the bot is shutting down, or /turbo stop came
             session = self._factory(url, pages, duration, lambda: self.limits)
             task = asyncio.create_task(session.run(), name=f"turbo:{url}")
             task.add_done_callback(lambda done, u=url: self._on_done(u, done))
@@ -432,9 +446,7 @@ class TurboManager:
             self._launching.discard(url)
 
     async def _pick_pages(self, url: str, max_pages: int) -> list[str]:
-        probes = await asyncio.gather(*(self._prober.probe(p) for p in self._deriver.derive(url)))
-        live = [url, *(probe.url for probe in probes if probe.worth_rendering)]
-        return live[:max_pages]
+        return (await live_pages(self._prober, self._deriver, url))[:max_pages]
 
     def _on_done(self, url: str, task: asyncio.Task[TurboStats]) -> None:
         if self._tasks.get(url) is task:

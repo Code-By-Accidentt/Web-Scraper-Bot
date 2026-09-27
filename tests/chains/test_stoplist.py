@@ -17,6 +17,7 @@ from scraper_bot.chains.stoplist import (
     StopList,
 )
 from scraper_bot.models import Address, Chain
+from tests.conftest import extract
 
 MEME = "0x6982508145454Ce325dDbE47a25d4ec3d2311933"
 SUI_USDC_PACKAGE = SUI_PACKAGES[0][1]
@@ -103,8 +104,8 @@ def test_the_operator_list_survives_a_bom_and_other_encodings(tmp_path: Path) ->
 
 def test_the_extractor_never_returns_stopped_addresses() -> None:
     text = f"USDC 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 and the launch {MEME}"
-    assert AddressExtractor(stoplist=StopList()).extract(text) == [evm(MEME)]
-    assert len(AddressExtractor().extract(text)) == 2  # without a stop-list nothing is dropped
+    assert extract(AddressExtractor(stoplist=StopList()), text) == [evm(MEME)]
+    assert len(extract(AddressExtractor(), text)) == 2  # without a stop-list nothing is dropped
 
 
 def test_an_unreadable_operator_list_leaves_the_built_in_one(tmp_path: Path, monkeypatch) -> None:

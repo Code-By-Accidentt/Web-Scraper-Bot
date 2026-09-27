@@ -6,13 +6,14 @@ import time
 from collections.abc import Callable
 from typing import Protocol
 
+from scraper_bot.chains.contract_validators import FailingEndpoint
 from scraper_bot.models import SiteState
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.pending import PendingWatch
 from scraper_bot.monitoring.turbo import TurboManager
 from scraper_bot.storage import AddressCache
 from scraper_bot.telegram.markup import escape
-from scraper_bot.telegram.timefmt import format_clock, format_duration
+from scraper_bot.telegram.timefmt import format_clock, format_duration, format_schedule
 
 
 class BrowserHealth(Protocol):
@@ -32,7 +33,7 @@ class StatusReporter:
         browser: BrowserHealth,
         turbo: TurboManager | None = None,
         pending: PendingWatch | None = None,
-        rpc_health: Callable[[], list[tuple[str, float]]] | None = None,
+        rpc_health: Callable[[], list[FailingEndpoint]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._version = version
@@ -41,7 +42,7 @@ class StatusReporter:
         self._browser = browser
         self._turbo = turbo
         self._pending = pending
-        self._rpc_health = rpc_health  # (endpoint, seconds without an answer)
+        self._rpc_health = rpc_health  # endpoints that stopped answering
         self._clock = clock
         self._started_at = clock()
 
@@ -50,6 +51,9 @@ class StatusReporter:
         sites = self._manager.sites()
         running = sum(1 for site in sites if self._manager.is_running(site.url))
         paused = sum(1 for site in sites if site.paused)
+        stopped = sum(
+            1 for site in sites if not site.paused and not self._manager.is_running(site.url)
+        )
         lines = [
             f"🤖 scraper-bot {self._version}, up {format_duration(now - self._started_at)}",
             f"Browser: {'connected' if self._browser.is_connected else 'DISCONNECTED'}",
@@ -57,10 +61,12 @@ class StatusReporter:
         failing = self._rpc_health() if self._rpc_health is not None else []
         if failing:
             listed = ", ".join(
-                f"{escape(name)} for {format_duration(age)}" for name, age in failing
+                f"{escape(endpoint.name)} for {format_duration(endpoint.seconds)}"
+                for endpoint in failing
             )
             lines.append(f"⚠️ RPC not answering: {listed}")
-        lines.append(f"Sites: {len(sites)} total, {running} running, {paused} paused")
+        counts = f"Sites: {len(sites)} total, {running} running, {paused} paused"
+        lines.append(counts + (f", {stopped} stopped" if stopped else ""))
         for site in sites:
             lines.append(f"• {escape(site.url)}: {self._describe(site, now)}")
         if self._turbo is not None:
@@ -74,7 +80,7 @@ class StatusReporter:
             for plan in self._turbo.scheduled():
                 lines.append(
                     f"⏰ Turbo {escape(plan.url)}: scheduled at "
-                    f"{format_clock(plan.start_at, date=False)} for {plan.minutes:.0f} min"
+                    f"{format_schedule(plan.start_at, now)} for {plan.minutes:.0f} min"
                 )
         if self._pending is not None and self._pending.count():
             lines.append(
@@ -89,6 +95,10 @@ class StatusReporter:
     def _describe(self, site: SiteState, now: float) -> str:
         if site.paused:
             return "paused"
+        if not self._manager.is_running(site.url):
+            if self._manager.restart_delay > 0:
+                return "⛔ stopped by an error: it restarts on its own, /resume restarts it now"
+            return "⛔ stopped by an error: /resume restarts it"
         stats = self._manager.stats(site.url)
         if stats is None or stats.last_round_at is None:
             return "starting"

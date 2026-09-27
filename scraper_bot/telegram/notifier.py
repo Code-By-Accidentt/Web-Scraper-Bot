@@ -8,16 +8,13 @@ import time
 from collections.abc import Callable, Coroutine, Sequence
 from typing import Any
 
-from scraper_bot.chains.enrichment import (
-    TokenEnricher,
-    TokenInfo,
-    format_amount,
-    format_usd,
-    token_links,
-)
+from scraper_bot.chains.contract_validators import FailingEndpoint
+from scraper_bot.chains.enrichment import TokenEnricher, TokenInfo
+from scraper_bot.chains.networks import token_links
 from scraper_bot.config import ChangedDefault
 from scraper_bot.models import (
     Address,
+    BlockSignal,
     ChangeReport,
     ConfirmedContract,
     Sighting,
@@ -79,21 +76,51 @@ class Notifier:
         return any(sent)
 
     async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
-        """Report a failure at most once per cooldown per ``key``; False when suppressed."""
+        """Report a failure at most once per cooldown per ``key``; True when a chat got it."""
+        if not self._problem_due(key):
+            return False
+        return await self._send(_problem_text(title, detail, hint))
+
+    def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
+        """:meth:`problem` for synchronous code (a task done-callback); sent in the background."""
+        if self._problem_due(key):
+            self._spawn(self._send(_problem_text(title, detail, hint)))
+
+    def rpc_endpoints_stuck(self, endpoints: Sequence[FailingEndpoint], retry_delay: float) -> None:
+        """RPC endpoints that have not answered for minutes: one 🛑 per outage.
+
+        The validators call it when an endpoint joins the ones failing for minutes, not
+        while an outage lasts, so a long Arc outage is one message, not one per cooldown.
+        """
+        required = any(not endpoint.optional for endpoint in endpoints)
+        detail = "\n".join(
+            f"{endpoint.name} for {format_duration(endpoint.seconds)}: {endpoint.error}"
+            for endpoint in endpoints
+        )
+        hints = []
+        if required:
+            hints.append(f"Addresses are re-checked every {retry_delay:.0f} s meanwhile.")
+        optional = [endpoint.name for endpoint in endpoints if endpoint.optional]
+        if optional:
+            what = "is an optional network" if len(optional) == 1 else "are optional networks"
+            hints.append(
+                f"{' and '.join(optional)} {what}: the other networks decide meanwhile, and "
+                "addresses are checked there again once it answers."
+            )
+        hints.append(
+            "Replace the endpoint in .env (an empty EVM URL skips that network) and restart."
+        )
+        text = _problem_text("On-chain checks keep failing", detail, " ".join(hints))
+        self._spawn(self._send(text, patient=True))  # said once per outage: it must arrive
+
+    def _problem_due(self, key: str) -> bool:
+        """True (and the cooldown starts) unless ``key`` was reported within the cooldown."""
         now = self._clock()
         last = self._problems.get(key)
         if last is not None and now - last < self._problem_cooldown:
             return False
         self._problems[key] = now
-        text = f"🛑 {escape(title)}\n{pre(str(detail)[:1500])}"
-        if hint:
-            text += f"\n{escape(hint)}"
-        await self._send(text)
         return True
-
-    def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
-        """Schedule :meth:`problem` from synchronous code, e.g. a task done-callback."""
-        self._spawn(self.problem(key, title, detail, hint))
 
     async def drain(self, timeout: float = 10.0) -> None:
         """Wait (a bounded time) for alerts still being delivered, e.g. before shutting down."""
@@ -120,6 +147,14 @@ class Notifier:
     async def page_renders_again(self, page_url: str, timeout: float) -> None:
         await self._send(
             f"✅ {escape(page_url)} renders again; load timeout back to {timeout:.0f}s."
+        )
+
+    async def captcha_shown(self, page_url: str, widget: str) -> None:
+        await self._send(
+            f"🧩 Captcha on {escape(page_url)}: the page shows a {escape(widget)} widget.\n"
+            "The bot keeps watching the page, but it does not solve captchas: whatever "
+            "appears only after solving one stays out of its sight. You hear about each "
+            "widget once per page."
         )
 
     async def contract_found(
@@ -159,22 +194,43 @@ class Notifier:
             return
         content = ("\n".join(lines) + "\n").encode("utf-8")
         task = self._spawn(
-            self._telegram.broadcast_document(self._chat_ids, filename, content, caption)
+            self._telegram.broadcast_document(
+                self._chat_ids, filename, content, caption, patient=True
+            )
         )
         self._unsent.add(task)  # the auto-pause message waits for it
         task.add_done_callback(self._unsent.discard)
 
     async def site_auto_paused(
-        self, site_url: str, page_url: str, count: int, pages: Sequence[str]
+        self,
+        site_url: str,
+        page_url: str,
+        count: int,
+        pages: Sequence[str],
+        first_check: bool = False,
     ) -> None:
+        """``first_check``: the page's first round since its monitor (re)started.
+
+        Sent from a task of its own after the document with the tokens: the caller (the
+        site's monitor, already paused) is not held up by a Telegram flood limit.
+        """
         listed = "\n".join(f"• {escape(page)}" for page in pages)
-        await self._alerts_out()  # the document with the tokens goes first
-        await self._send(
+        why = (
+            "This was the first check of the page since monitoring started or resumed, so "
+            f"these are most likely tokens the page already listed (for example on a newly "
+            f"supported network), not {count} launches.\n"
+            if first_check
+            else ""
+        )
+        text = (
             f"⏸️ Monitoring paused: {count} confirmed contracts found on {escape(page_url)}\n"
+            f"{why}"
             f"Website: {escape(site_url)}\n"
             f"Pages:\n{listed}\n"
-            f"Send {code(f'/resume {site_url}')} to continue."
+            f"Send {code(f'/resume {site_url}')} to continue; these tokens will not be "
+            "announced again."
         )
+        self._spawn(self._after_alerts(text, patient=True))  # the document goes first
 
     # ── unverified addresses (/unverified mode) ─────────────────────────────
     async def unverified_address(
@@ -232,29 +288,38 @@ class Notifier:
         renders: int,
     ) -> None:
         found = "\n".join(f"• {code(c.address.value)} ({escape(c.network)})" for c in contracts)
-        await self._alerts_out()  # the tokens listed here are announced first
-        await self._send(
+        text = (
             f"🎯 Turbo finished on {escape(site_url)}: {escape(reason)}\n"
             f"Duration {seconds:.0f}s, {renders} renders, {len(contracts)} confirmed contract(s)."
             + (f"\n{found}" if found else "")
         )
+        self._spawn(self._after_alerts(text))  # the tokens listed here are announced first
 
     # ── blocking ────────────────────────────────────────────────────────────
     async def site_blocked(
-        self, site_url: str, page_url: str, reason: str, next_delay: float
+        self, site_url: str, page_url: str, signal: BlockSignal, next_delay: float
     ) -> None:
-        await self._send(
-            f"🚫 Possible IP block on {escape(site_url)}\n"
-            f"Page: {escape(page_url)}\n"
-            f"Reason: {code(reason)}\n"
+        lines = [
+            f"🚫 Possible IP block on {escape(site_url)}",
+            f"Page: {escape(page_url)}",
+            f"Reason: {code(signal.reason)}",
+        ]
+        if signal.protection is not None:
+            lines.append(f"Protection: {escape(signal.protection)}")
+        lines.append(
             f"Slowing down: next check in {next_delay:.0f}s, the interval keeps doubling "
-            f"while this lasts; a turbo session on this site ends when its own render "
-            f"sees the block. "
-            f"If it persists, the site may have banned this IP address."
+            "while this lasts; a turbo session on this site ends when its own render sees "
+            "the block. The bot does not solve captchas or browser checks, it waits until "
+            "the site lets it through; you get a message when it answers normally again. "
+            "If it persists, the site may have banned this IP address."
         )
+        await self._send("\n".join(lines))
 
-    async def site_recovered(self, site_url: str) -> None:
-        await self._send(f"✅ {escape(site_url)} answers normally again; normal interval restored.")
+    async def site_recovered(self, site_url: str, blocked_for: float | None = None) -> None:
+        after = f" after {format_duration(blocked_for)}" if blocked_for is not None else ""
+        await self._send(
+            f"✅ {escape(site_url)} answers normally again{after}; normal interval restored."
+        )
 
     # ── formatting ──────────────────────────────────────────────────────────
     @staticmethod
@@ -320,7 +385,9 @@ class Notifier:
         if not self._chat_ids:
             log.warning("no TELEGRAM_CHAT_IDS configured; dropping alert: %s", text.splitlines()[0])
             return []
-        sent = await asyncio.gather(*(self._telegram.send_tracked(c, text) for c in self._chat_ids))
+        sent = await asyncio.gather(
+            *(self._telegram.send_tracked(c, text, patient=True) for c in self._chat_ids)
+        )
         return [message for message in sent if message is not None]
 
     def _spawn_alert(
@@ -335,10 +402,15 @@ class Notifier:
         out.add_done_callback(self._unsent.discard)
         self._spawn(self._deliver_token(contract, head, sighting, timeline, out))
 
-    async def _alerts_out(self, timeout: float = 5.0) -> None:
-        """Wait (a bounded time) until every token alert and document under way has left."""
+    async def _after_alerts(self, text: str, *, patient: bool = False) -> None:
+        """Send ``text`` once the token alerts and documents under way have left.
+
+        They wait out flood limits themselves (a few minutes at most); the bound only keeps
+        a stuck delivery from holding this message forever.
+        """
         if self._unsent:
-            await asyncio.wait(set(self._unsent), timeout=timeout)
+            await asyncio.wait(set(self._unsent), timeout=_ALERTS_OUT_WAIT)
+        await self._send(text, patient=patient)
 
     def _spawn(self, work: Coroutine[Any, Any, Any]) -> asyncio.Future[Any]:
         task = asyncio.ensure_future(work)
@@ -351,17 +423,52 @@ class Notifier:
         if not task.cancelled() and task.exception() is not None:
             log.error("delivering an alert failed", exc_info=task.exception())
 
-    async def _send(self, text: str) -> None:
+    async def _send(self, text: str, *, patient: bool = False) -> bool:
+        """Send to every alert chat; True when at least one of them received it."""
         if not self._chat_ids:
             log.warning("no TELEGRAM_CHAT_IDS configured; dropping alert: %s", text.splitlines()[0])
-            return
-        await self._telegram.broadcast(self._chat_ids, text)
+            return False
+        return await self._telegram.broadcast(self._chat_ids, text, patient=patient)
 
 
 NO_PAIR_YET = "No DEX pair listed yet."
+_ALERTS_OUT_WAIT = 300.0  # longest wait of a follow-up notice for the alerts it follows
 # Every RPC node keeps at least this much transaction history (seconds). The oldest
 # transaction a public node still has may be days younger than the token itself.
 _HISTORY_SURELY_KEPT = 3600.0
+
+
+def _problem_text(title: str, detail: str, hint: str | None) -> str:
+    text = f"🛑 {escape(title)}\n{pre(str(detail)[:1500])}"
+    return f"{text}\n{escape(hint)}" if hint else text
+
+
+def _short(value: float) -> str:
+    if abs(value) >= 100:
+        text = f"{value:.0f}"
+    elif abs(value) >= 10:
+        text = f"{value:.1f}"
+    else:
+        text = f"{value:.2f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def format_amount(value: float) -> str:
+    """``1.23K``, ``12.4M``, ``5B``; plain numbers below a thousand."""
+    for unit, threshold in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(value) >= threshold:
+            return f"{_short(value / threshold)}{unit}"
+    return _short(value)
+
+
+def format_usd(value: float) -> str:
+    if value >= 1000:
+        return f"${format_amount(value)}"
+    if value >= 1:
+        return f"${value:.2f}"
+    if value >= 0.0001:
+        return f"${value:.4g}"
+    return f"${value:.2g}"
 
 
 def _found_line(contract: ConfirmedContract, sighting: Sighting | None) -> str | None:

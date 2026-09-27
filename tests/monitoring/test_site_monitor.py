@@ -94,8 +94,17 @@ class Harness:
             sleep=sleep,
         )
 
-    def outcome(self, url: str, status: PageStatus, **kwargs: Any) -> None:
+    def outcome(
+        self,
+        url: str,
+        status: PageStatus,
+        *,
+        contracts: tuple[ConfirmedContract, ...] = (),
+        **kwargs: Any,
+    ) -> None:
+        """Script the next checks of ``url``; ``contracts`` are the tokens its renders show."""
         self.checker.outcomes[url] = PageCheckOutcome(url, status, **kwargs)
+        self.checker.tokens[url] = contracts
 
 
 async def test_round_checks_root_and_only_live_sub_pages() -> None:
@@ -163,8 +172,19 @@ async def test_many_contracts_send_a_document_and_pause_the_site() -> None:
     assert h.notifier.contracts == []
     assert h.notifier.batches == [(ROOT, ROOT, found)]
     assert h.notifier.paused == [(ROOT, ROOT, 3)]
+    assert h.notifier.first_check_pauses == [True]  # a listing the page already had, probably
     assert h.auto_pauses == [(ROOT, ROOT)]
     assert h.monitor.stopped
+
+
+async def test_a_pause_after_the_first_round_is_not_called_a_first_check() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404}, threshold=3)
+    await h.monitor.run_once()  # a quiet first round
+    found = tuple(contract(i) for i in range(3))
+    h.outcome(ROOT, PageStatus.CHANGED, contracts=found, report=ChangeReport(ROOT))
+    await h.monitor.run_once()
+    assert h.notifier.paused == [(ROOT, ROOT, 3)]
+    assert h.notifier.first_check_pauses == [False]
 
 
 async def test_failing_check_does_not_break_the_round() -> None:
@@ -597,3 +617,80 @@ async def test_a_token_on_a_sub_page_that_went_live_counts_for_turbo() -> None:
     checker.observations = {ROOT: [seen(ROOT, 5.0)], APP: [seen(APP, 5.0, address(8))]}
     await h.monitor.run_once()
     assert pending.announced_tokens == [(ROOT, address(8))]
+
+
+async def test_the_block_alert_names_the_protection_and_recovery_says_how_long() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    signal = BlockSignal("HTTP 403", protection="Cloudflare challenge")
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 403", block=signal)
+    await h.monitor.run_once()
+    assert h.notifier.block_signals == [signal]
+    assert h.monitor.stats.block_reason == "Cloudflare challenge (HTTP 403)"
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()
+    assert h.notifier.recovered == [ROOT]
+    [blocked_for] = h.notifier.blocked_for
+    assert blocked_for is not None and 0 <= blocked_for < 5
+
+
+async def test_a_captcha_widget_is_announced_once_per_page_and_widget() -> None:
+    h = Harness(statuses={APP: 200, DOCS: 404})
+    h.outcome(ROOT, PageStatus.UNCHANGED, captcha="hCaptcha")
+    h.outcome(APP, PageStatus.BASELINE, captcha="reCAPTCHA")
+    await h.monitor.run_once()
+    await h.monitor.run_once()
+    assert sorted(h.notifier.captchas) == sorted([(ROOT, "hCaptcha"), (APP, "reCAPTCHA")])
+    assert h.site.captcha_pages == {ROOT: ["hCaptcha"], APP: ["reCAPTCHA"]}
+    h.outcome(ROOT, PageStatus.UNCHANGED)  # gone: nothing to say, nothing forgotten
+    await h.monitor.run_once()
+    h.outcome(ROOT, PageStatus.UNCHANGED, captcha="Cloudflare Turnstile")  # another one
+    await h.monitor.run_once()
+    assert h.notifier.captchas[-1] == (ROOT, "Cloudflare Turnstile")
+    assert len(h.notifier.captchas) == 3
+    for widget in ("hCaptcha", "Cloudflare Turnstile", "hCaptcha"):  # alternating widgets
+        h.outcome(ROOT, PageStatus.UNCHANGED, captcha=widget)
+        await h.monitor.run_once()
+    assert len(h.notifier.captchas) == 3  # each widget once
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 500", captcha="hCaptcha")
+    await h.monitor.run_once()
+    assert len(h.notifier.captchas) == 3  # an unavailable page is not read for widgets
+
+
+async def test_the_first_seen_memory_forgets_the_addresses_gone_longest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scraper_bot.monitoring.site_monitor as site_monitor
+
+    monkeypatch.setattr(site_monitor, "_FIRST_SEEN_MEMORY", 2)
+    h, checker = observing({APP: 404, DOCS: 404})
+    ca, gone, other = address(3), address(4), address(5)
+
+    def rejected_at(at: float, *addresses: Address) -> Observation:
+        return Observation(
+            ROOT,
+            at,
+            tuple(Sighting(a, SightingSource.TEXT) for a in addresses),
+            tuple(ValidationResult(a, ValidationStatus.REJECTED) for a in addresses),
+        )
+
+    for observation in (rejected_at(50.0, ca), rejected_at(60.0, ca, gone)):
+        checker.observations = {ROOT: [observation]}
+        await h.monitor.run_once()
+    checker.observations = {ROOT: [rejected_at(70.0, ca, other)]}  # ``gone`` is forgotten
+    await h.monitor.run_once()
+    checker.observations = {ROOT: [seen(ROOT, 80.0, ca)]}
+    await h.monitor.run_once()
+    [(_, timeline)] = h.notifier.contract_details
+    assert timeline == Timeline(80.0, on_page_since=50.0)
+
+
+async def test_a_challenge_render_does_not_open_an_appearance_window() -> None:
+    h, checker = observing({APP: 404, DOCS: 404})
+    old_token = address(6)
+    challenge = Observation(ROOT, 200.0, (), (), started_at=199.0, read=False)
+    checker.observations = {ROOT: [challenge]}
+    await h.monitor.run_once()  # a restart met a challenge first
+    checker.observations = {ROOT: [seen(ROOT, 300.0, old_token)]}
+    await h.monitor.run_once()
+    [(_, timeline)] = h.notifier.contract_details
+    assert timeline == Timeline(300.0, missing_at=None)  # found on the first real read

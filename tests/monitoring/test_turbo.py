@@ -108,9 +108,9 @@ class Harness:
         self.validator = FakeValidator()
         self.notifier = FakeNotifier()
         self.pending = FakePending()
-        self.registry = AlertRegistry()
         self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
         self.cache.load()
+        self.registry = AlertRegistry(self.cache)
         self.now = 1_000.0
         self.session = TurboSession(
             ROOT,
@@ -154,7 +154,7 @@ async def test_a_new_token_is_announced_and_ends_the_session(tmp_path) -> None:
     assert sighting is not None and sighting.context == "Live CA:" and sighting.hinted
     assert timeline == Timeline(1_000.0, missing_at=1_000.0)  # the clock stood still
     assert h.notifier.unverified == []  # confirmed tokens only, never an early guess
-    assert stats.found == [ConfirmedContract(ADDRESS, "unknown network")]
+    assert stats.found == [ConfirmedContract(ADDRESS, "Base")]  # recorded by the claim
     assert stats.stop_reason == "found 1 confirmed contract(s)"
     assert stats.cycles == 2 and stats.renders == 2
     assert h.notifier.turbo_started_calls == [(ROOT, 1, 0.01, 1.0, 1)]
@@ -199,9 +199,17 @@ async def test_known_tokens_are_ignored(tmp_path) -> None:
 async def test_confirmation_by_the_regular_monitor_counts_without_a_second_alert(tmp_path) -> None:
     h = Harness(tmp_path)
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
-    h.validator.known(ADDRESS)  # the regular monitor announced it a moment ago
+    h.validator.known(ADDRESS)
+    validate_many = h.validator.validate_many
+
+    async def announced_meanwhile(addresses, **options):
+        # The regular monitor announced it while this check ran; its claim recorded it.
+        h.registry.claim(ConfirmedContract(ADDRESS, "Base"))
+        return await validate_many(addresses, **options)
+
+    h.validator.validate_many = announced_meanwhile  # type: ignore[method-assign]
     stats = await h.session.run()
-    assert stats.found == [ConfirmedContract(ADDRESS, "unknown network")]
+    assert stats.found == [ConfirmedContract(ADDRESS, "Base")]
     assert h.notifier.contracts == []
     assert stats.stop_reason == "found 1 confirmed contract(s)"
 
@@ -210,7 +218,14 @@ async def test_a_token_claimed_elsewhere_is_not_announced_twice(tmp_path) -> Non
     h = Harness(tmp_path)
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
     h.validator.confirm(ADDRESS, "Base")
-    h.registry.claim(ADDRESS)  # another page announced it in the same instant
+    validate_many = h.validator.validate_many
+
+    async def claimed_meanwhile(addresses, **options):
+        # Another page gets the same shared verdict and claims the token first.
+        h.registry.claim(ConfirmedContract(ADDRESS, "Base"))
+        return await validate_many(addresses, **options)
+
+    h.validator.validate_many = claimed_meanwhile  # type: ignore[method-assign]
     stats = await h.session.run()
     assert h.notifier.contracts == []
     assert stats.stop_reason == "found 1 confirmed contract(s)"
@@ -429,7 +444,7 @@ async def test_scheduled_launch_keeps_its_reservation() -> None:
         plan = await manager.start(ROOT, 5, start_at=time.time() + 5)
         assert isinstance(plan, ScheduledTurbo)
         await asyncio.sleep(0.02)  # timer fired, launch is probing sub-pages
-        assert manager.scheduled() == [] and manager.active() == []
+        assert manager.scheduled() == [plan] and manager.active() == []  # still reserved
         with pytest.raises(TurboAlreadyRunning):
             await manager.start(ROOT)
         for _ in range(100):
@@ -437,8 +452,30 @@ async def test_scheduled_launch_keeps_its_reservation() -> None:
                 break
             await asyncio.sleep(0.01)
         assert [s.url for s in manager.active()] == [ROOT]
+        assert manager.scheduled() == []
     finally:
         await manager.shutdown()
+
+
+async def test_turbo_stop_cancels_a_scheduled_session_while_it_launches() -> None:
+    manager = make_slow_manager()
+    try:
+        await manager.start(ROOT, 5, start_at=time.time() + 5)
+        await asyncio.sleep(0.02)  # timer fired, launch is probing sub-pages
+        assert await manager.stop(ROOT) == ROOT
+        await asyncio.sleep(0.2)  # the probe would have finished by now
+        assert manager.active() == [] and manager.scheduled() == []
+    finally:
+        await manager.shutdown()
+
+
+async def test_no_session_starts_during_a_shutdown() -> None:
+    manager = make_slow_manager()
+    await manager.start(ROOT, 5, start_at=time.time() + 5)
+    await asyncio.sleep(0.02)  # the launch is probing sub-pages
+    await manager.shutdown()
+    await asyncio.sleep(0.2)
+    assert manager.active() == []
 
 
 async def test_zero_minutes_is_clamped_to_the_minimum() -> None:
@@ -687,3 +724,60 @@ async def test_the_appearance_window_opens_when_the_previous_render_began(tmp_pa
     await asyncio.wait_for(h.session.run(), timeout=2)
     [(_, timeline)] = h.notifier.contract_details
     assert timeline is not None and timeline.missing_at == 990.0  # not the cycle's own start
+
+
+async def test_a_block_on_one_page_does_not_cost_the_ca_another_page_shows(tmp_path) -> None:
+    docs = "https://example.com/docs"
+    h = Harness(tmp_path, pages=[ROOT, docs])
+    h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
+    h.fetcher.html(docs, EMPTY, CHALLENGE)  # the second cycle: the docs page is challenged
+    h.validator.confirm(ADDRESS, "Base")
+    stats = await h.session.run()
+    assert h.notifier.contracts == [(ConfirmedContract(ADDRESS, "Base"), ROOT)]
+    assert stats.found == [ConfirmedContract(ADDRESS, "Base")]
+    assert stats.stop_reason == "found 1 confirmed contract(s)"
+
+
+async def test_a_2xx_page_that_looks_like_a_challenge_is_still_read(tmp_path) -> None:
+    h = Harness(tmp_path)
+    looks_blocked = WITH_ADDRESS.replace("<html>", "<html><title>Just a moment...</title>")
+    h.fetcher.html(ROOT, EMPTY, looks_blocked)
+    h.validator.confirm(ADDRESS, "Base")
+    stats = await h.session.run()
+    assert h.notifier.contracts == [(ConfirmedContract(ADDRESS, "Base"), ROOT)]
+    assert stats.stop_reason == "found 1 confirmed contract(s)"  # the block would end it too
+    assert stats.cycles == 2
+
+
+async def test_a_direct_start_still_probing_at_shutdown_does_not_start() -> None:
+    manager = make_slow_manager()
+    launching = asyncio.create_task(manager.start(ROOT, 5))  # /turbo, not scheduled
+    await asyncio.sleep(0.02)  # the launch is probing sub-pages
+    await manager.shutdown()
+    with pytest.raises(TurboNotRunning):
+        await launching
+    assert manager.active() == []
+
+
+async def test_a_blank_first_render_is_not_the_baseline(tmp_path) -> None:
+    h = Harness(tmp_path)
+    blank = "<html><body></body></html>"
+    h.fetcher.html(ROOT, blank, WITH_ADDRESS, WITH_ADDRESS)
+    h.validator.confirm(ADDRESS, "Base")
+    await h.session._cycle()  # hydrating: nothing to read yet
+    await h.session._cycle()  # the first real read: the token there is old news
+    assert h.notifier.contracts == []
+    assert [address for address, _ in h.pending.baseline] == [ADDRESS]
+
+
+async def test_stop_during_a_launch_calls_it_off() -> None:
+    manager = make_slow_manager()
+    try:
+        launching = asyncio.create_task(manager.start(ROOT, 5))  # probing its sub-pages
+        await asyncio.sleep(0.02)
+        assert await manager.stop(ROOT) == ROOT
+        with pytest.raises(TurboNotRunning):
+            await launching
+        assert manager.active() == []
+    finally:
+        await manager.shutdown()

@@ -19,6 +19,15 @@ from scraper_bot.pages.urls import (
         ("http://Foo.IO/path?q=1#frag", "http://foo.io/path?q=1"),
         ("localhost:8000", "https://localhost:8000"),
         ("https://sub.domain.co.uk:8443/x", "https://sub.domain.co.uk:8443/x"),
+        ("https://example.com:443/", "https://example.com"),
+        ("http://example.com:80/a", "http://example.com/a"),
+        ("http://example.com:443/a", "http://example.com:443/a"),
+        ("https://app.io/#/presale", "https://app.io/#/presale"),
+        ("app.io#/presale?ref=1", "https://app.io/#/presale?ref=1"),
+        ("https://app.io/v2/#!/sale", "https://app.io/v2/#!/sale"),
+        ("https://app.io/page#section", "https://app.io/page"),
+        ("https://app.io/#/", "https://app.io"),
+        ("https://app.io/#!/", "https://app.io"),
     ],
 )
 def test_normalize_url(raw: str, expected: str) -> None:

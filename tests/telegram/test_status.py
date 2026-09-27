@@ -1,12 +1,15 @@
+import asyncio
 from pathlib import Path
+from typing import Any
 
+from scraper_bot.chains.contract_validators import FailingEndpoint
 from scraper_bot.models import Address, Chain, ChangeCounts, ConfirmedContract, LastChange
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.turbo import ScheduledTurbo, TurboManager
 from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.storage import AddressCache, SnapshotStore, StateStore
 from scraper_bot.telegram.status import StatusReporter, format_duration
-from scraper_bot.telegram.timefmt import format_clock
+from scraper_bot.telegram.timefmt import format_schedule
 from tests.conftest import FakeProber, FakeTuning, StubMonitor, StubTurboSession
 
 
@@ -153,7 +156,7 @@ async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None
     assert lines[2] == "Sites: 0 total, 0 running, 0 paused"
     assert lines[3] == "🚀 Turbo https://a.io: 3 cycles, 1 confirmed, 2 pending, 10m 0s left"
     assert lines[4] == (
-        f"⏰ Turbo https://b.io: scheduled at {format_clock(starts_at, date=False)} for 5 min"
+        f"⏰ Turbo https://b.io: scheduled at {format_schedule(starts_at, clock_now)} for 5 min"
     )
     assert lines[5].startswith("Address cache:")
 
@@ -219,10 +222,36 @@ async def test_status_names_rpc_endpoints_that_do_not_answer(tmp_path: Path) -> 
         restart_delay=0,
     )
     cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
-    failing: list[tuple[str, float]] = [("Sui", 425.0)]
+    failing = [FailingEndpoint("Sui", 425.0, "sui_getObject via sui.rpc: HTTP 502")]
     reporter = StatusReporter(
         version="1", manager=manager, cache=cache, browser=Browser(True), rpc_health=lambda: failing
     )
     assert "⚠️ RPC not answering: Sui for 7m 5s" in reporter.render()
     failing.clear()
     assert "RPC not answering" not in reporter.render()
+
+
+async def test_a_crashed_monitor_is_stopped_not_starting(tmp_path: Path) -> None:
+    def crashing(site: Any, persist: Any, on_auto_pause: Any) -> StubMonitor:
+        return StubMonitor(site, persist, on_auto_pause, crash=True)
+
+    manager = MonitorManager(
+        state_store=StateStore(tmp_path / "state.json"),
+        snapshot_store=SnapshotStore(tmp_path / "snaps"),
+        deriver=SubUrlDeriver(()),
+        monitor_factory=crashing,
+        restart_delay=0,
+    )
+    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    cache.load()
+    reporter = StatusReporter(version="9.9", manager=manager, cache=cache, browser=Browser(True))
+    await manager.start()
+    try:
+        await manager.add_site("https://a.io")
+        await asyncio.sleep(0)  # the monitor runs and crashes
+        text = reporter.render()
+    finally:
+        await manager.shutdown()
+    assert "Sites: 1 total, 0 running, 0 paused, 1 stopped" in text
+    # restart_delay=0: nothing restarts it by itself (production: 30 s after each crash)
+    assert "• https://a.io: ⛔ stopped by an error: /resume restarts it" in text

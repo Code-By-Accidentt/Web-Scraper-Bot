@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 import httpx
 from playwright import async_api as pw
 
+from scraper_bot.chains.rpc import parse_retry_after
 from scraper_bot.config import Settings
 from scraper_bot.preferences import Tuning
 
@@ -27,6 +29,9 @@ class BrowserUnavailable(RuntimeError):
 _SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
 _SCANNED_CONTENT_TYPES = ("javascript", "ecmascript", "json", "text/", "xml")
 _PER_RESPONSE_LIMIT = 3 * 1024 * 1024
+# How a launch that failed because of the sandbox says so ("Chromium sandboxing failed!",
+# "No usable sandbox!", "Running as root without --no-sandbox", namespace errors).
+_SANDBOX_TROUBLE = ("sandbox", "namespace", "zygote", "setuid")
 
 # Requests a page makes that the bot never needs. Next.js prefetches the pages its links
 # point to (harvestco.ai: ten per load), and analytics beacons report every render to the
@@ -103,11 +108,6 @@ class FetchResult:
     def reason(self) -> str:
         return self.error or f"HTTP {self.status}"
 
-    @property
-    def scan_texts(self) -> tuple[str, ...]:
-        """Everything worth searching for addresses: the DOM first, then the extras."""
-        return (self.html, *self.extra_texts)
-
 
 class PageFetcher(Protocol):
     """Anything that can turn a URL into rendered HTML.
@@ -137,17 +137,22 @@ class PlaywrightFetcher:
         self._launch_lock = asyncio.Lock()
         self._blocked = frozenset(settings.blocked_resource_types)
         self._args = list(settings.browser_args)
-
-    async def __aenter__(self) -> PlaywrightFetcher:
-        await self.start()
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> None:
-        await self.stop()
+        # Chromium's own sandbox, unless BROWSER_ARGS switch it off or it cannot start here
+        # (as root, or without user namespaces in a container): then the bot runs without it.
+        self._sandbox = "--no-sandbox" not in self._args
+        self.sandbox_error: str | None = None  # why the sandbox was given up, if it was
+        self._launched = False
+        # Told when a relaunch (after a crash) had to give the sandbox up; the start is
+        # reported by the application.
+        self.on_sandbox_lost: Callable[[str], None] | None = None
 
     @property
     def is_connected(self) -> bool:
         return self._browser is not None and self._browser.is_connected()
+
+    @property
+    def sandboxed(self) -> bool:
+        return self._sandbox
 
     async def start(self) -> None:
         self._playwright = await pw.async_playwright().start()
@@ -171,7 +176,7 @@ class PlaywrightFetcher:
                 except pw.Error as exc:
                     if attempt == 1 and self._browser_gone(exc):
                         log.warning("browser connection lost (%s); relaunching", self._brief(exc))
-                        await self._close_browser()
+                        await self._discard(context)
                         continue
                     return FetchResult(url, None, error=self._brief(exc))
             return FetchResult(url, None, error="browser unavailable")
@@ -224,7 +229,7 @@ class PlaywrightFetcher:
                 extra_texts=dom + bodies,
                 dom_texts=dom,
                 headers=headers,
-                retry_after=_parse_retry_after(headers.get("retry-after")),
+                retry_after=parse_retry_after(headers.get("retry-after")),
                 started_at=started_at,
             )
         finally:
@@ -261,6 +266,9 @@ class PlaywrightFetcher:
                 break
             if not self._worth_scanning(response):
                 continue
+            length = response.headers.get("content-length", "")
+            if length.isdigit() and int(length) > _PER_RESPONSE_LIMIT:
+                continue  # not fetched from the browser only to be thrown away
             try:
                 body = await response.body()
             except pw.Error:
@@ -306,21 +314,62 @@ class PlaywrightFetcher:
         assert self._playwright is not None, "start() must be called first"
         cfg = self._settings
         channel = cfg.browser_channel if cfg.browser_channel not in {"", "bundled"} else None
-        self._browser = await self._playwright.chromium.launch(
-            headless=cfg.headless, channel=channel, args=self._args
-        )
-        self._context = await self._browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            ignore_https_errors=True,
-        )
-        # Every request passes the filter: blocked resource types, prefetches, beacons.
-        await self._context.route("**/*", self._route)
+        chromium = self._playwright.chromium
+        try:
+            browser = await chromium.launch(
+                headless=cfg.headless,
+                channel=channel,
+                args=self._args,
+                chromium_sandbox=self._sandbox,
+            )
+        except pw.Error as exc:
+            if not self._sandbox or not self._sandbox_trouble(exc):
+                raise
+            # The sandbox refuses root and needs user namespaces; without it the browser
+            # still works, isolated only by the bot's own user account.
+            browser = await chromium.launch(
+                headless=cfg.headless, channel=channel, args=self._args, chromium_sandbox=False
+            )
+            self._sandbox = False
+            self.sandbox_error = self._brief(exc)
+            log.warning(
+                "Chromium could not start with its sandbox (%s); running without it",
+                self.sandbox_error,
+            )
+            if self._launched and self.on_sandbox_lost is not None:
+                self.on_sandbox_lost(self.sandbox_error)
+        try:
+            context = await browser.new_context(
+                viewport={"width": 1366, "height": 900},
+                ignore_https_errors=True,
+            )
+            # Every request passes the filter: blocked resource types, prefetches, beacons.
+            await context.route("**/*", self._route)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await browser.close()  # the next attempt launches a new one
+            raise
+        self._browser, self._context = browser, context
+        self._launched = True
         log.info(
-            "browser started (%s, headless=%s, args=%s)",
+            "browser started (%s, headless=%s, sandbox=%s, args=%s)",
             channel or "chromium",
             cfg.headless,
+            "on" if self._sandbox else "off",
             " ".join(self._args) or "none",
         )
+
+    @staticmethod
+    def _sandbox_trouble(exc: pw.Error) -> bool:
+        """True when a launch failed because of the sandbox (not a timeout or a crash)."""
+        text = str(exc).lower()
+        return any(sign in text for sign in _SANDBOX_TROUBLE)
+
+    async def _discard(self, context: pw.BrowserContext) -> None:
+        """Close the browser a failed tab used, unless another tab relaunched it already."""
+        async with self._launch_lock:
+            if self._context is context:
+                await self._close_browser()
 
     async def _close_browser(self) -> None:
         browser, self._browser, self._context = self._browser, None, None
@@ -376,17 +425,6 @@ def _same_page(path: str, request: pw.Request) -> bool:
     except pw.Error:  # a service worker's request has no frame
         return True
     return path.rstrip("/") == page.rstrip("/")
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    """Seconds from a ``Retry-After`` header; HTTP-date forms are ignored."""
-    if value is None:
-        return None
-    try:
-        seconds = float(value.strip())
-    except ValueError:
-        return None
-    return seconds if seconds >= 0 else None
 
 
 @dataclass(frozen=True, slots=True)

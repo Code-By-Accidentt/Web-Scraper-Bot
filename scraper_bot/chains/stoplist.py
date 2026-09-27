@@ -2,7 +2,8 @@
 
 App pages load wallet-connect bundles and swap widgets full of these; without the list a
 first round on such a site announces a dozen "contracts" and auto-pauses it. Every token
-below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24.
+below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24; those on Arc
+and Robinhood Chain, taken from the chains' own docs, on 2026-09-27.
 """
 
 from __future__ import annotations
@@ -88,6 +89,17 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("DAI", "0x8D11eC38a3EB5E956B052f67Da8Bdc9bef8Abf3E"),
         ("WETH", "0x74b23882a30290451A17c44f4F05243b6b58C76d"),
         ("WBTC", "0x321162Cd933E2Be498Cd2267a90534A804051b11"),
+    ),
+    "Arc": (
+        ("USDC", "0x3600000000000000000000000000000000000000"),  # the gas token's ERC-20 face
+        ("EURC", "0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1"),
+        ("USYC", "0x8a5D989Bbb96929F689B0200f435f53dA42bF490"),
+        ("cirBTC", "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0"),
+        ("WETH", "0x128cC466B61f542da60c70e3aA11c10e19B84EDB"),
+    ),
+    "Robinhood Chain": (
+        ("WETH", "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"),
+        ("USDG", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"),
     ),
 }
 

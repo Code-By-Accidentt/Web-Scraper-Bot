@@ -340,3 +340,96 @@ def test_corrupt_legacy_notifications_file_means_alerts_on(tmp_path: Path) -> No
         flags.write_text(content, encoding="utf-8")
         sites = LegacyStateImporter(tmp_path).sites()
         assert sites["https://a.io"].notifications_enabled is True, content
+
+
+def test_a_damaged_state_file_is_moved_aside_not_overwritten(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text('{"sites": {"https://a.io": {},}}', encoding="utf-8")  # a stray comma
+    store = StateStore(path)
+    assert store.load() == {}
+    assert store.broken is not None and "unreadable" in store.broken[0]
+    moved = store.broken[1]
+    assert moved is not None and moved.read_text(encoding="utf-8").startswith('{"sites"')
+    assert not path.exists()  # the next save starts a new file; the old one is kept aside
+
+
+def test_one_bad_site_entry_keeps_the_others_and_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    good = SiteState("https://a.io").to_dict()
+    path.write_text(
+        json.dumps({"sites": {"https://a.io": good, "https://b.io": {"added_at": "abc"}}}),
+        encoding="utf-8",
+    )
+    store = StateStore(path)
+    assert list(store.load()) == ["https://a.io"]
+    assert store.broken is not None and "https://b.io" in store.broken[0]
+    assert store.broken[1] is not None and store.broken[1].is_file()
+
+
+def test_rejections_of_one_chain_can_be_forgotten(tmp_path: Path) -> None:
+    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=3600)
+    cache.load()
+    evm = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    other = Address(Chain.ETHEREUM, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+    sol = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
+    cache.add_rejected(evm)
+    cache.add_rejected(sol)
+    cache.add_rejected(other)
+    assert cache.forget_rejected(Chain.ETHEREUM) == 2
+    reloaded = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=3600)
+    reloaded.load()
+    assert reloaded.is_rejected(sol) and reloaded.rejected_count == 1
+    assert not reloaded.is_rejected(evm) and not reloaded.is_rejected(other)
+
+
+def test_the_captcha_pages_of_a_site_survive_a_save() -> None:
+    site = SiteState("https://a.io", captcha_pages={"https://a.io/claim": ["hCaptcha"]})
+    again = SiteState.from_dict("https://a.io", site.to_dict())
+    assert again.captcha_pages == {"https://a.io/claim": ["hCaptcha"]}
+    assert SiteState.from_dict("https://a.io", {}).captcha_pages == {}  # saved by 2.1
+
+
+def test_a_torn_last_line_does_not_swallow_the_next_known_contract(tmp_path: Path) -> None:
+    known = tmp_path / "k.tsv"
+    first = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    known.write_text(f"Ethereum\t{first.value}\tBase\t2026-09-27\nSolana\t2qEHjDL", "utf-8")
+    cache = AddressCache(known, tmp_path / "r.tsv", rejected_ttl=3600)
+    cache.load()
+    later = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
+    assert cache.add_known(ConfirmedContract(later, "Solana"))
+    again = AddressCache(known, tmp_path / "r.tsv", rejected_ttl=3600)
+    again.load()
+    assert again.is_known(first) and again.is_known(later)
+
+
+def test_expired_rejections_are_swept_out_and_not_counted(tmp_path: Path) -> None:
+    now = [1_000.0]
+    rejected = tmp_path / "r.tsv"
+    cache = AddressCache(tmp_path / "k.tsv", rejected, rejected_ttl=100, clock=lambda: now[0])
+    cache.load()
+    old = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    cache.add_rejected(old)
+    now[0] += 150
+    fresh = Address(Chain.SOLANA, "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump")
+    cache.add_rejected(fresh)
+    assert cache.rejected_count == 1  # the expired one no longer counts
+    assert cache.sweep() == 1
+    assert old.value not in rejected.read_text(encoding="utf-8")
+    assert cache.is_rejected(fresh)
+
+
+def test_expired_rejections_are_swept_while_rejections_come_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scraper_bot.storage as storage_module
+
+    monkeypatch.setattr(storage_module, "_SWEEP_EVERY", 2)
+    now = [1_000.0]
+    rejected = tmp_path / "r.tsv"
+    cache = AddressCache(tmp_path / "k.tsv", rejected, rejected_ttl=100, clock=lambda: now[0])
+    cache.load()
+    old = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+    cache.add_rejected(old)
+    now[0] += 150
+    cache.add_rejected(Address(Chain.ETHEREUM, "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"))
+    assert old.value not in rejected.read_text(encoding="utf-8")  # the second add swept

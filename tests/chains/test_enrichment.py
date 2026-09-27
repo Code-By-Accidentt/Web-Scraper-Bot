@@ -5,70 +5,29 @@ import logging
 import time
 from typing import Any
 
-import base58
 import httpx
 import pytest
 
-from scraper_bot.chains.enrichment import (
-    TokenEnricher,
-    TokenInfo,
-    decode_abi_string,
-    decode_abi_uint,
-    format_amount,
-    format_usd,
-    is_on_curve,
-    metadata_address,
-    parse_metaplex_metadata,
-    parse_mint,
-    parse_token2022_metadata,
-    token_links,
-)
+from scraper_bot.chains.enrichment import TokenEnricher, TokenInfo
+from scraper_bot.chains.networks import token_links
 from scraper_bot.config import EvmNetwork
 from scraper_bot.models import Address, Chain, ConfirmedContract
+from tests.chains.test_evm import abi_bytes32, abi_string, abi_uint
+from tests.chains.test_solana import (
+    METAPLEX,
+    MINT,
+    TOKEN_2022,
+    USDC_METADATA,
+    USDC_SOL,
+    extension,
+    t22_mint,
+)
 from tests.conftest import FakeTuning
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-USDC_SOL = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-USDC_METADATA = "5x38Kp4hvdomTCnCrAny4UtMUt5rQBdB6px2K1Ui45Wq"
 ETH_CONTRACT = ConfirmedContract(Address(Chain.ETHEREUM, USDC_ETH), "Ethereum")
 SOL_CONTRACT = ConfirmedContract(Address(Chain.SOLANA, USDC_SOL), "Solana")
 NETWORKS = (EvmNetwork("Ethereum", "https://alpha.rpc"),)
-
-
-# ── encoders for fixtures ───────────────────────────────────────────────────
-def abi_uint(value: int) -> str:
-    return "0x" + value.to_bytes(32, "big").hex()
-
-
-def abi_string(value: str) -> str:
-    raw = value.encode()
-    padded = raw + b"\x00" * (-len(raw) % 32)
-    head = (32).to_bytes(32, "big") + len(raw).to_bytes(32, "big")
-    return "0x" + (head + padded).hex()
-
-
-def abi_bytes32(value: str) -> str:
-    return "0x" + value.encode().ljust(32, b"\x00").hex()
-
-
-def borsh(value: str, pad_to: int = 0) -> bytes:
-    raw = value.encode().ljust(pad_to, b"\x00")
-    return len(raw).to_bytes(4, "little") + raw
-
-
-MINT = bytes(36) + (123_456).to_bytes(8, "little") + bytes([6, 1]) + bytes(36)
-METAPLEX = bytes([4]) + bytes(64) + borsh("USD Coin", 32) + borsh("USDC", 10) + borsh("", 200)
-_T22_BODY = bytes(64) + borsh("PayPal USD") + borsh("PYUSD") + borsh("https://x")
-TOKEN_2022 = (
-    MINT.ljust(165, b"\x00")
-    + b"\x01"
-    + (7).to_bytes(2, "little")  # some other extension first
-    + (2).to_bytes(2, "little")
-    + b"\x00\x00"
-    + (19).to_bytes(2, "little")
-    + len(_T22_BODY).to_bytes(2, "little")
-    + _T22_BODY
-)
 
 
 def pair(
@@ -187,66 +146,6 @@ def make(backend: Backend, **tuning: Any) -> TokenEnricher:
         tuning=FakeTuning(**tuning),
         sui_rpc_url="https://sui.rpc",
     )
-
-
-# ── decoders and parsers ────────────────────────────────────────────────────
-def test_abi_decoders() -> None:
-    assert decode_abi_string(abi_string("USD Coin")) == "USD Coin"
-    assert decode_abi_string(abi_bytes32("MKR")) == "MKR"
-    assert decode_abi_string(abi_string("  padded\x00 name  ")) == "padded name"
-    assert decode_abi_string("0x") is None
-    assert decode_abi_string("0x" + "ff" * 64) is None  # offset beyond the payload
-    assert decode_abi_string(RuntimeError("reverted")) is None
-    assert decode_abi_string("0xzz") is None
-    assert decode_abi_uint(abi_uint(6)) == 6
-    assert decode_abi_uint(abi_uint(300), limit=36) is None
-    assert decode_abi_uint("0x") is None and decode_abi_uint("nope") is None
-
-
-def test_metadata_pda_matches_the_known_usdc_account() -> None:
-    assert metadata_address(USDC_SOL) == USDC_METADATA
-    assert is_on_curve(base58.b58decode(USDC_SOL))  # a real key pair
-    assert not is_on_curve(base58.b58decode(USDC_METADATA))  # a program-derived address
-
-
-def test_solana_account_parsers() -> None:
-    assert parse_mint(MINT) == (123_456, 6)
-    assert parse_mint(b"short") is None
-    assert parse_metaplex_metadata(METAPLEX) == ("USD Coin", "USDC")
-    assert parse_metaplex_metadata(b"\x04") == (None, None)
-    assert parse_token2022_metadata(TOKEN_2022) == ("PayPal USD", "PYUSD")
-    assert parse_token2022_metadata(MINT) == (None, None)
-    assert parse_token2022_metadata(MINT.ljust(165, b"\x00") + b"\x02") == (None, None)
-
-
-def test_format_helpers() -> None:
-    assert format_amount(1_234) == "1.23K"
-    assert format_amount(12_400_000) == "12.4M"
-    assert format_amount(5e9) == "5B"
-    assert format_amount(49_951_489_980.6) == "50B"
-    assert format_amount(999) == "999" and format_amount(0.5) == "0.5"
-    assert format_usd(1.0) == "$1.00"
-    assert format_usd(12_400_000) == "$12.4M"
-    assert format_usd(0.0009773) == "$0.0009773"
-    assert format_usd(0.00000012) == "$1.2e-07"
-
-
-def test_links_per_network() -> None:
-    assert token_links(ETH_CONTRACT) == [
-        ("Etherscan", f"https://etherscan.io/token/{USDC_ETH}"),
-        ("DexScreener", f"https://dexscreener.com/ethereum/{USDC_ETH}"),
-        ("Uniswap", f"https://app.uniswap.org/swap?outputCurrency={USDC_ETH}&chain=ethereum"),
-    ]
-    assert [label for label, _ in token_links(SOL_CONTRACT)] == [
-        "Solscan",
-        "DexScreener",
-        "Jupiter",
-    ]
-    bsc = ConfirmedContract(ETH_CONTRACT.address, "BSC")
-    assert [label for label, _ in token_links(bsc)] == ["BscScan", "DexScreener", "PancakeSwap"]
-    fantom = ConfirmedContract(ETH_CONTRACT.address, "Fantom")
-    assert [label for label, _ in token_links(fantom)] == ["FtmScan", "DexScreener"]
-    assert token_links(ConfirmedContract(ETH_CONTRACT.address, "Nowhere")) == []
 
 
 # ── the enricher ────────────────────────────────────────────────────────────
@@ -384,36 +283,6 @@ def test_sui_types_match_case_sensitively_except_for_the_package() -> None:
     assert best_pair([pair(chain="sui", base=shouting)], "sui", SUI_COIN, Chain.SUI) is not None
 
 
-def test_abi_decoder_edge_cases() -> None:
-    head = (32).to_bytes(32, "big") + (100).to_bytes(32, "big")  # offset 32, length 100
-    assert decode_abi_string("0x" + "00" * 40) is None  # neither bytes32 nor a full head
-    assert decode_abi_string("0x" + (head + b"short").hex()) is None  # chunk shorter than said
-    assert decode_abi_string("0x" + "00" * 64) is None  # a well-formed empty string
-    assert decode_abi_string("0x" + "00" * 32) is None  # a blank bytes32
-    assert decode_abi_string(abi_string("x" * 200)) == "x" * 64  # long names are cut
-    assert decode_abi_uint("0xzz") is None
-    assert decode_abi_uint(None) is None and decode_abi_uint(b"0x1") is None
-    assert decode_abi_uint("0x0") == 0
-    assert decode_abi_uint(abi_uint(36), limit=36) == 36
-    assert decode_abi_uint(abi_uint(37), limit=36) is None
-
-
-def test_token2022_edge_cases() -> None:
-    padded = MINT.ljust(165, b"\x00")
-    metadata = (19).to_bytes(2, "little") + len(_T22_BODY).to_bytes(2, "little") + _T22_BODY
-    other = (7).to_bytes(2, "little") + (2).to_bytes(2, "little") + b"\x00\x00"
-    nothing = (None, None)
-    assert parse_token2022_metadata(padded + b"\x01") == nothing  # no extensions at all
-    assert parse_token2022_metadata(padded + b"\x01" + other) == nothing  # no metadata one
-    assert parse_token2022_metadata(padded + b"\x01" + other + metadata) == ("PayPal USD", "PYUSD")
-    # The (0, 0) padding sentinel ends the walk even when bytes follow it.
-    assert parse_token2022_metadata(padded + b"\x01" + bytes(4) + metadata) == nothing
-    # Account-type byte 2 is a token account, whatever comes after it.
-    assert parse_token2022_metadata(padded + b"\x02" + metadata) == nothing
-    assert parse_token2022_metadata(padded + b"\x01" + metadata[:3]) == nothing  # cut header
-    assert parse_token2022_metadata(padded + b"\x01" + metadata[:70]) == nothing  # cut body
-
-
 async def test_market_lookup_edge_cases() -> None:
     from scraper_bot.chains.enrichment import _number, best_pair
 
@@ -463,57 +332,6 @@ async def test_unexpected_exceptions_in_a_source_are_swallowed(
     assert not info.market_checked and info.pair is None
 
 
-# ── risk flags, age and other networks ──────────────────────────────────────
-def extension(kind: int, body: bytes) -> bytes:
-    return kind.to_bytes(2, "little") + len(body).to_bytes(2, "little") + body
-
-
-def t22_mint(*extensions: bytes, authorities: bool = False) -> bytes:
-    mint = bytearray(MINT)
-    if authorities:
-        mint[0:4] = (1).to_bytes(4, "little")  # mint authority kept
-        mint[46:50] = (1).to_bytes(4, "little")  # freeze authority kept
-    return bytes(mint).ljust(165, b"\x00") + b"\x01" + b"".join(extensions)
-
-
-def fee(bps: int) -> bytes:
-    older = bytes(16) + (0).to_bytes(2, "little")
-    newer = bytes(16) + bps.to_bytes(2, "little")
-    return bytes(72) + older + newer
-
-
-def test_risky_token_2022_extensions_are_named() -> None:
-    from scraper_bot.chains.enrichment import parse_authorities, parse_risky_extensions
-
-    data = t22_mint(
-        extension(1, fee(250)),
-        extension(6, b"\x02"),
-        extension(9, b""),
-        extension(12, b"\x07" * 32),
-        extension(14, bytes(32) + b"\x05" * 32),
-        extension(26, bytes(32) + b"\x01"),
-        authorities=True,
-    )
-    assert parse_risky_extensions(data) == (
-        "transfer fee 2.5%",
-        "new accounts start frozen",
-        "non-transferable",
-        "permanent delegate",
-        "transfer hook",
-        "paused",
-    )
-    assert parse_authorities(data) == (True, True)
-    harmless = t22_mint(
-        extension(1, fee(0)),
-        extension(6, b"\x01"),
-        extension(12, bytes(32)),
-        extension(14, b"\x05" * 32 + bytes(32)),
-    )
-    assert parse_risky_extensions(harmless) == ()
-    assert parse_authorities(MINT) == (False, False)
-    assert parse_authorities(b"short") is None
-
-
 async def test_solana_details_carry_authorities_flags_and_age() -> None:
     backend = Backend()
     backend.sol_accounts = {USDC_SOL: t22_mint(extension(12, b"\x07" * 32), authorities=True)}
@@ -545,3 +363,31 @@ async def test_evm_age_and_other_networks() -> None:
     )
     backend.fresh = False
     assert (await enricher.enrich(ETH_CONTRACT)).also_on == ("Base",)
+
+
+async def test_a_slow_other_network_does_not_cost_the_age_line() -> None:
+    backend = Backend()
+    backend.fresh = True  # deployed within the last 90 blocks
+    hang = asyncio.Event()
+    original = backend.handler
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "slow.rpc":
+            await hang.wait()  # another EVM network that never answers
+        return await original(request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    networks = (*NETWORKS, EvmNetwork("Base", "https://slow.rpc"))
+    enricher = TokenEnricher(
+        http,
+        networks,
+        "https://sol.rpc",
+        timeout=5,
+        tuning=FakeTuning(enrich_timeout=0.2),
+        sui_rpc_url="https://sui.rpc",
+    )
+    info = await enricher.enrich(ETH_CONTRACT)
+    assert info.deployed_within is not None  # the age came although "also on" timed out
+    assert info.also_on == ()
+    hang.set()
+    await http.aclose()

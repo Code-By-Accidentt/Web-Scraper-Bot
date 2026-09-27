@@ -12,6 +12,7 @@ from scraper_bot.chains.contract_validators import (
     ChainVerdict,
     ContractValidator,
     EvmContractValidator,
+    FailingEndpoint,
     RpcUnavailable,
     SolanaContractValidator,
     SuiCoinValidator,
@@ -487,8 +488,13 @@ async def test_verdicts_are_cached(tmp_path: Path) -> None:
         first = await validator.validate(ETH)
         assert first.status is ValidationStatus.CONFIRMED and first.kind is AddressKind.TOKEN
         assert first.contract == ConfirmedContract(ETH, "Alpha")
+        # A token becomes known when its alert is claimed (AlertRegistry), not here: a
+        # caller that vanished meanwhile must not leave it known but never announced.
+        assert (await validator.validate(ETH)).status is ValidationStatus.CONFIRMED
+        assert rpc.count("alpha.rpc", "eth_getCode") == 4  # checked twice, each with a batch
+        validator._cache.add_known(first.contract)  # what the claim does
         assert (await validator.validate(ETH)).status is ValidationStatus.ALREADY_KNOWN
-        assert rpc.count("alpha.rpc", "eth_getCode") == 2  # the probe batch asks again
+        assert rpc.count("alpha.rpc", "eth_getCode") == 4
 
         missing = await validator.validate(SOL)
         assert (missing.status, missing.kind) == (ValidationStatus.REJECTED, AddressKind.MISSING)
@@ -542,6 +548,8 @@ async def test_the_token_behind_an_lp_pair_is_checked_and_remembered(tmp_path: P
             (token, ValidationStatus.CONFIRMED, AddressKind.TOKEN),
         ]
         assert first[0].resolved == (token,) and first[1].via == pair
+        assert first[1].contract is not None
+        validator._cache.add_known(first[1].contract)  # its alert was claimed
         # The pair is cached as rejected, but it still points at its token.
         again = await validator.validate_many([pair])
         assert [(r.status, r.via) for r in again] == [
@@ -602,12 +610,10 @@ async def test_turbo_checks_bypass_and_do_not_write_the_negative_cache(tmp_path:
         assert rpc.count("alpha.rpc", "eth_getCode") == 4
 
 
-async def test_rpc_failures_are_reported_through_the_notifier(tmp_path: Path) -> None:
-    from tests.conftest import FakeNotifier
-
+async def test_endpoints_failing_for_minutes_are_reported(tmp_path: Path) -> None:
     rpc = FakeRpc()
     rpc.route("alpha.rpc", no_contract)  # beta unreachable
-    notifier = FakeNotifier()
+    reports: list[tuple[list[FailingEndpoint], float]] = []
     clock = FakeClock()
     async with rpc.client() as http:
         cache = AddressCache(
@@ -622,16 +628,62 @@ async def test_rpc_failures_are_reported_through_the_notifier(tmp_path: Path) ->
             max_concurrent=4,
             retry_delay=60,
             clock=clock,
-            notifier=notifier,  # type: ignore[arg-type]
+            on_stuck=lambda endpoints, delay: reports.append((list(endpoints), delay)),
         )
         assert (await validator.validate(ETH)).status is ValidationStatus.UNAVAILABLE
-        assert notifier.problems == []  # a hiccup stays in the log
+        assert reports == []  # a hiccup stays in the log
         for clock.now in (100, 200, 301):  # it keeps failing for five minutes
             assert (await validator.validate(ETH)).status is ValidationStatus.UNAVAILABLE
-    assert len(notifier.problems) == 1
-    key, title, detail, hint = notifier.problems[0]
-    assert key == "rpc" and "keep failing" in title and "Beta (for 5m 1s)" in detail
-    assert "every 60 s" in (hint or "")
+    [(endpoints, delay)] = reports
+    assert delay == 60
+    [beta] = endpoints
+    assert (beta.name, beta.seconds, beta.optional) == ("Beta", 301, False)
+    assert "eth_getCode via beta.rpc" in beta.error
+
+
+async def test_an_optional_network_never_holds_up_a_verdict(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", no_contract)  # beta, the optional one, is unreachable
+    reports: list[list[FailingEndpoint]] = []
+    clock = FakeClock()
+    networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
+    async with rpc.client() as http:
+        cache = AddressCache(
+            tmp_path / "known.tsv", tmp_path / "rejected.tsv", rejected_ttl=1000, clock=clock
+        )
+        cache.load()
+        lenient = EvmContractValidator(
+            http, networks, timeout=5, tuning=FakeTuning(), retry=NO_RETRY, clock=clock
+        )
+        validator = ContractValidator(
+            lenient,
+            solana(http, clock=clock),
+            cache,
+            sui=sui(http, clock=clock),
+            max_concurrent=4,
+            retry_delay=60,
+            clock=clock,
+            on_stuck=lambda endpoints, _delay: reports.append(list(endpoints)),
+        )
+        result = await validator.validate(ETH)
+        assert (result.status, result.kind) == (ValidationStatus.REJECTED, AddressKind.NO_CODE)
+        # Not cached for rejected_ttl: without Beta's answer Beta alone is asked again after
+        # the retry delay (and the pending watch keeps asking Beta about it meanwhile).
+        assert not cache.is_rejected(ETH)
+        again = await validator.validate(ETH)
+        assert (again.status, again.kind) == (
+            ValidationStatus.ALREADY_REJECTED,
+            AddressKind.NO_CODE,
+        )
+        for clock.now in (100, 200, 301):
+            await validator.validate(ETH, negative_cache=False)
+        assert [[(e.name, e.optional) for e in endpoints] for endpoints in reports] == [
+            [("Beta", True)]
+        ]
+        with pytest.raises(RpcUnavailable):  # nothing answered at all: still no verdict
+            await lenient.find_network(USDC_ETH, networks={"Beta"})
+        rpc.route("alpha.rpc", erc20_contract)  # a token on the required network wins
+        assert await lenient.find_network(OTHER) == ChainVerdict(AddressKind.TOKEN, "Alpha")
 
 
 async def test_an_answer_clears_the_failing_endpoint(tmp_path: Path) -> None:
@@ -643,13 +695,13 @@ async def test_an_answer_clears_the_failing_endpoint(tmp_path: Path) -> None:
         with pytest.raises(RpcUnavailable):
             await validator.find_network(USDC_ETH)
         clock.now = 400
-        assert validator.health.failing_for(300) == []  # nobody asked since: not "down"
+        assert validator.health.failing(300) == []  # nobody asked since: not "down"
         with pytest.raises(RpcUnavailable):
             await validator.find_network(USDC_ETH)
-        assert validator.health.failing(300) == [("Beta", 400)]  # one outage since 0
+        assert [(e.name, e.seconds) for e in validator.health.failing(300)] == [("Beta", 400)]
         rpc.route("beta.rpc", no_contract)
         await validator.find_network(USDC_ETH)
-        assert validator.health.failing_for(0) == []
+        assert validator.health.failing(0) == []
 
 
 async def test_hiccups_far_apart_are_not_one_long_outage() -> None:
@@ -661,14 +713,14 @@ async def test_hiccups_far_apart_are_not_one_long_outage() -> None:
         for clock.now in (0, 600, 1200):  # a stuck address retried every RPC_RETRY_DELAY=600
             with pytest.raises(RpcUnavailable):
                 await validator.find_network(USDC_ETH)
-        assert validator.health.failing(300) == [("Beta", 1200)]  # still one outage
+        assert [(e.name, e.seconds) for e in validator.health.failing(300)] == [("Beta", 1200)]
         rpc.route("beta.rpc", no_contract)
         await validator.find_network(USDC_ETH)
         rpc.routes.pop("beta.rpc")
         for clock.now in (5000, 9000):  # two hiccups an hour apart
             with pytest.raises(RpcUnavailable):
                 await validator.find_network(USDC_ETH)
-        assert validator.health.failing_for(300) == []
+        assert validator.health.failing(300) == []
 
 
 async def test_a_token_is_reported_without_waiting_for_slower_networks() -> None:
@@ -700,7 +752,7 @@ async def test_a_token_is_reported_without_waiting_for_slower_networks() -> None
             if not validator._background:
                 break
             await asyncio.sleep(0.01)
-        assert not validator._background and validator.health.failing_for(0) == []
+        assert not validator._background and validator.health.failing(0) == []
 
         release.clear()
         await validator.find_network(USDC_ETH)
@@ -853,7 +905,7 @@ async def test_a_failure_finishing_with_the_token_still_counts(
         await asyncio.sleep(0)
         release.set_result(None)
         assert await lookup == ChainVerdict(AddressKind.TOKEN, "Alpha")
-        assert validator.health.failing_for(0) == ["Beta"]
+        assert [e.name for e in validator.health.failing(0)] == ["Beta"]
     assert "never retrieved" not in caplog.text
 
 
@@ -944,3 +996,433 @@ async def test_checks_of_different_kinds_are_not_shared(tmp_path: Path) -> None:
         )
     assert restricted.kind is AddressKind.NO_CODE  # asked Alpha only
     assert full.contract == ConfirmedContract(ETH, "Beta")  # not handed Alpha's verdict
+
+
+async def test_a_cancelled_caller_does_not_leave_the_token_known(tmp_path: Path) -> None:
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await release.wait()  # the node answers after the caller is gone
+        body = json.loads(request.content)
+        items = body if isinstance(body, list) else [body]
+        answers = []
+        for item in items:
+            if item["method"] == "eth_getCode":
+                answers.append({"jsonrpc": "2.0", "id": item["id"], "result": "0x6080604052"})
+            elif item["params"][0]["data"] in {ERC20_TOTAL_SUPPLY, ERC20_DECIMALS}:
+                answers.append({"jsonrpc": "2.0", "id": item["id"], "result": word(18)})
+            else:
+                error = {"code": 3, "message": "execution reverted"}
+                answers.append({"jsonrpc": "2.0", "id": item["id"], "error": error})
+        return httpx.Response(200, json=answers if isinstance(body, list) else answers[0])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        cache = AddressCache(tmp_path / "known.tsv", tmp_path / "rejected.tsv", rejected_ttl=60)
+        cache.load()
+        validator = ContractValidator(
+            evm(http), solana(http), cache, sui=sui(http), max_concurrent=4, retry_delay=60
+        )
+        round_task = asyncio.create_task(validator.validate_many([ETH]))
+        await asyncio.sleep(0.05)
+        round_task.cancel()  # /pause, /remove or a shutdown during the check
+        await asyncio.gather(round_task, return_exceptions=True)
+        release.set()
+        await asyncio.sleep(0.05)  # the shared lookup finishes on its own
+        assert not cache.is_known(ETH)
+        again = await validator.validate(ETH)
+        assert again.status is ValidationStatus.CONFIRMED  # so the next round announces it
+
+
+async def test_one_failing_address_does_not_cost_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", no_contract)
+    rpc.route("beta.rpc", no_contract)
+    rpc.route("sol.rpc", solana_missing)
+    async with rpc.client() as http:
+        validator = build(rpc, http, tmp_path, FakeClock())
+        original = validator._lookup
+
+        async def lookup(address: Address, networks: Any) -> ChainVerdict:
+            if address == ETH:
+                raise ValueError("an odd answer")
+            return await original(address, networks)
+
+        monkeypatch.setattr(validator, "_lookup", lookup)
+        results = await validator.validate_many([ETH, SOL])
+    assert [r.status for r in results] == [
+        ValidationStatus.UNAVAILABLE,
+        ValidationStatus.REJECTED,
+    ]
+    assert "an odd answer" in caplog.text
+
+
+async def test_a_silent_optional_network_costs_a_verdict_only_the_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scraper_bot.chains import contract_validators
+
+    monkeypatch.setattr(contract_validators, "OPTIONAL_GRACE", 0.05)
+    hang = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if request.url.host == "beta.rpc":
+            await hang.wait()  # the optional network hangs
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": "0x"})
+
+    networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = EvmContractValidator(
+            http, networks, timeout=5, tuning=FakeTuning(), retry=NO_RETRY
+        )
+        verdict = await asyncio.wait_for(validator.find_network(USDC_ETH), timeout=1)
+        assert verdict == ChainVerdict(AddressKind.NO_CODE, missing=frozenset({"Beta"}))
+        assert len(validator._background) == 1  # Beta's request finishes in the background
+        await validator.aclose()
+
+
+def test_a_long_outage_is_reported_once_and_again_after_recovery() -> None:
+    from scraper_bot.chains.contract_validators import (
+        ContractValidator,
+        EvmContractValidator,
+        SolanaContractValidator,
+        SuiCoinValidator,
+    )
+    from scraper_bot.config import EvmNetwork
+    from scraper_bot.storage import AddressCache
+
+    clock = FakeClock()
+    http = httpx.AsyncClient()
+    networks = [
+        EvmNetwork("Base", "https://base.rpc"),
+        EvmNetwork("Arc", "https://arc.rpc", 5042, True),
+    ]
+    reports: list[tuple[str, ...]] = []
+    validator = ContractValidator(
+        EvmContractValidator(http, networks, timeout=1, tuning=FakeTuning(), clock=clock),
+        SolanaContractValidator(http, "https://sol.rpc", timeout=1, clock=clock),
+        AddressCache(Path("unused-k.tsv"), Path("unused-r.tsv"), rejected_ttl=0),
+        sui=SuiCoinValidator(http, "https://sui.rpc", timeout=1, tuning=FakeTuning(), clock=clock),
+        max_concurrent=4,
+        retry_delay=10,
+        clock=clock,
+        on_stuck=lambda endpoints, _delay: reports.append(tuple(e.name for e in endpoints)),
+    )
+    boom = RpcError("timed out")
+    for minute in range(0, 180, 1):  # three hours of an Arc outage, a failure a minute
+        clock.now = minute * 60.0
+        validator.record("Arc", boom)
+    assert reports == [("Arc",)]  # one message for the whole outage
+    clock.now += 30
+    validator.record("Base", boom)
+    for _ in range(6):
+        clock.now += 60
+        validator.record("Base", boom)
+        validator.record("Arc", boom)
+    assert reports == [("Arc",), ("Arc", "Base")]  # Base joined: said once, both listed
+    validator.record("Arc", None)  # Arc answers again: its outage is over
+    for _ in range(6):
+        clock.now += 60
+        validator.record("Arc", boom)
+    # A new Arc outage (Base, not asked for minutes, is no longer listed as failing).
+    assert reports[-1] == ("Arc",) and len(reports) == 3
+
+
+def test_an_optional_endpoint_that_keeps_failing_rests_between_probes() -> None:
+    from scraper_bot.chains.contract_validators import EndpointHealth
+
+    clock = FakeClock()
+    health = EndpointHealth(clock, optional={"Arc"})
+    boom = RpcError("timed out")
+    health.failed("Arc", boom)
+    assert not health.resting("Arc")  # one failure: still asked
+    health.failed("Arc", boom)
+    probes = []
+    for second in range(70):
+        clock.now = float(second)
+        if not health.resting("Arc"):
+            probes.append(second)
+    assert probes == [0, 2, 6, 14, 30, 60]  # at once, then 2, 4, 8, 16 and 30 s apart
+    health.answered("Arc")
+    assert not health.resting("Arc") and not health.resting("Arc")  # back in service
+    health.failed("Base", boom)
+    health.failed("Base", boom)
+    assert not health.resting("Base") and not health.resting("Base")  # required: always
+
+
+def slow_network(delays: dict[str, float], code: dict[str, str], requests: list[str]):
+    """JSON-RPC nodes by host: each answers after its delay; ``code`` gives bytecode."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        requests.append(host)
+        await asyncio.sleep(delays.get(host, 0))
+        body = json.loads(request.content)
+        items = body if isinstance(body, list) else [body]
+        answers = []
+        for item in items:
+            method = item["method"]
+            if method == "eth_getCode":
+                result: Any = code.get(host, "0x")
+            elif method == "eth_blockNumber":
+                result = "0x10"
+            elif method == "eth_call":
+                data = item["params"][0].get("data", "")
+                table = {"0x18160ddd": "0x" + "0" * 63 + "1", "0x313ce567": "0x" + "0" * 62 + "12"}
+                if data not in table:
+                    answers.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": item["id"],
+                            "error": {"code": 3, "message": "revert"},
+                        }
+                    )
+                    continue
+                result = table[data]
+            else:
+                result = "0x0"
+            answers.append({"jsonrpc": "2.0", "id": item["id"], "result": result})
+        return httpx.Response(200, json=answers if isinstance(body, list) else answers[0])
+
+    return handler
+
+
+def optional_validator(http: httpx.AsyncClient, tmp_path: Path, clock: FakeClock):
+    networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
+    evm_validator = EvmContractValidator(
+        http, networks, timeout=5, tuning=FakeTuning(), retry=NO_RETRY, clock=clock
+    )
+    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=1000, clock=clock)
+    cache.load()
+    return ContractValidator(
+        evm_validator,
+        solana(http, clock=clock),
+        cache,
+        sui=sui(http, clock=clock),
+        max_concurrent=4,
+        retry_delay=60,
+        clock=clock,
+    )
+
+
+async def test_a_token_an_optional_network_finds_too_late_is_confirmed_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scraper_bot.chains import contract_validators
+
+    monkeypatch.setattr(contract_validators, "OPTIONAL_GRACE", 0.02)
+    requests: list[str] = []
+    handler = slow_network({"beta.rpc": 0.1}, {"beta.rpc": "0x6080"}, requests)
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        told: list[tuple[Address, str]] = []
+        validator.on_late_token = lambda address, network: told.append((address, network))
+        first = await validator.validate(ETH)
+        assert (first.status, first.kind) == (ValidationStatus.REJECTED, AddressKind.NO_CODE)
+        await asyncio.sleep(0.4)  # Beta answers now: a token, too late for that verdict
+        assert told == [(ETH, "Beta")]
+        before = len(requests)
+        again = await validator.validate(ETH)  # the next round: no waiting for the delay
+        assert (again.status, again.network) == (ValidationStatus.CONFIRMED, "Beta")
+        assert len(requests) == before  # answered from what Beta said, nobody asked again
+
+
+async def test_a_partial_rejection_asks_only_the_silent_network_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scraper_bot.chains import contract_validators
+
+    monkeypatch.setattr(contract_validators, "OPTIONAL_GRACE", 0.02)
+    requests: list[str] = []
+    answer = slow_network({}, {}, requests)
+    beta_down = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "beta.rpc" and beta_down:
+            requests.append("beta.rpc")
+            return httpx.Response(502)
+        return await answer(request)
+
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        assert (await validator.validate(ETH)).kind is AddressKind.NO_CODE
+        assert not validator._cache.is_rejected(ETH)  # Beta failed: not final
+        beta_down = False
+        requests.clear()
+        clock.now = 61  # the retry delay has passed
+        result = await validator.validate(ETH)  # answered at once; Beta is asked meanwhile
+        assert (result.status, result.kind) == (
+            ValidationStatus.ALREADY_REJECTED,
+            AddressKind.NO_CODE,
+        )
+        await asyncio.sleep(0.05)
+        assert requests == ["beta.rpc"]  # Alpha already said "no code"
+        assert validator._cache.is_rejected(ETH)  # complete now: cached like any rejection
+
+
+async def test_a_resting_optional_network_is_not_waited_for(tmp_path: Path) -> None:
+    requests: list[str] = []
+    clock = FakeClock()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_network({}, {}, requests))
+    ) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        health = validator._evm.health
+        boom = RpcError("HTTP 502")
+        health.failed("Beta", boom)
+        health.failed("Beta", boom)
+        assert not health.resting("Beta")  # this probe slot is used up here
+        verdict = await validator._evm.find_network(ETH.value)
+        assert verdict.missing == frozenset({"Beta"}) and "beta.rpc" not in requests
+
+
+async def test_a_late_no_code_completes_the_rejection_without_a_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scraper_bot.chains import contract_validators
+
+    monkeypatch.setattr(contract_validators, "OPTIONAL_GRACE", 0.02)
+    requests: list[str] = []
+    clock = FakeClock()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(slow_network({"beta.rpc": 0.1}, {}, requests))
+    ) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        assert (await validator.validate(ETH)).kind is AddressKind.NO_CODE
+        assert not validator._cache.is_rejected(ETH)  # Beta has not answered yet
+        await asyncio.sleep(0.3)  # now it has: nothing there either
+        assert validator._cache.is_rejected(ETH) and ETH not in validator._partial
+        requests.clear()
+        clock.now = 61
+        assert (await validator.validate(ETH)).status is ValidationStatus.ALREADY_REJECTED
+        assert requests == []  # no wave of re-checks
+
+
+async def test_a_recheck_while_the_optional_network_is_still_down_waits_again(
+    tmp_path: Path,
+) -> None:
+    requests: list[str] = []
+    answer = slow_network({}, {}, requests)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "beta.rpc":
+            requests.append("beta.rpc")
+            return httpx.Response(502)
+        return await answer(request)
+
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        await validator.validate(ETH)
+        clock.now = 61
+        await validator.validate(ETH)  # Beta alone, in the background, and it fails again
+        await asyncio.sleep(0.05)
+        assert validator._partial[ETH].due == 61 + 60 and not validator._cache.is_rejected(ETH)
+
+
+def test_the_memories_of_pending_rechecks_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scraper_bot.chains import contract_validators
+
+    monkeypatch.setattr(contract_validators, "_MAX_PARTIAL", 3)
+    clock = FakeClock()
+    validator = optional_validator(httpx.AsyncClient(), tmp_path, clock)
+    addresses = [Address(Chain.ETHEREUM, f"0x{i:040x}") for i in range(1, 6)]
+    for address in addresses:
+        validator._set_partial(address, frozenset({"Beta"}), AddressKind.NO_CODE)
+        validator._retry_later(address)
+    assert list(validator._partial) == addresses[2:]  # the oldest are forgotten first
+    assert len(validator._retry_after) == 3
+    clock.now = 1_000  # all expired: dropped at once when the next one comes
+    validator._retry_later(addresses[0])
+    assert list(validator._retry_after) == [addresses[0]]
+
+
+def test_late_answers_from_two_optional_networks_complete_a_rejection(tmp_path: Path) -> None:
+    clock = FakeClock()
+    validator = optional_validator(httpx.AsyncClient(), tmp_path, clock)
+    validator._set_partial(ETH, frozenset({"Beta", "Gamma"}), AddressKind.NO_CODE)
+    nothing = ChainVerdict(AddressKind.NO_CODE)
+    validator._late_answer(ETH.value, "Delta", nothing)  # not one it waits for
+    validator._late_answer(ETH.value, "Beta", nothing)
+    assert validator._partial[ETH].missing == frozenset({"Gamma"})
+    validator._late_answer(ETH.value, "Gamma", nothing)
+    assert ETH not in validator._partial and validator._cache.is_rejected(ETH)
+
+
+async def test_a_recheck_never_holds_up_the_page_that_shows_the_address(tmp_path: Path) -> None:
+    requests: list[str] = []
+    answer = slow_network({}, {}, requests)
+    beta = {"down": True}
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "beta.rpc":
+            if beta["down"]:
+                return httpx.Response(502)
+            await release.wait()  # hangs now
+        return await answer(request)
+
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        await validator.validate(ETH)  # Beta down: a partial rejection
+        beta["down"] = False
+        clock.now = 61
+        result = await asyncio.wait_for(validator.validate(ETH), timeout=0.5)
+        assert result.status is ValidationStatus.ALREADY_REJECTED  # nobody waited for Beta
+        assert len(validator._rechecks) == 1
+        release.set()
+        await asyncio.sleep(0.05)
+        assert not validator._rechecks
+
+
+async def test_a_token_found_by_a_background_recheck_is_confirmed_next_time(
+    tmp_path: Path,
+) -> None:
+    requests: list[str] = []
+    state = {"beta": "down"}
+    quiet = slow_network({}, {}, requests)
+    token = slow_network({}, {"beta.rpc": "0x6080"}, requests)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "beta.rpc" and state["beta"] == "down":
+            return httpx.Response(502)
+        return await (token if state["beta"] == "token" else quiet)(request)
+
+    clock = FakeClock()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        validator = optional_validator(http, tmp_path, clock)
+        told: list[tuple[Address, str]] = []
+        validator.on_late_token = lambda address, network: told.append((address, network))
+        await validator.validate(ETH)
+        state["beta"] = "token"  # deployed on Beta meanwhile
+        clock.now = 61
+        await validator.validate(ETH)  # starts the re-check, answers at once
+        await asyncio.sleep(0.05)
+        assert told == [(ETH, "Beta")]  # the pending watch hears at once
+        requests.clear()
+        confirmed = await validator.validate(ETH)  # the next check of the page
+        assert (confirmed.status, confirmed.network) == (ValidationStatus.CONFIRMED, "Beta")
+        assert requests == []  # from what the re-check found, nobody asked again
+
+
+async def test_an_answer_in_the_same_step_as_a_token_is_not_late() -> None:
+    clock = FakeClock()
+    networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
+    evm_validator = EvmContractValidator(
+        httpx.AsyncClient(), networks, timeout=5, tuning=FakeTuning(), clock=clock
+    )
+    heard: list[str] = []
+    evm_validator.on_late = lambda address, name, verdict: heard.append(name)
+    done: asyncio.Future[ChainVerdict] = asyncio.get_running_loop().create_future()
+    done.set_result(ChainVerdict(AddressKind.NO_CODE))
+    evm_validator._finished("Beta", ETH.value, done, late=False)
+    assert heard == []
+    evm_validator._finished("Beta", ETH.value, done)
+    assert heard == ["Beta"]

@@ -14,7 +14,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from dotenv import dotenv_values
+
+from scraper_bot.chains.networks import EVM_CHAINS
+
+
+def _masked(url: str) -> str:
+    """``url`` fit for a log: scheme and host only, since API keys hide in paths and logins."""
+    match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)?([^/?#]*)(.*)$", url.strip(), re.S)
+    if match is None:
+        return "'…'"
+    scheme, authority, rest = match.groups()
+    host = authority.rpartition("@")[2]
+    login = "…@" if "@" in authority else ""
+    return repr(f"{scheme or ''}{login}{host}{'/…' if rest else ''}")
 
 
 class ConfigError(ValueError):
@@ -27,33 +41,12 @@ class EvmNetwork:
 
     name: str
     rpc_url: str
+    chain_id: int | None = None  # what eth_chainId must answer (None: not checked)
+    optional: bool = False  # its failure never blocks a verdict (see EvmChain)
 
-
-# (display name, environment variable, default endpoint)
-DEFAULT_EVM_NETWORKS: tuple[tuple[str, str, str], ...] = (
-    ("Ethereum", "ETH_RPC_URL", "https://ethereum-rpc.publicnode.com"),
-    ("Base", "BASE_RPC_URL", "https://base-rpc.publicnode.com"),
-    ("Arbitrum", "ARB_RPC_URL", "https://arbitrum-one-rpc.publicnode.com"),
-    ("Optimism", "OPT_RPC_URL", "https://optimism-rpc.publicnode.com"),
-    ("BSC", "BSC_RPC_URL", "https://bsc-rpc.publicnode.com"),
-    ("Fantom", "FANTOM_RPC_URL", "https://rpcapi.fantom.network"),
-    ("Sonic", "SONIC_RPC_URL", "https://rpc.soniclabs.com"),
-    ("Avalanche", "AVAX_RPC_URL", "https://avalanche-c-chain-rpc.publicnode.com"),
-)
-
-# eth_chainId of each network; a mismatch at start means the URL points at another chain.
-EXPECTED_CHAIN_IDS: dict[str, int] = {
-    "Ethereum": 1,
-    "Base": 8453,
-    "Arbitrum": 42161,
-    "Optimism": 10,
-    "BSC": 56,
-    "Fantom": 250,
-    "Sonic": 146,
-    "Avalanche": 43114,
-}
 
 DEFAULT_SOLANA_RPC_URL = "https://solana-rpc.publicnode.com"
+DEFAULT_SUI_RPC_URL = "https://sui-rpc.publicnode.com"
 
 DEFAULT_SUB_URL_PATTERNS: tuple[str, ...] = (
     "https://app.{domain}",
@@ -221,12 +214,18 @@ class Settings:
             raise ConfigError("POLL_INTERVAL_MAX must be >= POLL_INTERVAL_MIN")
 
         networks = tuple(
-            EvmNetwork(name, reader.text(var, default))
-            for name, var, default in DEFAULT_EVM_NETWORKS
-            if reader.text(var, default)
+            EvmNetwork(chain.name, reader.url(chain.env_var, url), chain.chain_id, chain.optional)
+            for chain in EVM_CHAINS
+            if (url := reader.text(chain.env_var, chain.default_rpc))
         )
         if not networks:
             raise ConfigError("at least one EVM RPC endpoint must be configured")
+        solana_rpc_url = reader.url(
+            "SOLANA_RPC_URL", reader.text_or_default("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL)
+        )
+        sui_rpc_url = reader.url(
+            "SUI_RPC_URL", reader.text_or_default("SUI_RPC_URL", DEFAULT_SUI_RPC_URL)
+        )
 
         log_file = reader.text("LOG_FILE")
         return cls(
@@ -275,8 +274,8 @@ class Settings:
             http2=reader.flag("HTTP2", True),
             evm_networks=networks,
             # (an empty EVM URL skips that network; Solana and Sui cannot be skipped)
-            solana_rpc_url=reader.text_or_default("SOLANA_RPC_URL", DEFAULT_SOLANA_RPC_URL),
-            sui_rpc_url=reader.text_or_default("SUI_RPC_URL", "https://sui-rpc.publicnode.com"),
+            solana_rpc_url=solana_rpc_url,
+            sui_rpc_url=sui_rpc_url,
             require_erc20=reader.flag("REQUIRE_ERC20", True),
             rpc_timeout=reader.number("RPC_TIMEOUT", 5.0, minimum=1.0),
             max_concurrent_rpc=reader.integer("MAX_CONCURRENT_RPC", 8, minimum=1),
@@ -342,6 +341,17 @@ class _EnvReader:
     def text_or_default(self, key: str, default: str) -> str:
         """Like :meth:`text`, but an empty value also means the default."""
         return self.text(key) or default
+
+    @staticmethod
+    def url(key: str, value: str) -> str:
+        """``value`` when it is an http(s) URL httpx can send to; a typo stops the start."""
+        try:
+            parsed = httpx.URL(value)
+        except httpx.InvalidURL as exc:
+            raise ConfigError(f"{key} is not a valid URL ({exc}): {_masked(value)}") from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.host:
+            raise ConfigError(f"{key} must be an http(s) URL with a host, got {_masked(value)}")
+        return value
 
     def choice(self, key: str, default: str, allowed: frozenset[str]) -> str:
         value = self.text_or_default(key, default).upper()

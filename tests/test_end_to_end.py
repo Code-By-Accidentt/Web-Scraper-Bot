@@ -20,6 +20,7 @@ import httpx
 from scraper_bot.app import Runtime, build_runtime
 from scraper_bot.chains.enrichment import TokenEnricher
 from scraper_bot.chains.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
+from scraper_bot.chains.networks import EVM_CHAINS
 from scraper_bot.config import Settings
 from scraper_bot.pages.fetcher import FetchResult
 from scraper_bot.preferences import Preferences
@@ -38,14 +39,8 @@ WALLET = "0x" + "e1" * 20  # (0xeeee...eeee is the stop-listed native-coin place
 CHALLENGE = "<html><head><title>Just a moment...</title></head><body>Checking</body></html>"
 ENV = {
     "TELEGRAM_CHAT_IDS": str(CHAT),
+    **{chain.env_var: "" for chain in EVM_CHAINS},  # one EVM network is enough here
     "ETH_RPC_URL": "https://alpha.rpc",
-    "BASE_RPC_URL": "",
-    "ARB_RPC_URL": "",
-    "OPT_RPC_URL": "",
-    "BSC_RPC_URL": "",
-    "FANTOM_RPC_URL": "",
-    "SONIC_RPC_URL": "",
-    "AVAX_RPC_URL": "",
     "SOLANA_RPC_URL": "https://sol.rpc",
     "SUI_RPC_URL": "https://sui.rpc",
     "SUB_URL_PATTERNS": "https://app.{domain}",

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Container, Iterable
-from typing import ClassVar
+from collections.abc import Callable, Container, Iterable
+from typing import ClassVar, TypeVar
 
 import base58
 from Crypto.Hash import keccak
@@ -16,7 +16,13 @@ from scraper_bot.models import Address, Chain
 # ``::`` after 40 digits would be a (short) Sui coin type, not an EVM address.
 EVM_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z]|::)")
 _BASE58 = "1-9A-HJ-NP-Za-km-z"
-SOLANA_ADDRESS_RE = re.compile(rf"(?<![{_BASE58}])[{_BASE58}]{{32,44}}(?![{_BASE58}])")
+SOLANA_ADDRESS_RE = re.compile(rf"(?<![0-9A-Za-z])[{_BASE58}]{{32,44}}(?![0-9A-Za-z])")
+# Inline files (``data:image/png;base64,...``, also JSON-escaped ``data:image\/png``): a
+# base64 payload is full of base58-looking runs, none of them an address.
+_DATA_URI_RE = re.compile(
+    r"data:[\w.+-]+\\?/[\w.+-]+(?:;[\w.+-]+=[^;,\s\"'<>]*)*;base64,[A-Za-z0-9+/=\\_-]*",
+    re.IGNORECASE,
+)
 # Sui names a coin by its type ``0x<package>::<module>::<NAME>``; a bare 32-byte id may
 # be the package that defines it. Ethereum transaction hashes have the same 64-hex
 # shape, so bare ids only count on pages that talk about Sui.
@@ -107,6 +113,10 @@ def canonical_address(chain: Chain, raw: str) -> Address | None:
     if chain is Chain.SOLANA:
         if _HEX_ONLY_RE.match(raw):
             return None  # all-hex text is a slice of some 0x... id, not a base58 key
+        if raw.islower() or raw.isupper():
+            # base32 (IPFS, Arweave) or a single-case word: a random 32-byte key in base58
+            # has both cases (a single-case one is rarer than 1 in 10 billion).
+            return None
         return Address(chain, raw) if is_solana_address(raw) else None
     if chain is Chain.SUI:
         value = normalize_sui(raw)
@@ -141,10 +151,6 @@ class AddressExtractor:
         self._chains = tuple(chains)
         self._stoplist = stoplist
 
-    def extract(self, text: str) -> list[Address]:
-        """Unique, syntactically valid addresses in order of first appearance."""
-        return self.extract_many((text,))
-
     def locate(self, text: str, *, sui_context: bool | None = None) -> list[tuple[Address, int]]:
         """Every valid address in ``text`` with its start offset, in text order.
 
@@ -155,6 +161,9 @@ class AddressExtractor:
             return []
         if sui_context is None:
             sui_context = SUI_CONTEXT_RE.search(text) is not None
+        if "base64," in text or "BASE64," in text or "Base64," in text:
+            # Blanked out, not cut out: offsets and the context around matches stay the same.
+            text = _DATA_URI_RE.sub(lambda match: " " * len(match.group(0)), text)
         found: list[tuple[Address, int]] = []
         for chain in self._chains:
             for pattern in self._PATTERNS[chain]:
@@ -167,27 +176,24 @@ class AddressExtractor:
         found.sort(key=lambda item: item[1])
         return found
 
-    def extract_many(self, texts: Iterable[str]) -> list[Address]:
-        """Like :meth:`extract` over several texts (page HTML, frames, scripts, API bodies)."""
-        found: dict[Address, None] = {}
-        for text in texts:
-            sui_context = SUI_CONTEXT_RE.search(text) is not None
-            for chain in self._chains:
-                for pattern in self._PATTERNS[chain]:
-                    if pattern is SUI_ADDRESS_RE and not sui_context:
-                        continue
-                    for match in pattern.finditer(text):
-                        address = canonical_address(chain, match.group(0))
-                        if address is not None and address not in self._stoplist:
-                            found.setdefault(address, None)
-        return _drop_packages_of_coins(list(found))
+
+T = TypeVar("T")
 
 
-def _drop_packages_of_coins(addresses: list[Address]) -> list[Address]:
-    """A page naming a coin type also shows its package: report the coin, not both."""
-    packages = {sui_package(a.value) for a in addresses if a.chain is Chain.SUI and "::" in a.value}
+def drop_coin_packages(items: list[T], address: Callable[[T], Address]) -> list[T]:
+    """Leave out the bare Sui packages of coin types that are among ``items`` too.
+
+    A page naming a coin type also shows its package: the coin is reported, not both.
+    ``address`` reads the address of an item.
+    """
+    coins = [a for a in map(address, items) if a.chain is Chain.SUI and "::" in a.value]
+    packages = {sui_package(a.value) for a in coins}
     return [
-        a
-        for a in addresses
-        if not (a.chain is Chain.SUI and "::" not in a.value and a.value in packages)
+        item
+        for item in items
+        if not (
+            (found := address(item)).chain is Chain.SUI
+            and "::" not in found.value
+            and found.value in packages
+        )
     ]

@@ -38,8 +38,8 @@ class ValidationStatus(Enum):
     REJECTED = "rejected"
     ALREADY_KNOWN = "already_known"
     ALREADY_REJECTED = "already_rejected"
-    # no verdict: an endpoint failed (EVM: at least one network, and none found a token);
-    # nothing was cached
+    # no verdict: an endpoint failed (EVM: a required network, or every network, and none
+    # found a token); nothing was cached
     UNAVAILABLE = "unavailable"
 
 
@@ -47,7 +47,7 @@ class AddressKind(Enum):
     """What the chain says an address is (beyond "a token or not")."""
 
     TOKEN = "token"  # ERC-20, SPL / Token-2022 mint or Sui coin: the only kind announced
-    NO_CODE = "no_code"  # EVM: no bytecode anywhere, a plain wallet or not deployed yet
+    NO_CODE = "no_code"  # EVM: no bytecode on the networks that answered: a wallet or not yet
     WALLET = "wallet"  # EVM: an EIP-7702 delegated wallet (its "code" is 0xef0100 + address)
     PAIR = "pair"  # an LP pair or pool; the tokens it holds are in ``resolved``
     VAULT = "vault"  # ERC-4626 vault shares: a token, but never a launch
@@ -109,6 +109,9 @@ class Observation:
     results: tuple[ValidationResult, ...]
     # when the render began: what the page shows is from between this and ``seen_at``
     started_at: float | None = None
+    # False for a render that did not show the page itself (a 2xx challenge, a blank page):
+    # the next appearance window does not open at it
+    read: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +236,8 @@ class SiteState:
     unverified_enabled: bool = False
     # "Chain:address" -> when it was announced as unverified (watched until confirmed)
     unverified: dict[str, float] = field(default_factory=dict)
+    # page -> the captcha widgets the user was told it shows (told once per page and widget)
+    captcha_pages: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -243,15 +248,29 @@ class SiteState:
             "added_at": self.added_at,
             "unverified_enabled": self.unverified_enabled,
             "unverified": dict(self.unverified),
+            "captcha_pages": {page: list(widgets) for page, widgets in self.captcha_pages.items()},
         }
 
     @classmethod
     def from_dict(cls, url: str, data: dict[str, Any]) -> SiteState:
+        if not isinstance(data, dict):
+            raise TypeError("a site entry must be an object")
         last = data.get("last_change")
         raw_unverified = data.get("unverified")
         unverified = (
             {str(key): float(value) for key, value in raw_unverified.items()}
             if isinstance(raw_unverified, dict)
+            else {}
+        )
+        raw_captcha = data.get("captcha_pages")
+        captcha_pages = (
+            {
+                str(page): [str(w) for w in widgets]
+                if isinstance(widgets, list)
+                else [str(widgets)]
+                for page, widgets in raw_captcha.items()
+            }
+            if isinstance(raw_captcha, dict)
             else {}
         )
         return cls(
@@ -263,6 +282,7 @@ class SiteState:
             added_at=float(data.get("added_at", 0.0)) or time.time(),
             unverified_enabled=bool(data.get("unverified_enabled", False)),
             unverified=unverified,
+            captcha_pages=captcha_pages,
         )
 
 
@@ -270,8 +290,12 @@ class SiteState:
 class BlockSignal:
     """Evidence that the site is refusing us (rate limit, WAF challenge, IP ban)."""
 
-    reason: str
+    reason: str  # the answer: "HTTP 403", "challenge page with HTTP 200", a network error
     retry_after: float | None = None
+    protection: str | None = None  # who refused, when recognisable: "Cloudflare challenge"
+
+    def describe(self) -> str:
+        return f"{self.protection} ({self.reason})" if self.protection else self.reason
 
 
 class PageStatus(Enum):
@@ -286,13 +310,35 @@ class PageStatus(Enum):
 class PageCheckOutcome:
     url: str
     status: PageStatus
-    contracts: tuple[ConfirmedContract, ...] = ()
     report: ChangeReport | None = None
     error: str | None = None
     block: BlockSignal | None = None
     candidates: tuple[Address, ...] = ()  # every syntactically valid address seen on the page
     timed_out: bool = False  # the document never arrived within the load timeout
+    captcha: str | None = None  # a captcha widget the page shows, e.g. "hCaptcha"
 
 
 def shorten(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(limit - 3, 0)] + "..."
+
+
+LABEL_LIMIT = 64  # characters kept of a token name or symbol
+
+
+def clean_label(text: str) -> str | None:
+    """A token name or symbol fit to show: NULs and runs of spaces gone, cut to 64 chars."""
+    cleaned = " ".join(text.replace("\x00", " ").split())
+    return cleaned[:LABEL_LIMIT] or None
+
+
+def address_key(address: Address) -> str:
+    """``Chain:value``, how addresses are keyed in state.json and pending.json."""
+    return f"{address.chain.value}:{address.value}"
+
+
+def parse_address_key(key: str) -> Address | None:
+    chain, _, value = key.partition(":")
+    try:
+        return Address(Chain(chain), value) if value else None
+    except ValueError:
+        return None
