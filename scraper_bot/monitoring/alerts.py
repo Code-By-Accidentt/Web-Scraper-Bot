@@ -10,9 +10,9 @@ it; the others stay silent. A claim also writes the token to the known cache
 
 from __future__ import annotations
 
-from scraper_bot.chains.address_extractor import sui_package
-from scraper_bot.models import Address, Chain, ConfirmedContract
-from scraper_bot.storage import AddressCache
+from scraper_bot.chains.addresses.formats import sui_package
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
+from scraper_bot.storage.address_cache import AddressCache
 
 _REMEMBERED = 10_000
 

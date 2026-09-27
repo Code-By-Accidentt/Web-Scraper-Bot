@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import logging
 
-from scraper_bot.pages.fetcher import HttpProber
+from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.urls import SubUrlDeriver
 
 log = logging.getLogger(__name__)

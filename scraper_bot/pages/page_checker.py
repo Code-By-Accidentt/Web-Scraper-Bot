@@ -7,26 +7,19 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
-from scraper_bot.chains.address_extractor import AddressExtractor
-from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.models import (
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SightingSource,
-    Signature,
-    Snapshot,
-    ValidationResult,
-)
-from scraper_bot.pages.blocking import BlockDetector
-from scraper_bot.pages.change_detector import ChangeDetector
-from scraper_bot.pages.fetcher import FetchResult, PageFetcher
-from scraper_bot.pages.html_normalizer import HtmlNormalizer
-from scraper_bot.pages.noise_filter import NoiseFilter
+from scraper_bot.chains.addresses.extractor import AddressExtractor
+from scraper_bot.chains.validator import ContractValidator
+from scraper_bot.models.addresses import ValidationResult
+from scraper_bot.models.pages import PageCheckOutcome, PageStatus, Signature, Snapshot
+from scraper_bot.models.sightings import Observation, Sighting, SightingSource
+from scraper_bot.pages.changes.detector import ChangeDetector
+from scraper_bot.pages.changes.noise import NoiseFilter
+from scraper_bot.pages.changes.normalizer import HtmlNormalizer
+from scraper_bot.pages.fetching.blocking import BlockDetector
+from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
-from scraper_bot.preferences import Tuning
-from scraper_bot.storage import SnapshotStore
+from scraper_bot.settings.live import Tuning
+from scraper_bot.storage.snapshots import SnapshotStore
 
 log = logging.getLogger(__name__)
 

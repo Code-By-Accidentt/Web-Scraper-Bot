@@ -4,24 +4,18 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.chains.address_extractor import sui_package
-from scraper_bot.chains.contract_validators import FailingEndpoint
+from scraper_bot.chains.addresses.formats import sui_package
 from scraper_bot.chains.enrichment import TokenInfo
-from scraper_bot.config import ChangedDefault
-from scraper_bot.models import (
-    Address,
-    BlockSignal,
-    Chain,
-    ChangeReport,
-    ConfirmedContract,
-    Sighting,
-    SightingSource,
-    Timeline,
-)
+from scraper_bot.chains.rpc.health import FailingEndpoint
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
+from scraper_bot.models.pages import BlockSignal, ChangeReport
+from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
 from scraper_bot.pages.urls import url_to_filename
+from scraper_bot.settings.defaults import ChangedDefault
 from scraper_bot.telegram.markup import strip_markup
-from scraper_bot.telegram.notifier import Notifier, format_amount, format_usd
+from scraper_bot.telegram.notifier import Notifier
 from scraper_bot.telegram.timefmt import format_precise, format_utc_offset
+from scraper_bot.telegram.views.token import format_amount, format_usd
 from tests.conftest import FakeTelegram, node
 
 ADDRESS = Address(Chain.ETHEREUM, "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
@@ -442,7 +436,7 @@ async def test_a_token_found_through_its_lp_pair_says_so_without_naming_the_pair
 
 
 def test_risk_age_and_network_lines() -> None:
-    from scraper_bot.telegram.notifier import describe_token
+    from scraper_bot.telegram.views.token import describe_token
 
     solana = TokenInfo(
         symbol="MEME",

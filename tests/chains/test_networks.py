@@ -1,8 +1,8 @@
 from pathlib import Path
 
+from scraper_bot.chains.addresses.stoplist import EVM_TOKENS
 from scraper_bot.chains.networks import EVM_CHAINS, NETWORK_LINKS, token_links
-from scraper_bot.chains.stoplist import EVM_TOKENS
-from scraper_bot.models import Address, Chain, ConfirmedContract
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
 from tests.conftest import make_settings
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"

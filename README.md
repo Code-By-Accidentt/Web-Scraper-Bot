@@ -110,14 +110,17 @@ Every command is described with its replies in [docs/commands.md](docs/commands.
 ```text
 main.py, rebooter.py        entry point and supervisor
 scraper_bot/
-  app.py config.py preferences.py models.py storage.py    core and state
-  pages/        rendering, HTML normalisation, diffing, noise filter, block detection,
-                where on a page an address stands (sightings)
-  chains/       the network table, address extraction, stop-list, JSON-RPC, EVM / Solana /
-                Sui validation, token details, connection warm-up
+  app/          start-up: entry point, process resources, wiring, heartbeat
+  settings/     .env settings and the live ones changed with /set
+  models/       plain data types shared by every package
+  storage/      state.json, page snapshots, address caches, v1 import
+  pages/        fetching (browser, prober, block detection), changes (normalising,
+                diffing, noise filter), the per-page check, where addresses stand
+  chains/       the network table, addresses (formats, extraction, stop-list), JSON-RPC,
+                EVM / Solana / Sui validation, token details
   monitoring/   site monitor, monitor manager, turbo mode, unverified mode, pending watch
                 (addresses published before deployment), alert registry
-  telegram/     Bot API client, commands, alerts, /status, /settings view, HTML markup
+  telegram/     Bot API client, alerts, commands, views (token details, /status, /settings)
 tests/          pytest suite mirroring the packages, offline; browser tests behind a flag
 docs/           the pages above
 data/           runtime data, git-ignored, created on first start
@@ -129,7 +132,7 @@ data/           runtime data, git-ignored, created on first start
 pip install -r requirements-dev.txt
 pytest -q                                # offline: no network, no browser
 ruff check . && ruff format --check .
-SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/test_fetcher_browser.py   # real Chromium
+SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/fetching/test_fetcher_browser.py   # real Chromium
 ```
 
 ## License

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from scraper_bot.chains.address_extractor import is_sui_coin_type
-from scraper_bot.models import Chain, ConfirmedContract
+from scraper_bot.chains.addresses.formats import is_sui_coin_type
+from scraper_bot.models.addresses import Chain, ConfirmedContract
 
 
 @dataclass(frozen=True, slots=True)

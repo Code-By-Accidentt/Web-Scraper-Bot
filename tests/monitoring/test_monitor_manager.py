@@ -5,7 +5,8 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.models import SiteState, Snapshot
+from scraper_bot.models.pages import Snapshot
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.monitor_manager import (
     MonitorManager,
     SiteAlreadyPaused,
@@ -14,7 +15,9 @@ from scraper_bot.monitoring.monitor_manager import (
     SiteNotTracked,
 )
 from scraper_bot.pages.urls import InvalidUrlError, SubUrlDeriver
-from scraper_bot.storage import LegacyStateImporter, SnapshotStore, StateStore
+from scraper_bot.storage.legacy import LegacyStateImporter
+from scraper_bot.storage.snapshots import SnapshotStore
+from scraper_bot.storage.state import StateStore
 from tests.conftest import FakeNotifier, StubMonitor, node
 
 ROOT = "https://example.com"
@@ -508,7 +511,7 @@ async def test_after_a_damaged_state_file_the_next_start_still_has_the_readable_
 async def test_a_damaged_state_file_that_cannot_be_set_aside_is_not_saved_over(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import scraper_bot.storage as storage_module
+    import scraper_bot.storage.state as storage_module
 
     def refuse(*_args: Any) -> None:
         raise PermissionError("locked by another program")

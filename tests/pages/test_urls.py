@@ -1,6 +1,5 @@
 import pytest
 
-from scraper_bot.config import DEFAULT_SUB_URL_PATTERNS
 from scraper_bot.pages.urls import (
     InvalidUrlError,
     SubUrlDeriver,
@@ -8,6 +7,7 @@ from scraper_bot.pages.urls import (
     registrable_domain,
     url_to_filename,
 )
+from scraper_bot.settings.defaults import DEFAULT_SUB_URL_PATTERNS
 
 
 @pytest.mark.parametrize(

@@ -10,25 +10,18 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from itertools import islice
 
-from scraper_bot.models import (
-    Address,
-    ConfirmedContract,
-    LastChange,
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SiteState,
-    Timeline,
-)
+from scraper_bot.models.addresses import Address, ConfirmedContract
+from scraper_bot.models.pages import PageCheckOutcome, PageStatus
+from scraper_bot.models.sightings import Observation, Sighting, Timeline
+from scraper_bot.models.sites import LastChange, SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
-from scraper_bot.monitoring.pending import PendingWatch
+from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
-from scraper_bot.pages.fetcher import HttpProber
+from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.pages.urls import SubUrlDeriver
-from scraper_bot.preferences import Tuning
+from scraper_bot.settings.live import Tuning
 from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)

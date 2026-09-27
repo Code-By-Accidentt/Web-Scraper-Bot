@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
-from scraper_bot.models import SiteState
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.site_monitor import (
     AutoPauseCallback,
     MonitorStats,
@@ -15,7 +15,9 @@ from scraper_bot.monitoring.site_monitor import (
     SiteMonitor,
 )
 from scraper_bot.pages.urls import InvalidUrlError, SubUrlDeriver, normalize_url
-from scraper_bot.storage import LegacyStateImporter, SnapshotStore, StateStore
+from scraper_bot.storage.legacy import LegacyStateImporter
+from scraper_bot.storage.snapshots import SnapshotStore
+from scraper_bot.storage.state import StateStore
 from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)

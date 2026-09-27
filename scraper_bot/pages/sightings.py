@@ -12,12 +12,14 @@ import re
 from collections.abc import Iterable, Sequence
 from urllib.parse import unquote
 
-from scraper_bot.chains.address_extractor import (
+from scraper_bot.chains.addresses.extractor import (
     SUI_CONTEXT_RE,
     AddressExtractor,
     drop_coin_packages,
 )
-from scraper_bot.models import Address, Sighting, SightingSource, Signature
+from scraper_bot.models.addresses import Address
+from scraper_bot.models.pages import Signature
+from scraper_bot.models.sightings import Sighting, SightingSource
 
 CONTEXT_CHARS = 60
 HINT_WINDOW = 32  # characters before the address that decide the hint (as in X Scraper)

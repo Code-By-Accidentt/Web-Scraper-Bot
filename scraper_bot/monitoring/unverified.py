@@ -11,17 +11,12 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 
-from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.models import (
-    Address,
-    SiteState,
-    ValidationStatus,
-    address_key,
-    parse_address_key,
-)
+from scraper_bot.chains.validator import ContractValidator
+from scraper_bot.models.addresses import Address, ValidationStatus, address_key, parse_address_key
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
-from scraper_bot.preferences import Tuning
-from scraper_bot.storage import AddressCache
+from scraper_bot.settings.live import Tuning
+from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)

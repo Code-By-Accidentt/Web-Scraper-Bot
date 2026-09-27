@@ -12,28 +12,22 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.chains.address_extractor import AddressExtractor, drop_coin_packages
-from scraper_bot.chains.contract_validators import FailingEndpoint
-from scraper_bot.config import Settings
-from scraper_bot.models import (
+from scraper_bot.chains.addresses.extractor import AddressExtractor, drop_coin_packages
+from scraper_bot.chains.rpc.health import FailingEndpoint
+from scraper_bot.models.addresses import (
     Address,
-    BlockSignal,
-    ChangeReport,
     ConfirmedContract,
-    Node,
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SightingSource,
-    SiteState,
-    Timeline,
     ValidationResult,
     ValidationStatus,
 )
+from scraper_bot.models.pages import BlockSignal, ChangeReport, Node, PageCheckOutcome, PageStatus
+from scraper_bot.models.sightings import Observation, Sighting, SightingSource, Timeline
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.site_monitor import MonitorStats
-from scraper_bot.monitoring.turbo import TurboStats
-from scraper_bot.pages.fetcher import FetchResult, ProbeResult
+from scraper_bot.monitoring.turbo.session import TurboStats
+from scraper_bot.pages.fetching.prober import ProbeResult
+from scraper_bot.pages.fetching.result import FetchResult
+from scraper_bot.settings.env import Settings
 from scraper_bot.telegram.client import SentMessage
 
 

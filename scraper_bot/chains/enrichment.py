@@ -17,8 +17,8 @@ from typing import Any
 
 import httpx
 
-from scraper_bot.chains.address_extractor import is_sui_coin_type
-from scraper_bot.chains.evm import (
+from scraper_bot.chains.addresses.formats import is_sui_coin_type
+from scraper_bot.chains.evm.abi import (
     ERC20_DECIMALS,
     ERC20_NAME,
     ERC20_SYMBOL,
@@ -29,8 +29,8 @@ from scraper_bot.chains.evm import (
     is_delegated_wallet,
 )
 from scraper_bot.chains.networks import NETWORK_LINKS
-from scraper_bot.chains.rpc import JsonRpcClient, RpcError
-from scraper_bot.chains.solana import (
+from scraper_bot.chains.rpc.client import JsonRpcClient, RpcError
+from scraper_bot.chains.solana.accounts import (
     account_data,
     metadata_address,
     parse_authorities,
@@ -39,10 +39,10 @@ from scraper_bot.chains.solana import (
     parse_risky_extensions,
     parse_token2022_metadata,
 )
-from scraper_bot.chains.sui import coin_metadata, find_coin, total_supply
-from scraper_bot.config import EvmNetwork
-from scraper_bot.models import Chain, ConfirmedContract, clean_label
-from scraper_bot.preferences import Tuning
+from scraper_bot.chains.sui.objects import coin_metadata, find_coin, total_supply
+from scraper_bot.models.addresses import Chain, ConfirmedContract, clean_label
+from scraper_bot.settings.env import EvmNetwork
+from scraper_bot.settings.live import Tuning
 
 log = logging.getLogger(__name__)
 

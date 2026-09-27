@@ -1,19 +1,14 @@
 from pathlib import Path
 
-from scraper_bot.chains.address_extractor import AddressExtractor
-from scraper_bot.models import (
-    Address,
-    Chain,
-    ConfirmedContract,
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-)
-from scraper_bot.pages.change_detector import ChangeDetector
-from scraper_bot.pages.fetcher import FetchResult
-from scraper_bot.pages.html_normalizer import HtmlNormalizer
+from scraper_bot.chains.addresses.extractor import AddressExtractor
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
+from scraper_bot.models.pages import PageCheckOutcome, PageStatus
+from scraper_bot.models.sightings import Observation
+from scraper_bot.pages.changes.detector import ChangeDetector
+from scraper_bot.pages.changes.normalizer import HtmlNormalizer
+from scraper_bot.pages.fetching.result import FetchResult
 from scraper_bot.pages.page_checker import PageChecker
-from scraper_bot.storage import SnapshotStore
+from scraper_bot.storage.snapshots import SnapshotStore
 from tests.conftest import FakeFetcher, FakeTuning, FakeValidator, node
 
 URL = "https://example.com"

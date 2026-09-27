@@ -9,50 +9,90 @@ This page explains how the pieces fit together and why they are shaped the way t
 
 ```text
 scraper_bot/
-  app.py            composition root: build_runtime() wires everything, Runtime serves it
-  config.py         Settings: every knob read once from the environment and .env
-  preferences.py    live overrides of the tunable knobs (/settings, /set), the Tuning protocol
-  models.py         plain data types shared by every package
-  storage.py        state.json, page snapshots, address caches, atomic writes, v1 import
+  app/              starting the bot
+    cli.py            main(): settings, logging, SIGTERM handling, exit codes
+    application.py    Application: shared HTTP clients, the browser, the Telegram token check
+    runtime.py        build_runtime() wires everything, Runtime starts, serves and stops it
+    heartbeat.py      the file the supervisor watches
+    notices.py        one-time notices: Chromium without its sandbox, outdated .env values
+
+  settings/         configuration
+    env.py            Settings: every knob read once from the environment and .env
+    defaults.py       built-in defaults and the ones changed since earlier releases
+    catalog.py        every live setting: key, range, unit, explanation (PreferenceSpec)
+    live.py           Preferences: /set overrides on top of Settings; the Tuning protocol
+
+  models/           plain data types shared by every package
+    addresses.py      Chain, Address, AddressKind, ValidationResult, ChainVerdict
+    sightings.py      Sighting, Observation, Timeline: where and when an address was seen
+    pages.py          Node, Snapshot, ChangeReport, BlockSignal, PageCheckOutcome
+    sites.py          SiteState, LastChange: what state.json holds per site
+
+  storage/          what the bot keeps on disk
+    files.py          atomic writes
+    state.py          state.json (moved aside when damaged)
+    snapshots.py      one snapshot file per page
+    address_cache.py  known tokens (forever) and rejected addresses (for a TTL)
+    legacy.py         import of the version 1 files
 
   pages/            rendering a page and telling real changes from noise
-    fetcher.py        PlaywrightFetcher (one browser, a tab per fetch, deep scan) + HttpProber
-    html_normalizer.py  rendered HTML -> ordered list of Node(tag, attrs, own text)
-    change_detector.py  ordered diff of two node lists, volatile-node exclusion
-    noise_filter.py     memory of elements that keep changing (flapping)
-    blocking.py         recognises blocks (401/403/407/429/503, challenge pages, connection
+    fetching/
+      result.py         FetchResult and the PageFetcher protocol
+      chromium.py       PlaywrightFetcher: one browser, a tab per fetch, deep scan
+      request_filter.py requests never needed: prefetches, analytics beacons
+      prober.py         HttpProber: does a sub-page exist at all?
+      blocking.py       recognises blocks (401/403/407/429/503, challenge pages, connection
                         resets) and names the protection; spots captcha widgets
+    changes/
+      normalizer.py     rendered HTML -> ordered list of Node(tag, attrs, own text)
+      detector.py       ordered diff of two node lists, volatile-node exclusion
+      noise.py          memory of elements that keep changing (flapping)
     page_checker.py     the per-page pipeline: render -> addresses -> diff -> snapshot
     sightings.py        where on a page each address stands and the words in front of it
     urls.py             URL normalisation, sub-page derivation, snapshot file names
 
   chains/           addresses and blockchains
-    networks.py           every network: .env key, default RPC, chain id, explorer and
-                          DEX links, optional flag; the alert links
-    address_extractor.py  regexes + syntactic validation (EIP-55, base58, Sui coin types)
-    stoplist.py           stablecoins, wrapped natives, system addresses: never candidates
-    rpc.py                JSON-RPC client: quick retries, HTTP 429 cool-down, batches
-    warmup.py             keeps RPC connections warm, checks each EVM endpoint's chain id
-    evm.py / solana.py / sui.py   chain constants, ABI decoding, Solana account layouts and
-                                  program-derived addresses, Sui lookups
-    contract_validators.py        EVM, Solana and Sui validators, endpoint health + the
-                                  caching facade
-    enrichment.py                 token details for alerts: metadata, age, DexScreener
+    networks.py       every network: .env key, default RPC, chain id, explorer and DEX
+                      links, optional flag; the alert links
+    addresses/
+      formats.py        syntactic validation and canonical forms (EIP-55, base58, Sui types)
+      extractor.py      finding addresses in text
+      stoplist.py       stablecoins, wrapped natives, system addresses: never candidates
+    rpc/
+      client.py         JSON-RPC client: quick retries, HTTP 429 cool-down, batches
+      health.py         which endpoints are failing, since when, and resting ones
+      warmup.py         keeps RPC connections warm, checks each EVM endpoint's chain id
+    evm/              abi.py (constants, ABI decoding), validator.py (every network at once)
+    solana/           accounts.py (account layouts, PDAs), validator.py (mints)
+    sui/              objects.py (lookups), validator.py (coins and packages)
+    validator.py      ContractValidator: caches verdicts, merges parallel checks, re-checks
+    enrichment.py     token details for alerts: metadata, age, DexScreener
 
   monitoring/       the loops
     site_monitor.py     rounds for one root site and its sub-pages, block backoff, timeout streaks
     monitor_manager.py  add / remove / pause / resume, one task per site, crash restart
+    rounds.py           what the monitor and turbo share: pages to render, the paced wait
     alerts.py           AlertRegistry: one alert per token across pages, sites and modes
-    pending.py          PendingWatch: addresses published before deployment, checked in batches
-    turbo.py            TurboManager + TurboSession: render every few seconds, hunt tokens
+    pending/            PendingWatch: addresses published before deployment
+      entry.py            one watched address and its saved form
+      watch.py            the batched checks, confirmation and pending.json
+    turbo/              render every few seconds, hunt tokens
+      session.py          TurboSession: one site in a tight loop
+      manager.py          TurboManager: start, schedule, list, stop
     unverified.py       UnverifiedWatcher: announce first, confirm on-chain later
 
   telegram/         what the user sees
     client.py         Bot API over httpx: HTML messages, plain-text fallback, documents, polling
-    commands.py       command parsing and replies, the long-polling listener
-    notifier.py       every alert the bot sends on its own initiative, token details as text
-    status.py         the /status report
-    settings_view.py  the /settings overview and the explanation of one setting
+    notifier.py       every alert the bot sends on its own initiative
+    commands/
+      parsing.py        /command text -> name and arguments, /turbo arguments
+      help.py           help and usage texts
+      handlers.py       BotCommands: what each command does and replies
+      listener.py       the long-polling listener
+    views/
+      token.py          the token part of an alert: name, supply, age, market, links
+      status.py         the /status report
+      settings.py       the /settings overview and the explanation of one setting
     markup.py         HTML helpers: escape, code, pre, link
     timefmt.py        durations and clock times for people
 
@@ -61,14 +101,14 @@ rebooter.py         supervisor: restarts the bot when it exits or stops heart-be
 ```
 
 Dependencies point downwards: `telegram/` and `monitoring/` use `pages/` and `chains/`,
-`pages/` uses `chains/` for extraction and validation (and `chains/rpc.py` to read a
-`Retry-After` header), and `chains/` knows only the core
-modules (`models`, `config`, `preferences`, `storage`). The loops in `monitoring/` send
-their alerts through `telegram/notifier.py`; `telegram/commands.py` and `status.py` drive
-and read the loops. `config.py` reads the network table in `chains/networks.py` (which
-imports nothing of `config`), and `storage.py` uses `pages/urls.py` and
-`chains/address_extractor.py` for file names and addresses. `chains/` reports failing RPC
-endpoints through a callback that the `Notifier` provides; it never formats a message.
+`pages/` uses `chains/` for extraction and validation (and `chains/rpc/client.py` to read a
+`Retry-After` header), and `chains/` knows only the core packages (`models`, `settings`,
+`storage`). The loops in `monitoring/` send their alerts through `telegram/notifier.py`;
+`telegram/commands/` and `telegram/views/status.py` drive and read the loops.
+`settings/env.py` reads the network table in `chains/networks.py` (which imports nothing
+of `settings`), and `storage/` uses `pages/urls.py` and `chains/addresses/formats.py` for
+file names and addresses. `chains/` reports failing RPC endpoints through a callback that
+the `Notifier` provides; it never formats a message.
 
 ## The life of a round
 
@@ -160,7 +200,7 @@ counts once for the page as a whole, not for each element; after `flap_threshold
 element is silenced for as long as it keeps changing. The memory lives in the page's
 snapshot file and expires on its own.
 
-**Well-known addresses never become candidates.** `StopList` (`chains/stoplist.py`) holds
+**Well-known addresses never become candidates.** `StopList` (`chains/addresses/stoplist.py`) holds
 stablecoins, wrapped natives, bridged BTC/ETH, liquid-staking tokens (stETH, cbETH,
 jitoSOL, mSOL, ...) and a few chain tokens (ARB) on every configured chain (each one
 checked on-chain), the OP-stack predeploys, every EVM address below `0x10000`, the burn
@@ -317,8 +357,8 @@ half-written file; the address caches are append-only.
 
 ## Configuration layering
 
-`Settings` (`config.py`) is built once from the environment and `.env`. `Preferences`
-(`preferences.py`) layers validated overrides from `/set` on top and exposes the
+`Settings` (`settings/env.py`) is built once from the environment and `.env`. `Preferences`
+(`settings/live.py`) layers validated overrides from `/set` on top and exposes the
 effective values under the same attribute names. Everything that may change at runtime
 reads a `Tuning` (a Protocol) at use time, so a `/set` applies at once (a running round
 picks it up at its next use) without a restart. Knobs that need a restart (browser, concurrency, RPC endpoints, paths) live

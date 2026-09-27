@@ -10,10 +10,10 @@ import pytest
 
 from scraper_bot.chains.enrichment import TokenEnricher, TokenInfo
 from scraper_bot.chains.networks import token_links
-from scraper_bot.config import EvmNetwork
-from scraper_bot.models import Address, Chain, ConfirmedContract
-from tests.chains.test_evm import abi_bytes32, abi_string, abi_uint
-from tests.chains.test_solana import (
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
+from scraper_bot.settings.env import EvmNetwork
+from tests.chains.evm.test_abi import abi_bytes32, abi_string, abi_uint
+from tests.chains.solana.test_accounts import (
     METAPLEX,
     MINT,
     TOKEN_2022,
