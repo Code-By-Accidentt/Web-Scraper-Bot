@@ -1,5 +1,7 @@
 import asyncio
+import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -12,6 +14,7 @@ from scraper_bot.models.pages import BlockSignal, ChangeReport
 from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
 from scraper_bot.pages.urls import url_to_filename
 from scraper_bot.settings.defaults import ChangedDefault
+from scraper_bot.storage.outbox import Outbox
 from scraper_bot.telegram.markup import strip_markup
 from scraper_bot.telegram.notifier import Notifier
 from scraper_bot.telegram.timefmt import format_precise, format_utc_offset
@@ -501,6 +504,35 @@ async def test_a_cancelled_round_does_not_lose_the_document_and_the_pause_waits(
     uploading.set()
     await notifier.drain()
     assert order == ["document", "pause"] and len(telegram.documents) == 1
+
+
+async def test_an_alert_cut_off_by_a_stop_goes_out_at_the_next_start(tmp_path: Path) -> None:
+    class Unreachable(FakeTelegram):
+        """Telegram does not answer before the bot stops."""
+
+        async def send_tracked(self, chat_id, text, *, patient=False):
+            await asyncio.Event().wait()
+
+    path = tmp_path / "outbox.json"
+    stopped = Notifier(Unreachable(), [1, 2])  # type: ignore[arg-type]
+    stopped.outbox = Outbox(path)
+    await stopped.contract_found(ConfirmedContract(ADDRESS, "Base"), "https://x.io")
+    await stopped.drain(timeout=0.05)  # the shutdown gives up on it
+
+    notifier, telegram = make(chat_ids=(1, 2))  # the next start
+    notifier.outbox = Outbox(path)
+    notifier.resend_unsent()
+    await notifier.drain()
+    assert [chat for chat, text in telegram.messages if ADDRESS.value in text] == [1, 2]
+    assert json.loads(path.read_text(encoding="utf-8"))["entries"] == []  # nothing left
+
+    path.write_text("{damaged", encoding="utf-8")
+    damaged, told = make()
+    damaged.outbox = Outbox(path)
+    damaged.resend_unsent()
+    await damaged.drain()
+    assert told.messages[0][1].startswith("🛑 The list of unsent alerts (outbox.json) was damaged")
+    assert len(list(tmp_path.glob("outbox.json.broken-*"))) == 1  # moved aside, not lost
 
 
 def test_format_helpers() -> None:

@@ -33,6 +33,7 @@ scraper_bot/
     state.py          state.json (moved aside when damaged)
     snapshots.py      one snapshot file per page
     address_cache.py  known tokens (forever) and rejected addresses (for a TTL)
+    outbox.py         token alerts and documents on their way to Telegram (outbox.json)
     legacy.py         import of the version 1 files
 
   pages/            rendering a page and telling real changes from noise
@@ -45,7 +46,7 @@ scraper_bot/
                         resets) and names the protection; spots captcha widgets
     changes/
       normalizer.py     rendered HTML -> ordered list of Node(tag, attrs, own text)
-      detector.py       ordered diff of two node lists, volatile-node exclusion
+      detector.py       ordered diff of two node lists (bounded work), volatile-node exclusion
       noise.py          memory of elements that keep changing (flapping)
     page_checker.py     the per-page pipeline: render -> addresses -> diff -> snapshot
     sightings.py        where on a page each address stands and the words in front of it
@@ -75,6 +76,8 @@ scraper_bot/
     alerts.py           AlertRegistry: one alert per token across pages, sites and modes
     pending/            PendingWatch: addresses published before deployment
       entry.py            one watched address and its saved form
+      old_news.py         tokens a pausing first check showed but confirmed late: one
+                          document per burst
       watch.py            the batched checks, confirmation and pending.json
     turbo/              render every few seconds, hunt tokens
       session.py          TurboSession: one site in a tight loop
@@ -82,7 +85,8 @@ scraper_bot/
     unverified.py       UnverifiedWatcher: announce first, confirm on-chain later
 
   telegram/         what the user sees
-    client.py         Bot API over httpx: HTML messages, plain-text fallback, documents, polling
+    client.py         Bot API over httpx: a send queue per chat, HTML messages, plain-text
+                      fallback, documents, polling
     notifier.py       every alert the bot sends on its own initiative
     commands/
       parsing.py        /command text -> name and arguments, /turbo arguments
@@ -126,10 +130,13 @@ SiteMonitor.run_once
  │   ├─ PlaywrightFetcher.fetch        tab from the shared browser (max MAX_CONCURRENT_PAGES),
  │   │                                 domcontentloaded -> network idle (capped) -> settle;
  │   │                                 prefetches and analytics beacons are dropped; deep scan
- │   │                                 (off by default) collects frames, shadow roots, script/JSON
+ │   │                                 (off by default) collects frames, shadow roots, script/JSON;
+ │   │                                 every step has a time limit (opening the tab, reading the
+ │   │                                 page and the deep scan: the load timeout; closing it: 5 s)
  │   ├─ BlockDetector.inspect          a challenge or ban page is never diffed (a 2xx one
  │   │                                 is still read for the addresses it shows)
  │   ├─ HtmlNormalizer.signature       ordered nodes with own text and cleaned attributes
+ │   │                                 (the first 200 of each element)
  │   ├─ find_sightings                 every address with where it stood (text, link, page
  │   │                                 source, loaded script) and the words in front of it;
  │   │                                 script-only addresses from the page's first deep round
@@ -157,12 +164,11 @@ SiteMonitor.run_once
 A token alert goes out from a task the `Notifier` owns, the moment a render shows the
 token. Claiming it in the `AlertRegistry` is what writes the token into the known cache,
 so a round cancelled during the check (or a restart) cannot hide a token that was never
-announced, and a later cancellation cannot lose the alert. The task waits out Telegram
-flood limits of up to a minute and resends a request that provably never reached Telegram
-(up to 8 attempts, the pause doubling from 2 to 30 s: about two minutes offline), so a
-rate limit never holds up the page. A request that may have arrived (its answer timed
-out) is not resent, and a delivery that runs out of attempts is lost: the token is known
-by then. The ⏸️ pause notice and the turbo summary follow the alerts they belong to from
+announced, and neither a later cancellation nor a stop can lose the alert: it is kept in
+`data/outbox.json` until every chat got it (see the rules below). In each chat's Telegram
+queue only command replies overtake it, and it waits out flood limits and outages of up
+to about ten minutes (see Concurrency and resources), so a rate limit never holds up the
+page. The ⏸️ pause notice and the turbo summary follow the alerts they belong to from
 tasks of their own; the monitor pauses the site first. The token's details
 (name, supply, Solana authorities and Token-2022 flags, age, other networks, DEX pair)
 follow as an edit of the same message. When one page reaches `contract_pause_threshold`
@@ -170,11 +176,24 @@ tokens in one round (both renders), the render that crosses it sends its tokens 
 `.txt` document and the site pauses (tokens of an earlier render of that round went out
 one by one); when that happens on the monitor's first round, the pause message says the
 tokens are most likely ones the page already listed (a page full of tokens on a newly
-supported network, for example).
+supported network, for example). The addresses that first round left open (no verdict at
+all, or an EVM rejection that a late Arc or Robinhood Chain answer may overturn; Solana
+and Sui rejections are final) are remembered for a day, at most 1 000 per site (`old_news`
+in `pending.json`). One of them that turns out a token later is old news too: it gets no
+alert of its own, counts toward no pause and is not reported to turbo; each burst of them
+is claimed and sent as one more `.txt` once 10 s pass without another:
+`📄 N more contract(s) that were already on <site> at the first check (confirmed late)`.
+A token on a network where the pending watch saw the address empty is a deployment and
+gets its own 🔔.
 
 The heavy synchronous steps (parsing, finding addresses, the diffs) run in worker
 threads, each with its own lxml parser, so the other monitors and the Telegram listener
-stay responsive on pages with thousands of nodes.
+stay responsive on pages with thousands of nodes. The ordered diff is `SequenceMatcher`
+under a work budget: the common start and end of the two lists are matched first where
+that lines up more nodes, a part too big for the budget is split at the nodes found exactly
+once on each side (patience diff), and a part without such anchors is compared as a bag
+of nodes. Its cost grows with the page size, not with its square, also on pages full of
+identical rows.
 
 ## Rules that shape the design
 
@@ -189,7 +208,10 @@ the old snapshot did not have, plus the old nodes that vanished only between the
 renders. Noise never accumulates, and a real change (an addition or a removal) that
 happened between the renders is reported by the next round, if it lasts. If one render
 is much smaller than the other (a truncated load) the page is skipped for this round as
-UNSTABLE and the snapshot is kept.
+UNSTABLE and the snapshot is kept. So is a round whose confirming render has under 60% of
+the stored snapshot's nodes (a loading skeleton, a half-loaded list); the third such round
+in a row is compared as usual, since the page then really changed. Tokens are looked for
+in those renders all the same.
 
 **Slow noise has a memory.** Content that changes slower than the confirm delay would
 pass the two-render check every time. `NoiseFilter` counts alerts per element (tag,
@@ -300,7 +322,20 @@ widget. There is no proxy rotation and no captcha solving by design.
 
 **Pages that keep timing out get more time, once.** After `render_failure_threshold`
 load timeouts in a row on one page you get one 🐢 alert and the page's load timeout is
-stretched (x2, then x3); a successful render resets it and says so.
+stretched (x2, then x3); a successful render resets it and says so. A page that stops
+answering once it has loaded (a script stuck in an endless loop: "page did not respond
+within 20s") counts as a load timeout, and so does a browser that does not open a tab in
+time ("browser did not open a tab within 20s").
+
+**A token alert survives a restart.** Token alerts, `✅ Confirmed` alerts and token
+`.txt` documents are written to `data/outbox.json` (atomically) before they are sent, one
+entry each with the chats it is owed to; a chat is struck off once its send is over:
+sent, refused, or given up after about ten minutes of failures. The next start sends what
+is left to the chats still configured, right after the 🤖 message, token details
+included. After a stop or crash just after Telegram accepted a message but before the
+outbox noted it, the next start sends that message once more (rare, and accepted). A
+damaged outbox is moved aside as `outbox.json.broken-<time>` with a 🛑; when the outbox
+cannot be saved, the bot logs the error and sends a 🛑, and the alerts go out all the same.
 
 ## Persistent state
 
@@ -312,22 +347,31 @@ stretched (x2, then x3); a successful render resets it and says so.
 | `data/rejected_addresses.txt` | `AddressCache` | rejected addresses with a timestamp, compacted on start |
 | `data/preferences.json` | `Preferences` | live overrides made with `/set` |
 | `data/ignore.txt` | you | optional: addresses never to announce, one per line, `#` comments |
-| `data/pending.json` | `PendingWatch` | addresses waiting to become a token (sites, networks seen empty), and dropped ones remembered for a week (wallets and non-tokens refused; expired ones refused unless named as the CA or seen by turbo) |
+| `data/pending.json` | `PendingWatch` | addresses waiting to become a token (sites, networks seen empty), dropped ones remembered for a week (wallets and non-tokens refused; expired ones refused unless named as the CA or seen by turbo), and the addresses a pausing first check left open (`old_news`, for a day) |
+| `data/outbox.json` | `Outbox` (for the `Notifier`) | token alerts, `✅ Confirmed` alerts and token documents not yet delivered to every chat, with the chats still owed; a damaged file is moved aside as `outbox.json.broken-<time>` |
 | `data/outdated_defaults.txt` | `Application` | the old `.env` values last reported in Telegram, so a restart does not report them again |
 | `data/evm_networks.txt` | `Runtime` | the EVM networks the caches were built with, written once the bot runs |
 | `data/no_sandbox_notice.txt` | `Application` | written once a chat received the 🛑 that Chromium runs without its sandbox; removed by a start with the sandbox |
 | `data/heartbeat` | `Heartbeat` | epoch seconds, every `HEARTBEAT_INTERVAL`, read by `rebooter.py` |
 
-State, snapshots, preferences and the pending watch are written through
+State, snapshots, preferences, the pending watch and the outbox are written through
 `atomic_write_text` (write to a temp file, then replace), so a crash never leaves a
-half-written file; the address caches are append-only.
+half-written file; the address caches are appended to line by line, and
+`rejected_addresses.txt` is rewritten through it when compacted.
 
 ## Concurrency and resources
 
 - One event loop. One Chromium for the whole process, started with its sandbox where
   that works (without it, and one 🛑, where it does not), relaunched transparently if it
-  crashes (only by the first tab that notices); a tab per fetch; at most
-  `MAX_CONCURRENT_PAGES` renders at once.
+  crashes (only by the first tab that notices); when the Playwright driver itself dies
+  ("Connection closed while reading from the driver"), driver, browser and context start
+  again and the fetch is tried once more. Between renders, after an hour or 10 000
+  renders, whichever comes first, Playwright and the browser start afresh, because
+  Playwright keeps a little memory for every call (6 to 14 KB per render, measured): the
+  renders in flight get up to 30 s to finish, and cookies and cache start empty. A tab
+  per fetch, at most `MAX_CONCURRENT_PAGES` renders at once; a tab that a page opens itself
+  (`window.open`, `target=_blank`) is closed at once, downloads are refused, and closing a
+  tab, the browser or the driver gets 5 s.
 - At most `MAX_CONCURRENT_RPC` address checks in flight. An EVM check asks every network
   at once and answers as soon as one of them finds a token (or an LP pair); the slower
   requests finish in the background (at most 64 of them) instead of being cancelled,
@@ -346,14 +390,30 @@ half-written file; the address caches are append-only.
   since when an endpoint fails and its latest error; one 🛑 goes out only after five
   minutes of failures (the latest within the last minute), optional networks included,
   and `/status` lists endpoints failing for a minute or more.
+- `TelegramClient` sends every request to a chat from that chat's queue: a chat that was
+  quiet takes up to 5 at once, then about one a second, and at most 30 a second go out in
+  all; command replies first, then token alerts, their details edits and documents, then
+  everything else (change reports, notices). A 429 pauses the whole chat, which then
+  resumes at one a second, and only the request at the head of the queue tries again.
+  Token alerts, documents and notices wait out any flood limit, up to about ten minutes
+  of waiting; a command reply gets three tries and is dropped on a flood wait over 10 s.
+  A request that never reached Telegram is sent again (three tries, 2 s apart); patient
+  sends (token alerts, documents, the ⏸️ pause message, the RPC 🛑) keep trying for about
+  ten minutes, the pause doubling from 2 to 30 s, and retry a 5xx answer too. A request
+  whose answer timed out may have arrived and is never resent. A notice holds up its
+  caller for 2 s at most (a 🛑 for 10 s) and stays queued; the details edit of an alert
+  waits only for the token alerts queued before it.
 - Per site one monitor task; turbo sessions and their timers are separate tasks;
   fire-and-forget notifications from task callbacks go through `Notifier.report_later`.
 - Shutdown (Ctrl-C or SIGTERM, even during the start) order: Telegram listener,
   heartbeat and warm-up, the pending watch saved, turbo sessions and monitors (8 s each
   at most, their summaries included), the pending watch stopped and saved again, alerts
-  and documents on their way (up to 10 s), RPC checks still running, browser, HTTP
-  clients: within the 30 s the supervisor grants. A cancelled command (Ctrl-C during
-  `/remove`) is never swallowed.
+  and documents on their way (up to 10 s; token alerts and documents not out by then stay
+  in the outbox for the next start), RPC checks still running, browser, HTTP clients:
+  within the 30 s the supervisor grants. `/remove` and `/pause` wait at most 10 s for the
+  site's monitor to end; one stuck in a browser call is left to finish on its own, so the
+  command still gets its answer. A cancelled command (Ctrl-C during `/remove`) is never
+  swallowed.
 
 ## Configuration layering
 

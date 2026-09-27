@@ -33,14 +33,14 @@ class LegacyStateImporter:
     def sites(self) -> dict[str, SiteState]:
         """Return the version 1 sites with their notification flags, keyed by normalised URL.
 
-        Lines that are not valid URLs are logged and skipped.
+        Lines that are not valid URLs (or not UTF-8) are logged and skipped.
         """
         path = self._dir / self.SITES_FILE
         if not path.is_file():
             return {}
         notifications = self._load_json(self._dir / self.NOTIFICATIONS_FILE)
         sites: dict[str, SiteState] = {}
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             raw = line.strip()
             if not raw:
                 continue
@@ -54,12 +54,15 @@ class LegacyStateImporter:
         return sites
 
     def known_addresses(self) -> list[Address]:
-        """Return the addresses listed in found_wallets.txt, skipping lines that are not one."""
+        """Return the addresses listed in found_wallets.txt, skipping lines that are not one.
+
+        A line that is not UTF-8 is not an address either.
+        """
         path = self._dir / self.WALLETS_FILE
         if not path.is_file():
             return []
         addresses: list[Address] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             raw = line.strip()
             if not raw:
                 continue

@@ -7,6 +7,7 @@ import pytest
 
 from scraper_bot.models.pages import Snapshot
 from scraper_bot.models.sites import SiteState
+from scraper_bot.monitoring import monitor_manager
 from scraper_bot.monitoring.monitor_manager import (
     MonitorManager,
     SiteAlreadyPaused,
@@ -94,6 +95,19 @@ class Harness:
         monitor = self.kind(site, persist, on_auto_pause, crash=crash)
         self.monitors.append(monitor)
         return monitor
+
+
+async def crash_reported(h: Harness) -> None:
+    """Yield until the first monitor's crash is reported, which also arms its restart timer.
+
+    The yields take no time, so the caller's next step still runs before that timer can fire,
+    however slow the machine is.
+    """
+    for _ in range(100):
+        if h.notifier.problems:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the monitor did not crash")
 
 
 async def test_add_site_normalises_persists_and_starts(tmp_path: Path) -> None:
@@ -316,10 +330,7 @@ async def test_restart_is_skipped_when_site_paused_or_removed_meanwhile(
     await h.manager.start()
     try:
         await h.manager.add_site(ROOT)
-        for _ in range(100):
-            if h.notifier.problems:
-                break
-            await asyncio.sleep(0.005)
+        await crash_reported(h)
         assert "restarts automatically" in (h.notifier.problems[0][3] or "")
         if action == "pause":
             await h.manager.pause_site(ROOT)
@@ -404,7 +415,7 @@ async def test_a_crash_restart_timer_does_not_fire_after_shutdown(tmp_path: Path
     h = Harness(tmp_path, restart_delay=0.05, crash_first=True)
     await h.manager.start()
     await h.manager.add_site(ROOT)
-    await asyncio.sleep(0.01)  # the first monitor crashed; its restart is 0.05 s away
+    await crash_reported(h)  # its restart is 0.05 s away
     await h.manager.shutdown()
     await asyncio.sleep(0.1)
     assert len(h.monitors) == 1 and not h.manager.is_running(ROOT)
@@ -527,4 +538,37 @@ async def test_a_damaged_state_file_that_cannot_be_set_aside_is_not_saved_over(
         [(_, _, detail, _)] = h.notifier.problems
         assert "could not be moved aside" in detail
     finally:
+        await h.manager.shutdown()
+
+
+class StuckMonitor(LingeringMonitor):
+    """Goes on after it is cancelled until released, like a monitor stuck in a browser call."""
+
+    async def run(self) -> None:
+        self.started = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self.released.wait()
+            raise
+
+
+async def test_remove_answers_even_when_the_monitor_does_not_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(monitor_manager, "STOP_WAIT", 0.05)
+    h = Harness(tmp_path, kind=StuckMonitor)
+    await h.manager.start()
+    await h.manager.add_site(ROOT)
+    await asyncio.sleep(0)
+    monitor = h.monitors[0]
+    assert isinstance(monitor, StuckMonitor) and monitor.started
+    [task] = [task for task in asyncio.all_tasks() if task.get_name() == f"monitor:{ROOT}"]
+    try:
+        async with asyncio.timeout(5):
+            await h.manager.remove_site(ROOT)
+        assert h.manager.sites() == [] and not task.done()  # answered; the task ends later
+    finally:
+        monitor.released.set()
+        await asyncio.wait({task})
         await h.manager.shutdown()

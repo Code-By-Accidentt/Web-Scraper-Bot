@@ -59,6 +59,10 @@ class RateLimited(Exception):
     """Simulates an HTTP 429 from a public node."""
 
 
+class LostAnswer(Exception):
+    """Simulates a node that leaves one call out of its batch answer."""
+
+
 class FakeRpc:
     """Routes JSON-RPC requests by host to Python callables and records every call."""
 
@@ -87,6 +91,8 @@ class FakeRpc:
                 result = {"error": {"code": exc.code, "message": str(exc)}}
             except RateLimited:  # a 429 refuses the whole request, batch or not
                 return httpx.Response(429, text="too many requests")
+            except LostAnswer:
+                continue
             answers.append({"jsonrpc": "2.0", "id": item["id"], **result})
         return httpx.Response(200, json=answers if isinstance(body, list) else answers[0])
 
@@ -375,6 +381,27 @@ async def test_every_revert_flavour_means_not_a_token(message: str, code: int) -
     rpc.route("beta.rpc", no_contract)
     async with rpc.client() as http:
         assert (await evm(http).find_network(USDC_ETH)).kind is AddressKind.NOT_TOKEN
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RpcFailure("header not found", code=-32000), LostAnswer()],
+    ids=["node-error", "lost-answer"],
+)
+async def test_a_node_error_or_a_lost_answer_on_one_probe_gives_no_verdict(
+    failure: Exception,
+) -> None:
+    def behind(method: str, params: list[Any]) -> Any:
+        if method == "eth_call" and params[0]["data"] == ERC20_TOTAL_SUPPLY:
+            raise failure  # no real answer to that call: an outage, not "no such function"
+        return erc20_contract(method, params)
+
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", behind)
+    rpc.route("beta.rpc", no_contract)
+    async with rpc.client() as http:
+        with pytest.raises(RpcUnavailable, match="Alpha"):
+            await evm(http).find_network(USDC_ETH)
 
 
 async def test_non_rpc_exceptions_propagate_from_find_network(
@@ -1184,6 +1211,15 @@ def slow_network(delays: dict[str, float], code: dict[str, str], requests: list[
     return handler
 
 
+async def until(condition: Callable[[], object]) -> None:
+    """Let the background work run until ``condition()`` holds; fail after about five seconds."""
+    for _ in range(500):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the background work did not finish")
+
+
 def optional_validator(http: httpx.AsyncClient, tmp_path: Path, clock: FakeClock):
     networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
     evm_validator = EvmContractValidator(
@@ -1254,9 +1290,8 @@ async def test_a_partial_rejection_asks_only_the_silent_network_again(
             ValidationStatus.ALREADY_REJECTED,
             AddressKind.NO_CODE,
         )
-        await asyncio.sleep(0.05)
+        await until(lambda: validator._cache.is_rejected(ETH))  # cached like any rejection now
         assert requests == ["beta.rpc"]  # Alpha already said "no code"
-        assert validator._cache.is_rejected(ETH)  # complete now: cached like any rejection
 
 
 async def test_a_resting_optional_network_is_not_waited_for(tmp_path: Path) -> None:
@@ -1282,15 +1317,22 @@ async def test_a_late_no_code_completes_the_rejection_without_a_recheck(
 
     monkeypatch.setattr(evm_validator, "OPTIONAL_GRACE", 0.02)
     requests: list[str] = []
+    answer = slow_network({}, {}, requests)
+    beta_answers = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "beta.rpc":
+            await beta_answers.wait()  # late for sure, however long Alpha takes
+        return await answer(request)
+
     clock = FakeClock()
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(slow_network({"beta.rpc": 0.1}, {}, requests))
-    ) as http:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         validator = optional_validator(http, tmp_path, clock)
         assert (await validator.validate(ETH)).kind is AddressKind.NO_CODE
         assert not validator._cache.is_rejected(ETH)  # Beta has not answered yet
-        await asyncio.sleep(0.3)  # now it has: nothing there either
-        assert validator._cache.is_rejected(ETH) and ETH not in validator._partial
+        beta_answers.set()  # now it does: nothing there either
+        await until(lambda: validator._cache.is_rejected(ETH))
+        assert ETH not in validator._partial
         requests.clear()
         clock.now = 61
         assert (await validator.validate(ETH)).status is ValidationStatus.ALREADY_REJECTED
@@ -1373,8 +1415,7 @@ async def test_a_recheck_never_holds_up_the_page_that_shows_the_address(tmp_path
         assert result.status is ValidationStatus.ALREADY_REJECTED  # nobody waited for Beta
         assert len(validator._rechecks) == 1
         release.set()
-        await asyncio.sleep(0.05)
-        assert not validator._rechecks
+        await until(lambda: not validator._rechecks)  # the re-check ends once Beta answers
 
 
 async def test_a_token_found_by_a_background_recheck_is_confirmed_next_time(
@@ -1399,7 +1440,7 @@ async def test_a_token_found_by_a_background_recheck_is_confirmed_next_time(
         state["beta"] = "token"  # deployed on Beta meanwhile
         clock.now = 61
         await validator.validate(ETH)  # starts the re-check, answers at once
-        await asyncio.sleep(0.05)
+        await until(lambda: told)
         assert told == [(ETH, "Beta")]  # the pending watch hears at once
         requests.clear()
         confirmed = await validator.validate(ETH)  # the next check of the page

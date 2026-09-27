@@ -59,10 +59,11 @@ python main.py            # or: python -m scraper_bot
 ```
 
 The bot verifies the token, starts the browser, loads `data/state.json`, sends
-`🤖 Bot started (v2.1.1): 2/2 site(s) running.` to the alert chats and starts polling
+`🤖 Bot started (v2.1.2): 2/2 site(s) running.` to the alert chats and starts polling
 Telegram. Stop it with Ctrl-C or SIGTERM (SIGTERM on Linux and macOS; on Windows it
 kills at once); monitors, turbo sessions and the browser shut down cleanly, and token alerts
-already on their way are still sent (up to 10 s). A second SIGTERM kills at once.
+already on their way are still sent (up to 10 s); one that does not make it in time is sent
+at the next start. A second SIGTERM kills at once.
 
 Exit codes: `0` normal, Ctrl-C or SIGTERM, `1` unexpected fatal error, `2` configuration
 error or rejected token, `3` the browser could not start (run `playwright install
@@ -137,6 +138,8 @@ scraper_bot.monitoring.site_monitor: [https://x.io] https://x.io/app: unchanged
 scraper_bot.monitoring.site_monitor: [https://x.io] https://x.io unavailable: timeout after 20s
 scraper_bot.monitoring.site_monitor: [https://x.io] possible block on https://x.io (Cloudflare challenge (HTTP 403)); next round in 16s
 scraper_bot.pages.fetching.chromium: Chromium could not start with its sandbox (No usable sandbox! …); running without it
+scraper_bot.pages.fetching.chromium: restarting Playwright and the browser after 4210 renders in 60 min (frees memory)
+scraper_bot.pages.fetching.chromium: Playwright driver lost (Connection closed while reading from the driver); starting it again
 scraper_bot.chains.validator: Ethereum 0x1f9a… confirmed as a token on Base
 scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via rpcapi.fantom.network: HTTP 502
 ```
@@ -149,8 +152,9 @@ scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via r
 | `⚙️ .env still sets defaults of an earlier release:` + keys | Your `.env` pins values that were the default in an earlier release (it was copied whole from an older `.env.example`). Sent once per set of such values; the log repeats it at every start. | Delete those lines to get the new defaults, or keep them on purpose; restart. |
 | `🔍 Sub-page found: …` | A derived sub-page answered for the first time; it is monitored from now on. | – |
 | `‼️ Changes on …` + counts + `- / + / ~` examples | A confirmed change of the page: removed, added, attribute-changed elements. | Look at the page. Mute a noisy site with `/nonotifi`. |
-| `🔔 Contract found on …` + network, address, `Found in …: «…»`, `⏱ …`, links | A token appeared on the page: an ERC-20 (not an LP pair or vault), an SPL / Token-2022 mint or a Sui coin. It is sent the moment a render shows it, before the page is compared. It waits out Telegram flood limits of up to a minute, and a send that failed before reaching Telegram is tried again with growing pauses (about two minutes in all); one that may have reached Telegram (the answer timed out) is not sent twice. `Found in` says where (page text, link, page source, loaded script, or via an LP pair) and quotes the text in front of the address, other addresses masked. `⏱` says between which two checks it appeared and when the alert was sent (the first attempt). A second or so later the same message is edited to add the token's name and supply, Solana authorities and risky Token-2022 extensions (⚠️), its age (🆕 = a Solana mint created within the hour, or an EVM contract deployed within the last ~90 blocks; «more than …» is a lower bound: Solana nodes keep days of history, EVM nodes about 100 blocks of state), other networks with the same address and the DEX pair. | Read the quoted text: `CA:` next to it is the launch, `Partner`/`Treasury`/a comment is not. ⚠️ lines mean the issuer can still mint, freeze, tax or move holders' tokens. Tap the monospace address to copy. |
+| `🔔 Contract found on …` + network, address, `Found in …: «…»`, `⏱ …`, links | A token appeared on the page: an ERC-20 (not an LP pair or vault), an SPL / Token-2022 mint or a Sui coin. It is sent the moment a render shows it, before the page is compared. In the chat's queue only command replies overtake it; it waits out any Telegram flood limit, and a send that failed before reaching Telegram or got a 5xx answer is tried again with growing pauses (about ten minutes in all); one that may have reached Telegram (the answer timed out) is not sent twice. Until every chat got it, it is kept in `outbox.json`: an alert cut off by a stop or crash is sent at the next start. `Found in` says where (page text, link, page source, loaded script, or via an LP pair) and quotes the text in front of the address, other addresses masked. `⏱` says between which two checks it appeared and when the alert was sent (the first attempt). A second or so later (in a burst, after the other queued alerts) the same message is edited to add the token's name and supply, Solana authorities and risky Token-2022 extensions (⚠️), its age (🆕 = a Solana mint created within the hour, or an EVM contract deployed within the last ~90 blocks; «more than …» is a lower bound: Solana nodes keep days of history, EVM nodes about 100 blocks of state), other networks with the same address and the DEX pair. | Read the quoted text: `CA:` next to it is the launch, `Partner`/`Treasury`/a comment is not. ⚠️ lines mean the issuer can still mint, freeze, tax or move holders' tokens. Tap the monospace address to copy. |
 | a `.txt` document + `⏸️ Monitoring paused: N confirmed contracts found on …` | `contract_pause_threshold` or more new contracts on one page in one round: the site is paused and the tokens of the render that crossed the threshold come as a file (those of an earlier render of the same round went out as single alerts; N counts them all). The site is paused before either message goes out, and the pause message follows the document. When it says "This was the first check of the page since monitoring started or resumed", the page most likely lists tokens that existed before (after an update that adds a network, for example); they are known now and will not be announced again. | Look at the file, then `/resume <url>`. |
+| a `.txt` document `📄 N more contract(s) that were already on … at the first check (confirmed late)` | Tokens that such a first check showed but could confirm only later (Arc or Robinhood Chain answered late, or no network answered), usually after `/resume`. They are old news like those of the first document: one file per burst, sent once 10 s pass without another, no alert of their own. | Look at the file. |
 | `⚠️ Unverified address on …` | Only with `/unverified <url> on`: a new address on that site, not a token yet; it is re-checked on-chain. | Wait for `✅ Confirmed` or treat as a hint. |
 | `✅ Confirmed: 0x… is a token on …` | A previously unverified address is now a token. | – |
 | `📨 N more unverified address(es) appeared on … (alert cap reached)` | Hourly digest of unverified addresses above `unverified_max_per_hour`. | Lower the noise: `/unverified <url> off` or raise the cap. |
@@ -159,9 +163,9 @@ scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via r
 | `🚫 Possible IP block on …` + `Page:`, `Reason:`, `Protection:` | 401/403/407/429/503, a challenge page or connection resets from any page of the site (a sub-page too). `Protection:` names the service when the answer gives it away: Cloudflare challenge, Cloudflare Turnstile, Vercel Security Checkpoint, AWS WAF, DataDome, DDoS-Guard, PerimeterX, Imperva, Sucuri, hCaptcha, reCAPTCHA, or only the CDN in front of the site (Cloudflare, Akamai). The bot does not solve captchas or browser checks: the interval doubles per round up to `block_max_backoff` (a longer `Retry-After` from the site is honoured as sent), and a turbo session on that site ends when one of its own renders is blocked. | Wait. If it persists, the site banned the IP or wants a browser check; slow down with `/set poll_interval_min`. When `Page:` names a sub-page that always answers 401/403 (a login-only `/dashboard`), take its pattern out of `SUB_URL_PATTERNS`. |
 | `✅ … answers normally again after 12m 30s; normal interval restored.` | A round without any block signal in which the root page answered. | – |
 | `🧩 Captcha on …: the page shows a … widget.` | A page that otherwise loads shows a captcha a person would have to solve: a reCAPTCHA checkbox, hCaptcha or Cloudflare Turnstile (the invisible kinds are not reported). Monitoring goes on, but what the page shows only after solving it stays out of sight. Once per page and widget (the page's other widget, if it alternates, gets its own notice once). | Watch that part of the site by hand if it matters. |
-| `🐢 … has not rendered N times in a row (timeout after 20s). Load timeout for this page raised to 40s` | The page keeps timing out; it gets more time. | Check the site by hand; a heavy or dying page. |
+| `🐢 … has not rendered N times in a row (timeout after 20s). Load timeout for this page raised to 40s` | The page keeps timing out; it gets more time. The reason may also be `page did not respond within 20s` (the page loaded, then a script kept it busy, such as an endless loop) or `browser did not open a tab within 20s`. | Check the site by hand; a heavy or dying page. `/pause` and `/remove` answer within about 10 s even while such a page hangs. |
 | `✅ … renders again; load timeout back to 20s.` | The streak ended. | – |
-| `🛑 <title>` + details + hint | An operational failure, at most once per ten minutes per problem and run: a crashed monitor (restarted after 30 s), a crashed turbo session, a page check that raised, a failing pending watch, a damaged `state.json` (moved aside) or a failed save of it, a browser that could not start, Chromium running without its sandbox (once, until a start with the sandbox), an RPC endpoint serving another chain (checked at start). An RPC endpoint silent for five minutes gets one 🛑 per outage, with how long and its last error; another endpoint joining it, or the same one failing again after it answered, gets a new one. | Read the hint; the log has the traceback. |
+| `🛑 <title>` + details + hint | An operational failure, at most once per ten minutes per problem and run (one that reached no chat does not count): a crashed monitor (restarted after 30 s), a crashed turbo session, a page check that raised, a failing pending watch, a damaged `state.json` or `outbox.json` (moved aside) or a failed save of one, an address cache (`known_contracts.txt`, `rejected_addresses.txt`) with unreadable lines or one that cannot be read or saved (see Troubleshooting), a browser that could not start, Chromium running without its sandbox (once, until a start with the sandbox), an RPC endpoint serving another chain (checked at start). An RPC endpoint silent for five minutes gets one 🛑 per outage, with how long and its last error; another endpoint joining it, or the same one failing again after it answered, gets a new one. | Read the hint; the log has the traceback. |
 
 ## Data directory
 
@@ -170,12 +174,14 @@ scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via r
 | `state.json` | no (you lose the site list) | Back it up; it is the whole configuration you made from Telegram. A damaged one is moved aside at start (`state.json.broken-<time>`, with a 🛑) instead of being overwritten. |
 | `state.json.broken-<time>` | yes, once repaired or not needed | A damaged `state.json`: repair it and put it back as `state.json` while the bot is stopped. |
 | `snapshots/*.json` | yes | The next round stores a fresh baseline; no alert is sent for the rebuild. Delete one file to reset one page. |
-| `known_contracts.txt` | yes | Every contract will be announced again when seen. |
-| `rejected_addresses.txt` | yes | Every wallet on the pages is checked again once. Expired entries leave at start and every 1 000 new ones. |
+| `known_contracts.txt` | yes | Every contract will be announced again when seen. The file is only appended to: lines it cannot read (another encoding, torn by a crash) are skipped and reported at every start until you fix or delete them. |
+| `rejected_addresses.txt` | yes | Every wallet on the pages is checked again once. Expired entries leave at start and every 1 000 new ones; unreadable lines are reported once, and the file is saved again without them. If the file cannot be read at all, that is reported and it is not rewritten at start. |
 | `evm_networks.txt` | yes | The EVM networks the caches were built with. Without it the next start counts every network as new: cached EVM rejections are forgotten and watched EVM addresses become old news (see Upgrading). |
 | `preferences.json` | yes | Live settings go back to `.env`; `/settings reset all` does the same at runtime. |
 | `ignore.txt` | yes | Your own stop-list (addresses never announced, one per line, `#` comments); read at start. |
 | `pending.json` | yes | Addresses waiting to become a token; after deleting it they are taken up again on the next rounds. |
+| `outbox.json` | yes | Token alerts and documents not yet delivered to every chat; the next start sends them. After deleting it they are not sent again. |
+| `outbox.json.broken-<time>` | yes, once read | A damaged `outbox.json`, moved aside at start (with a 🛑); the alerts it lists were not sent again. |
 | `outdated_defaults.txt` | yes | The old `.env` values last reported; after deleting it the next start reports them again. |
 | `no_sandbox_notice.txt` | yes | Present while the chat knows that Chromium runs without its sandbox; after deleting it the next such start reports it again. |
 | `heartbeat` | yes | Rewritten every 15 s. |
@@ -192,6 +198,8 @@ a damaged `state.json`: their sites may come back with the repaired file.
 | Exit code 3, `browser could not start: … Install it with: playwright install chromium` | Chromium missing or an incompatible Playwright. | `playwright install chromium`; on Ubuntu 20.04 install Google Chrome and set `BROWSER_CHANNEL=chrome`. |
 | `🚫 Possible IP block …` with `Protection: Vercel Security Checkpoint` or `Cloudflare challenge` | The site's bot protection wants a browser check the headless browser does not pass. | Poll that site less often; the bot only slows down. |
 | `🛑 The site list (state.json) was damaged` | A crash of the disk or a hand edit left `state.json` unreadable. It was moved to `state.json.broken-<time>` and the bot started without those sites; their snapshots are kept. | Stop the bot, repair the file (a JSON validator names the line), put it back as `data/state.json`, start again. Or `/add` the sites again. |
+| `🛑 Some lines of known_contracts.txt were unreadable and skipped` (or of `rejected_addresses.txt`) | A line in another encoding (the file was edited and saved as ANSI instead of UTF-8) or torn by a crash; the message lists the line numbers. The rest of the file was loaded. | `known_contracts.txt` is only appended to, so every start reports the lines until you fix them (UTF-8, tab-separated) or delete them while the bot is stopped. `rejected_addresses.txt` was saved again without them: nothing to do. |
+| `🛑 Saving to known_contracts.txt fails` or `🛑 known_contracts.txt could not be read` (the same for `rejected_addresses.txt`) | The file or `data/` is read-only or owned by another user (for example after one run with `sudo`), open in another program, or the disk is full. The bot goes on with the lists in memory, but without what it could not read, and what it cannot save is lost at the next restart: a known token may be announced again. | Give the files back to the bot's user (`sudo chown -R scraper:scraper /home/scraper/bot/data`), close the other program or free disk space. After a read error, restart. |
 | `🛑 Chromium runs without its sandbox` | The sandbox could not start: the bot runs as root, in a container, or where user namespaces are restricted (Ubuntu 23.10+). The browser works, isolated only by the bot's user account. | Run the bot as its own non-root user; try Google Chrome (`BROWSER_CHANNEL=chrome`). `--no-sandbox` in `BROWSER_ARGS` switches the sandbox off on purpose, without a 🛑. |
 | A command in a group gets no answer | It was addressed to another bot (`/pause@OtherBot`), or the group is not an allowed chat. | Send it without a mention or with this bot's name. |
 | `/add` answers `⚠️ It shares pages with …` | The two sites derive the same pages (`x.io` and `www.x.io`, a path of the same domain, or a subdomain that is also a sub-page pattern). | Keep one of them; otherwise a change on a shared page is reported by only one of the two monitors. |
@@ -244,6 +252,35 @@ Chrome, `sudo apt install --only-upgrade google-chrome-stable` instead), then `p
 and restart. Missing
 keys in `.env` use the defaults; `⚙️ .env still sets defaults of an earlier release`
 at start names the lines that pin an old default.
+
+To 2.1.2 from 2.1.1:
+
+- Nothing to do: no new dependency and no `.env` line to change. `pending.json` gains an
+  `old_news` key (older files load), `outbox.json` is new, and snapshots and caches keep
+  their format; normal pages give the same signatures as before, so the update sends no
+  change alert. An address cache that cannot be read or written, or holds a line in
+  another encoding, no longer stops the start: the bot reports it with a 🛑 and goes on.
+- Alerts: each chat has a send queue (command replies first, then token alerts and
+  documents, then the rest), and a flood limit pauses the whole chat. Token alerts,
+  documents and the pause message ride out flood limits and outages of up to about ten
+  minutes (2.1.1: a minute of flood wait, two minutes offline). Token alerts and documents
+  are kept in `data/outbox.json` until every chat got them: the next start sends what a
+  stop or crash cut off. A change report or a details edit is no longer lost behind a
+  flood wait, and a 🛑 that reached no chat no longer starts its ten-minute cooldown.
+- Tokens that a pausing first check showed but could confirm only later (a late Arc or
+  Robinhood Chain answer, or none at all) no longer come as single 🔔 alerts after
+  `/resume`, but as one more `.txt` per burst:
+  `📄 N more contract(s) that were already on … at the first check (confirmed late)`.
+- Pages: one that stops answering once it loaded (a script in an endless loop) counts as
+  a load timeout (🐢) instead of stalling its site and `/pause`; a loading skeleton (a
+  render with under 60% of the snapshot's nodes) no longer replaces the snapshot, and the
+  third such round in a row is compared; big pages, above all those full of identical
+  rows, are compared many times faster. Tabs a page opens are closed, downloads refused,
+  and Playwright and the browser start afresh every hour or 10 000 renders, which frees
+  the memory Playwright keeps for every call.
+- 2.1.1 runs on the data directory again after a rollback (it ignores the new file and
+  key); delete `data/outbox.json` before returning to 2.1.2, or the alerts left in
+  it are sent again.
 
 To 2.1.1 from 2.1:
 

@@ -1,4 +1,6 @@
-from scraper_bot.pages.changes.normalizer import HtmlNormalizer
+import time
+
+from scraper_bot.pages.changes.normalizer import MAX_ATTRIBUTES, HtmlNormalizer
 from scraper_bot.settings.defaults import DEFAULT_IGNORED_ATTRIBUTES
 from tests.conftest import node
 
@@ -98,3 +100,15 @@ def test_content_after_a_huge_text_node_is_kept() -> None:
     bundle = "x" * (11 * 1024 * 1024)  # over libxml2's 10 MB limit for one text node
     signature = HtmlNormalizer().signature(f"<div>{bundle}</div><p>CA: after the bundle</p>")
     assert signature[-1].text == "CA: after the bundle"
+
+
+def test_an_element_keeps_only_its_first_attributes() -> None:
+    written = " ".join(f'a{i}="v"' for i in range(20_000))  # as Chromium writes them
+    unquoted = " ".join(f"b{i}=v" for i in range(300))
+    started = time.perf_counter()
+    first, second = sig(f'<div id="x" {written}>hi</div><p {unquoted}>after</p>')
+    assert time.perf_counter() - started < 1.0
+    assert len(first.attrs) == len(second.attrs) == MAX_ATTRIBUTES
+    assert ("id", "x") in first.attrs and ("a198", "v") in first.attrs
+    assert ("a199", "v") not in first.attrs
+    assert ("b199", "v") in second.attrs and ("b200", "v") not in second.attrs

@@ -497,6 +497,8 @@ class FakeChromium:
     def __init__(self, sandbox_error: str | None = None) -> None:
         self.launches: list[dict[str, object]] = []
         self.routes: list[str] = []
+        self.listeners: list[str] = []  # the context events the fetcher listens to
+        self.context_options: dict[str, object] = {}
         self.sandbox_error = sandbox_error  # what a launch with the sandbox fails with
         self.closed = 0
 
@@ -509,13 +511,17 @@ class FakeChromium:
     async def close(self) -> None:
         self.closed += 1
 
-    async def new_context(self, **_kwargs: object) -> FakeContext:
+    async def new_context(self, **kwargs: object) -> FakeContext:
+        self.context_options = kwargs
         return FakeContext(self)
 
 
 class FakeContext:
     def __init__(self, browser: FakeChromium) -> None:
         self.browser = browser
+
+    def on(self, event: str, _handler: object) -> None:
+        self.browser.listeners.append(event)
 
     async def route(self, pattern: str, _handler: object) -> None:
         self.browser.routes.append(pattern)
@@ -546,6 +552,8 @@ async def test_launch_passes_the_browser_args_and_always_installs_the_filter(
     assert launch["args"] == expected
     assert launch["chromium_sandbox"] is True and fetcher.sandboxed
     assert playwright.chromium.routes == ["**/*"]  # beacons are dropped even with no types
+    assert playwright.chromium.context_options["accept_downloads"] is False
+    assert playwright.chromium.listeners == ["page"]  # tabs a page opens get closed
 
 
 async def test_without_a_usable_sandbox_the_browser_starts_without_it(tmp_path: Path) -> None:

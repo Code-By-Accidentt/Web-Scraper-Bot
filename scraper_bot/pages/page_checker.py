@@ -25,6 +25,11 @@ log = logging.getLogger(__name__)
 
 Observer = Callable[[Observation], Awaitable[None]]
 
+# A round whose renders keep less than this share of the stored snapshot's nodes (a loading
+# skeleton, a half-loaded list) is skipped; the third such round in a row is a real change.
+_SMALL_RENDER = 0.6
+_SMALL_ROUNDS = 3
+
 
 def _without_old_deep(
     sightings: tuple[Sighting, ...], deep_seen: frozenset[str] | None, *, recording: bool
@@ -50,11 +55,12 @@ def _without_old_deep(
 
 
 class PageChecker:
-    """Runs the full check of one page and keeps no per-page state itself.
+    """Runs the full check of one page; per page it remembers only its small-render streak.
 
     A change counts only if a second render ``confirm_delay`` seconds later still shows it;
     what differs between the two renders is volatile and stays out of the report and the
     snapshot. Elements that keep changing across rounds are silenced by :class:`NoiseFilter`.
+    Renders much smaller than the stored snapshot replace it only after a few rounds.
     """
 
     def __init__(
@@ -82,6 +88,7 @@ class PageChecker:
         self._blocks = block_detector or BlockDetector()
         self._sleep = sleep
         self._clock = clock
+        self._small: dict[str, int] = {}  # page -> rounds in a row that rendered small
 
     async def check(
         self,
@@ -156,6 +163,7 @@ class PageChecker:
                 page_url, PageStatus.BASELINE, candidates=candidates, captcha=captcha
             )
         if not self._detector.differs(snapshot.signature, current):
+            self._small.pop(page_url, None)
             return PageCheckOutcome(
                 page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
             )
@@ -217,6 +225,16 @@ class PageChecker:
                 candidates=candidates,
                 captcha=captcha,
             )
+        if self._small_round(page_url, snapshot.signature, confirmed):
+            stored = len(snapshot.signature)
+            reason = f"renders much smaller than the snapshot ({len(confirmed)} vs {stored} nodes)"
+            return PageCheckOutcome(
+                page_url,
+                PageStatus.UNSTABLE,
+                error=reason,
+                candidates=candidates,
+                captcha=captcha,
+            )
         # The diffs can take seconds of CPU on big pages; a thread keeps the event loop free.
         volatile = await asyncio.to_thread(self._detector.volatile_nodes, current, confirmed)
         report, accepted = await asyncio.to_thread(
@@ -243,6 +261,23 @@ class PageChecker:
             candidates=candidates,
             captcha=captcha,
         )
+
+    def _small_round(self, page_url: str, stored: Signature, render: Signature) -> bool:
+        """Return True when this round is skipped: its render is much smaller than the snapshot.
+
+        A loading skeleton must not replace the stored page and be reported as a removal. A
+        page that stays that small for ``_SMALL_ROUNDS`` rounds in a row really changed, so
+        that round is compared as usual.
+        """
+        if len(render) >= _SMALL_RENDER * len(stored):
+            self._small.pop(page_url, None)
+            return False
+        rounds = self._small.get(page_url, 0) + 1
+        if rounds >= _SMALL_ROUNDS:
+            self._small.pop(page_url, None)
+            return False
+        self._small[page_url] = rounds
+        return True
 
     async def _sightings(self, signature: Signature, result: FetchResult) -> tuple[Sighting, ...]:
         """Return one sighting per address found in a render, searched in a worker thread."""

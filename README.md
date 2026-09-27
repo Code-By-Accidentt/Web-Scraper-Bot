@@ -113,7 +113,7 @@ scraper_bot/
   app/          start-up: entry point, process resources, wiring, heartbeat
   settings/     .env settings and the live ones changed with /set
   models/       plain data types shared by every package
-  storage/      state.json, page snapshots, address caches, v1 import
+  storage/      state.json, page snapshots, address caches, unsent alerts, v1 import
   pages/        fetching (browser, prober, block detection), changes (normalising,
                 diffing, noise filter), the per-page check, where addresses stand
   chains/       the network table, addresses (formats, extraction, stop-list), JSON-RPC,

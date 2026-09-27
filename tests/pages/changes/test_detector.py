@@ -1,3 +1,5 @@
+import time
+
 from scraper_bot.models.pages import ChangeCounts
 from scraper_bot.pages.changes.detector import ChangeDetector
 from tests.conftest import node
@@ -115,6 +117,19 @@ def test_shape_masks_every_number() -> None:
     assert shape("Launch in 00:05:30") == "Launch in #:#:#"
     assert shape("Raised: 1,204.5 SOL of 2000") == "Raised: # SOL of #"
     assert shape("Presale is live") == "Presale is live"
+
+
+def test_a_node_inserted_into_a_run_of_identical_rows_is_the_only_addition() -> None:
+    head, fresh = node("h1", "Launchpad"), node("p", "Token is live: CA below")
+    soon, live = node("p", "Sale starts in 2 days"), node("p", "Sale is open")
+    for count in (250, 20_000):  # 250: 101 removed and 102 added before; 20 000: minutes
+        rows = (node("div", class_="skeleton"),) * count
+        started = time.perf_counter()
+        report = ChangeDetector().compare(
+            (head, *rows, soon), (head, *rows[:100], fresh, *rows[100:], live), URL
+        )
+        assert time.perf_counter() - started < 1.0
+        assert (report.removed, report.added) == ((soon,), (fresh, live))
 
 
 def test_diff_keeps_only_confirmed_content_as_the_next_snapshot() -> None:

@@ -393,6 +393,38 @@ def test_a_torn_last_line_does_not_swallow_the_next_known_contract(tmp_path: Pat
     assert again.is_known(first) and again.is_known(later)
 
 
+def test_unreadable_lines_and_an_unwritable_file_do_not_stop_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    known = tmp_path / "known.tsv"
+    known.write_bytes(
+        f"Ethereum\t{USDC_ETH}\tBase\t2026-09-27\n".encode()
+        + "Solana\tнота\n".encode("cp1251")  # saved by an ANSI editor
+        + b"Sol"  # torn by a crash
+    )
+    real_open = Path.open
+
+    def read_only(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if self == known and mode != "rb":
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", read_only)
+    problems: list[str] = []
+
+    def report(key: str, title: str, detail: str, hint: str) -> None:
+        problems.append(title)
+
+    cache = AddressCache(known, tmp_path / "r.tsv", rejected_ttl=0, report=report)
+    cache.load()
+    assert cache.add_known(ConfirmedContract(SOL, "Solana"))  # kept in memory, reported once
+    assert cache.is_known(ETH) and cache.is_known(SOL)
+    assert problems == [
+        "Saving to known.tsv fails",
+        "Some lines of known.tsv were unreadable and skipped",
+    ]
+
+
 def test_expired_rejections_are_swept_out_and_not_counted(tmp_path: Path) -> None:
     now = [1_000.0]
     rejected = tmp_path / "r.tsv"

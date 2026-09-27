@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import re
+from itertools import pairwise
 
 import httpx
 import pytest
@@ -329,12 +331,13 @@ async def test_a_message_sent_as_plain_text_is_edited_as_plain_text() -> None:
     assert "parse_mode" not in seen[-1] and seen[-1]["text"] == "0xabc + details"
 
 
-async def test_edits_are_never_retried_and_an_unchanged_text_is_fine() -> None:
+async def test_an_unchanged_edit_is_fine_and_a_rate_limited_one_waits_its_turn() -> None:
     calls: list[str] = []
     answers = iter(
         [
             httpx.Response(400, json={"ok": False, "description": "message is not modified"}),
             httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 0}}),
+            httpx.Response(200, json={"ok": True, "result": {"message_id": 9}}),
         ]
     )
 
@@ -346,8 +349,40 @@ async def test_edits_are_never_retried_and_an_unchanged_text_is_fine() -> None:
     async with http:
         message = SentMessage(1, 9)
         assert await client.edit_message_text(message, "same") is True
-        assert await client.edit_message_text(message, "new") is False
-    assert len(calls) == 2  # the rate-limited edit was not repeated
+        assert await client.edit_message_text(message, "new") is True
+    assert len(calls) == 3  # the details of an alert are not lost to a flood wait
+
+
+async def test_a_quiet_chat_takes_a_short_burst_at_once_then_one_a_second() -> None:
+    now = 0.0
+    seen: list[tuple[float, str]] = []
+
+    async def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        await asyncio.sleep(0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((now, request.url.path.rsplit("/", 1)[-1]))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramClient("123:secret", http, sleep=sleep, clock=lambda: now)
+        message = await client.send_tracked(1, "alert 0", patient=True)
+        assert message is not None
+        assert await client.edit_message_text(message, "alert 0 + details")
+        more = [client.send_tracked(1, f"alert {i}", patient=True) for i in range(1, 6)]
+        assert all(await asyncio.gather(*more))
+    # An alert, its details and three more alerts go at once; then one a second.
+    assert seen == [
+        (0.0, "sendMessage"),
+        (0.0, "editMessageText"),
+        (0.0, "sendMessage"),
+        (0.0, "sendMessage"),
+        (0.0, "sendMessage"),
+        (1.0, "sendMessage"),
+        (2.0, "sendMessage"),
+    ]
 
 
 async def test_a_message_too_long_to_edit_is_sent_but_not_tracked() -> None:
@@ -381,6 +416,64 @@ async def test_a_patient_send_waits_out_a_long_flood_limit() -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramClient("123:secret", http, sleep=record)
         assert await client.send_message(1, "reply") is False  # a reply does not wait 35 s
+
+
+async def test_a_burst_waits_its_turn_and_a_flood_wait_pauses_the_whole_chat() -> None:
+    now = 0.0
+    seen: list[tuple[float, str]] = []
+
+    async def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        await asyncio.sleep(0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if len(seen) == 2 and now < 30:  # Telegram asks the chat to wait 30 s, once
+            return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 30}})
+        seen.append((now, form(request)["text"]))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(seen)}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramClient("123:secret", http, sleep=sleep, clock=lambda: now)
+        alerts = [
+            asyncio.create_task(client.send_tracked(1, f"alert {i}", patient=True))
+            for i in range(10)
+        ]
+        while len(seen) < 4:
+            await asyncio.sleep(0)
+        assert await client.send_message(1, "reply")  # a command reply skips the backlog
+        assert all(await asyncio.gather(*alerts))  # none is dropped for waiting so long
+    assert [text for _, text in seen] == [
+        *(f"alert {i}" for i in range(4)),
+        "reply",
+        *(f"alert {i}" for i in range(4, 10)),
+    ]
+    times = [at for at, _ in seen]
+    assert times[:2] == [0.0, 0.0]  # a quiet chat takes a short burst at once
+    # After the flood wait no burst: one a second.
+    assert times[2] >= 30 and all(later - at >= 1 for at, later in pairwise(times[2:]))
+
+
+async def test_a_patient_send_rides_out_a_telegram_5xx() -> None:
+    answers = [
+        httpx.Response(502, text="<html>Bad Gateway</html>"),
+        httpx.Response(500, json={"ok": False, "description": "Internal Server Error"}),
+        httpx.Response(200, json={"ok": True, "result": {"message_id": 1}}),
+    ]
+    pauses: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return answers.pop(0) if len(answers) > 1 else answers[0]
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = TelegramClient("123:secret", http, sleep=sleep)
+        assert await client.send_document(1, "c.txt", b"0xabc\n", patient=True)
+        assert pauses == [2, 4]
+        answers[:] = [httpx.Response(502, text="Bad Gateway"), answers[0]]
+        assert not await client.send_message(1, "reply")  # a reply is not resent after a 5xx
 
 
 async def test_only_requests_that_never_left_are_sent_again() -> None:

@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from playwright import async_api as pw
 
@@ -18,11 +19,19 @@ from scraper_bot.settings.live import Tuning
 
 log = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
 _SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
 _SCANNED_CONTENT_TYPES = ("javascript", "ecmascript", "json", "text/", "xml")
 _PER_RESPONSE_LIMIT = 3 * 1024 * 1024
 # Words in a launch error that mean the sandbox failed ("No usable sandbox!", namespaces).
 _SANDBOX_TROUBLE = ("sandbox", "namespace", "zygote", "setuid")
+# What every call raises (a plain Exception, not a Playwright error) once the driver is gone.
+_DRIVER_GONE = "connection closed while reading from the driver"
+_CLOSE_TIMEOUT = 5.0  # seconds a tab, the browser or the driver gets to close
+RECYCLE_AFTER = 3600.0  # seconds one Playwright driver serves before a fresh one replaces it
+RECYCLE_RENDERS = 10_000  # renders one Playwright driver serves before a fresh one replaces it
+_RECYCLE_WAIT = 30.0  # seconds a scheduled restart waits for the renders in flight
 
 _SHADOW_ROOTS_JS = """
 () => {
@@ -41,22 +50,106 @@ _SHADOW_ROOTS_JS = """
 """
 
 
-class PlaywrightFetcher:
-    """Renders pages in one shared Chromium, one tab per fetch.
+async def _within(seconds: float, call: Awaitable[_T]) -> _T:
+    """Await one call to a page and return its result; TimeoutError after ``seconds``."""
+    async with asyncio.timeout(seconds):
+        return await call
 
-    The browser lives as long as the process and is relaunched after a crash; at most
-    ``max_concurrent_pages`` pages render at once. With ``deep_scan`` the result also
-    carries frame and shadow-root markup and the script and JSON bodies the page loaded,
-    so addresses hidden there cost no extra request.
+
+async def _quietly(close: Callable[[], Awaitable[object]]) -> None:
+    """Run a close or stop call, giving up after ``_CLOSE_TIMEOUT`` seconds; errors are ignored.
+
+    Whatever does not close in time is left to the driver, which ends with the bot.
+    """
+    with contextlib.suppress(Exception):
+        async with asyncio.timeout(_CLOSE_TIMEOUT):
+            await close()
+
+
+class _OwnTabs:
+    """Tells the tabs the fetcher opened from the ones a page opened, and closes the latter.
+
+    Playwright announces a new tab of the fetcher's own before ``new_page()`` returns it, so
+    a tab born while opens are in flight is closed only once none of them turned out to be it.
     """
 
-    def __init__(self, settings: Settings, tuning: Tuning | None = None) -> None:
-        """Set up the fetcher; the browser itself starts in :meth:`start`."""
+    def __init__(self) -> None:
+        """Start with no tabs."""
+        self._own: set[pw.Page] = set()
+        self._opening: set[object] = set()  # a token per new_page() call in flight
+        self._unclaimed: dict[pw.Page, set[object]] = {}  # new tabs and the opens they wait for
+        self._closing: set[asyncio.Task[None]] = set()
+
+    async def open(self, context: pw.BrowserContext) -> pw.Page:
+        """Open a tab of the fetcher's own in ``context`` and return it."""
+        token = object()
+        self._opening.add(token)
+        try:
+            page = await context.new_page()
+            self._own.add(page)
+            self._unclaimed.pop(page, None)
+            return page
+        finally:
+            self._opening.discard(token)
+            for other, waiting in list(self._unclaimed.items()):
+                waiting.discard(token)
+                if not waiting:
+                    del self._unclaimed[other]
+                    self._close(other)
+
+    def forget(self, page: pw.Page) -> None:
+        """Stop counting ``page`` as a tab of the fetcher's own; it is being closed."""
+        self._own.discard(page)
+
+    def on_page(self, page: pw.Page) -> None:
+        """Handle a tab the context reports: a popup is closed, the fetcher's own tab kept."""
+        if page in self._own:
+            return
+        if self._opening:
+            self._unclaimed[page] = set(self._opening)
+        else:
+            self._close(page)
+
+    def _close(self, page: pw.Page) -> None:
+        """Close, in the background, a tab a page opened (window.open, a link to a new window)."""
+        log.debug("closing a tab a page opened: %s", page.url)
+        task = asyncio.ensure_future(_quietly(page.close))
+        self._closing.add(task)
+        task.add_done_callback(self._closing.discard)
+
+
+class PlaywrightFetcher:
+    """Renders pages in one shared Chromium, a tab per fetch, ``max_concurrent_pages`` at once.
+
+    Playwright and its browser start again after a crash, and between renders after an hour
+    or 10 000 renders, because Playwright keeps a little memory for every call it makes.
+    With ``deep_scan`` the result also carries frame and shadow-root markup and the script and
+    JSON bodies the page loaded, so addresses hidden there cost no extra request.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        tuning: Tuning | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        recycle_after: float = RECYCLE_AFTER,
+        recycle_renders: int = RECYCLE_RENDERS,
+    ) -> None:
+        """Set up the fetcher; the browser itself starts in :meth:`start`.
+
+        Playwright is started afresh once it has run ``recycle_after`` seconds or served
+        ``recycle_renders`` renders, whichever comes first.
+        """
         self._settings = settings
         self._tuning: Tuning = tuning if tuning is not None else settings
+        self._clock = clock
+        self._recycle_after = recycle_after
+        self._recycle_renders = recycle_renders
         self._playwright: pw.Playwright | None = None
         self._browser: pw.Browser | None = None
         self._context: pw.BrowserContext | None = None
+        self._tabs = _OwnTabs()
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_pages)
         self._launch_lock = asyncio.Lock()
         self._blocked = frozenset(settings.blocked_resource_types)
@@ -64,8 +157,16 @@ class PlaywrightFetcher:
         self._sandbox = "--no-sandbox" not in self._args
         self.sandbox_error: str | None = None  # why the sandbox was dropped; None if it was not
         self._launched = False
+        self._stopped = False
         # Called when a relaunch drops the sandbox; the first start is reported by the app.
         self.on_sandbox_lost: Callable[[str], None] | None = None
+        self._up_since = 0.0  # when the running driver started, on ``clock``
+        self._renders = 0  # renders since then
+        self._rendering = 0  # renders in flight
+        self._idle = asyncio.Event()  # set while no render is in flight
+        self._idle.set()
+        self._ready = asyncio.Event()  # cleared while Playwright restarts on schedule
+        self._ready.set()
 
     @property
     def is_connected(self) -> bool:
@@ -82,50 +183,72 @@ class PlaywrightFetcher:
 
         Raise :class:`BrowserUnavailable`, with a hint on what to install, if it cannot start.
         """
-        self._playwright = await pw.async_playwright().start()
-        try:
-            await self._launch()
-        except pw.Error as exc:
-            raise BrowserUnavailable(self._explain_launch_error(exc)) from exc
+        self._stopped = False
+        async with self._launch_lock:
+            await self._bring_up()
 
     async def stop(self) -> None:
-        """Close the browser and stop Playwright."""
+        """Close the browser and stop Playwright for good.
+
+        A browser or driver that is gone already, or slow to close, is no error.
+        """
+        self._stopped = True
         await self._close_browser()
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
+        await self._stop_driver()
 
     async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult:
         """Render ``url`` in a new tab and return the result.
 
-        Page errors come back inside the result. If the browser died, it is relaunched and
-        the fetch tried once more; :class:`BrowserUnavailable` means it could not start.
+        Page errors come back inside the result. If the browser or the Playwright driver
+        died, they start again and the fetch is tried once more; :class:`BrowserUnavailable`
+        means they could not start.
         """
         async with self._semaphore:
-            for attempt in (1, 2):
-                context = await self._ensure_context()
-                try:
-                    return await self._fetch_in(context, url, timeout)
-                except pw.Error as exc:
-                    if attempt == 1 and self._browser_gone(exc):
-                        log.warning("browser connection lost (%s); relaunching", self._brief(exc))
-                        await self._discard(context)
-                        continue
+            await self._recycle_if_due()
+            self._rendering += 1
+            self._idle.clear()
+            try:
+                return await self._render(url, timeout)
+            finally:
+                self._rendering -= 1
+                self._renders += 1
+                if not self._rendering:
+                    self._idle.set()
+
+    async def _render(self, url: str, timeout: float | None) -> FetchResult:
+        """Fetch ``url``; if the browser or the driver turns out gone, start it and retry once."""
+        for attempt in (1, 2):
+            context = await self._ensure_context()
+            try:
+                return await self._fetch_in(context, url, timeout)
+            except Exception as exc:
+                driver = self._driver_gone(exc)
+                if not driver and not isinstance(exc, pw.Error):
+                    raise
+                if attempt == 2 or not (driver or self._browser_gone(exc)):
                     return FetchResult(url, None, error=self._brief(exc))
-            return FetchResult(url, None, error="browser unavailable")
+                what = "Playwright driver" if driver else "browser connection"
+                log.warning("%s lost (%s); starting it again", what, self._brief(exc))
+                await self._discard(context, driver=driver)
+        return FetchResult(url, None, error="browser unavailable")
 
     async def _fetch_in(
         self, context: pw.BrowserContext, url: str, timeout: float | None
     ) -> FetchResult:
         """Open ``url`` in a new tab of ``context``, let it settle and read it.
 
-        A timeout or page error comes back in the result; an error meaning the browser is
-        gone is raised, so :meth:`fetch` can relaunch it.
+        A timeout or page error comes back in the result, a page that stops answering too;
+        an error meaning the browser or the driver is gone is raised, so :meth:`fetch` can
+        start them again.
         """
         tuning = self._tuning
         load_timeout = timeout or self._settings.page_load_timeout
         deep_scan = tuning.deep_scan
-        page = await context.new_page()
+        try:
+            page = await _within(load_timeout, self._tabs.open(context))
+        except TimeoutError:
+            error = f"browser did not open a tab within {load_timeout:.0f}s"
+            return FetchResult(url, None, error=error, timed_out=True)
         responses: list[pw.Response] = []
         if deep_scan:
             # Playwright wraps the handler; a builtin like responses.append breaks it.
@@ -156,8 +279,22 @@ class PlaywrightFetcher:
                     )
             if tuning.settle_delay > 0:
                 await asyncio.sleep(tuning.settle_delay)
-            html = await page.content()
-            dom, bodies = await self._deep_scan(page, responses) if deep_scan else ((), ())
+            try:
+                html = await _within(load_timeout, page.content())
+                dom, bodies = (
+                    await self._deep_scan(page, responses, timeout=load_timeout)
+                    if deep_scan
+                    else ((), ())
+                )
+            except TimeoutError:
+                # A script that never yields (an endless loop) keeps the page from answering.
+                return FetchResult(
+                    url,
+                    None,
+                    error=f"page did not respond within {load_timeout:.0f}s",
+                    timed_out=True,
+                    started_at=started_at,
+                )
             status = response.status if response is not None else None
             headers = dict(response.headers) if response is not None else {}
             return FetchResult(
@@ -171,17 +308,20 @@ class PlaywrightFetcher:
                 started_at=started_at,
             )
         finally:
-            with contextlib.suppress(pw.Error):
-                await page.close()
+            self._tabs.forget(page)
+            await _quietly(page.close)
 
     async def _deep_scan(
-        self, page: pw.Page, responses: list[pw.Response]
+        self, page: pw.Page, responses: list[pw.Response], *, timeout: float | None = None
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         """Return the markup of child frames and shadow roots, and the bodies the page loaded.
 
-        Bodies are the script, JSON and other text responses. Both share the
-        ``deep_scan_max_bytes`` budget, frames and shadow roots first.
+        Bodies are the script, JSON and other text responses; both share the
+        ``deep_scan_max_bytes`` budget, frames and shadow roots first. Reading a frame or the
+        shadow roots raises TimeoutError after ``timeout`` seconds (default
+        ``PAGE_LOAD_TIMEOUT``); the bodies share that much time, and the rest is left out.
         """
+        seconds = timeout or self._settings.page_load_timeout
         budget = self._settings.deep_scan_max_bytes
         texts: list[str] = []
 
@@ -198,27 +338,29 @@ class PlaywrightFetcher:
             if frame is page.main_frame:
                 continue
             with contextlib.suppress(pw.Error):
-                take(await frame.content())
+                take(await _within(seconds, frame.content()))
         with contextlib.suppress(pw.Error):
-            take(str(await page.evaluate(_SHADOW_ROOTS_JS) or ""))
+            take(str(await _within(seconds, page.evaluate(_SHADOW_ROOTS_JS)) or ""))
         dom = len(texts)
         # URL order, not arrival order: every render fills the budget with the same bodies,
         # so an address skipped once does not turn up later as "new".
-        for response in sorted(responses, key=lambda item: item.url):
-            if budget <= 0:
-                break
-            if not self._worth_scanning(response):
-                continue
-            length = response.headers.get("content-length", "")
-            if length.isdigit() and int(length) > _PER_RESPONSE_LIMIT:
-                continue
-            try:
-                body = await response.body()
-            except pw.Error:
-                continue
-            if len(body) > _PER_RESPONSE_LIMIT:
-                continue
-            take(body.decode("utf-8", errors="replace"))
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(seconds):
+                for response in sorted(responses, key=lambda item: item.url):
+                    if budget <= 0:
+                        break
+                    if not self._worth_scanning(response):
+                        continue
+                    length = response.headers.get("content-length", "")
+                    if length.isdigit() and int(length) > _PER_RESPONSE_LIMIT:
+                        continue
+                    try:
+                        body = await response.body()
+                    except pw.Error:
+                        continue
+                    if len(body) > _PER_RESPONSE_LIMIT:
+                        continue
+                    take(body.decode("utf-8", errors="replace"))
         return tuple(texts[:dom]), tuple(texts[dom:])
 
     @staticmethod
@@ -230,21 +372,97 @@ class PlaywrightFetcher:
         return any(marker in content_type for marker in _SCANNED_CONTENT_TYPES)
 
     async def _ensure_context(self) -> pw.BrowserContext:
-        """Return the shared browser context, launching the browser first if it is gone.
+        """Return the shared browser context, starting the browser (and the driver) if gone.
 
-        A failed launch raises :class:`BrowserUnavailable`.
+        A failed start raises :class:`BrowserUnavailable`.
         """
         if self._context is not None and self.is_connected:
             return self._context
         async with self._launch_lock:
             if self._context is None or not self.is_connected:
                 await self._close_browser()
-                try:
-                    await self._launch()
-                except pw.Error as exc:
-                    raise BrowserUnavailable(self._explain_launch_error(exc)) from exc
+                await self._bring_up()
             assert self._context is not None
             return self._context
+
+    async def _bring_up(self) -> None:
+        """Launch the browser, first starting the Playwright driver when none runs.
+
+        A driver found dead on the way is replaced once. Raise :class:`BrowserUnavailable`
+        when either cannot start, or once the fetcher was stopped.
+        """
+        if self._stopped:
+            raise BrowserUnavailable("the browser was stopped")
+        for attempt in (1, 2):
+            await self._start_driver()
+            try:
+                await self._launch()
+                return
+            except Exception as exc:
+                if self._driver_gone(exc):
+                    await self._stop_driver()
+                    if attempt == 1:
+                        continue
+                    brief = self._brief(exc)
+                    raise BrowserUnavailable(f"browser could not start: {brief}") from exc
+                if isinstance(exc, pw.Error):
+                    raise BrowserUnavailable(self._explain_launch_error(exc)) from exc
+                raise
+
+    async def _start_driver(self) -> None:
+        """Start the Playwright driver unless one runs; its age and render count start at zero.
+
+        Raise :class:`BrowserUnavailable` when it cannot start.
+        """
+        if self._playwright is not None:
+            return
+        try:
+            self._playwright = await pw.async_playwright().start()
+        except Exception as exc:
+            raise BrowserUnavailable(f"Playwright could not start: {self._brief(exc)}") from exc
+        self._up_since, self._renders = self._clock(), 0
+
+    async def _stop_driver(self) -> None:
+        """Stop the Playwright driver, if there is one, and forget it; a dead one is no error."""
+        playwright, self._playwright = self._playwright, None
+        if playwright is not None:
+            await _quietly(playwright.stop)
+
+    def _recycle_due(self) -> bool:
+        """True once the driver has run ``recycle_after`` seconds or ``recycle_renders`` renders."""
+        if self._playwright is None or self._stopped:
+            return False
+        return (
+            self._renders >= self._recycle_renders
+            or self._clock() - self._up_since >= self._recycle_after
+        )
+
+    async def _recycle_if_due(self) -> None:
+        """Start Playwright and the browser afresh when they have served long enough.
+
+        The restart waits for the renders in flight (``_RECYCLE_WAIT`` seconds at most), and
+        renders that come meanwhile wait for the new browser; this frees what Playwright
+        keeps for every call it made.
+        """
+        await self._ready.wait()
+        if not self._recycle_due():
+            return
+        self._ready.clear()
+        try:
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(_RECYCLE_WAIT):
+                    await self._idle.wait()
+            log.info(
+                "restarting Playwright and the browser after %d renders in %.0f min (frees memory)",
+                self._renders,
+                (self._clock() - self._up_since) / 60,
+            )
+            async with self._launch_lock:
+                await self._close_browser()
+                await self._stop_driver()
+                await self._bring_up()
+        finally:
+            self._ready.set()
 
     @classmethod
     def _explain_launch_error(cls, exc: pw.Error) -> str:
@@ -262,9 +480,9 @@ class PlaywrightFetcher:
     async def _launch(self) -> None:
         """Launch Chromium and open the shared context; every request goes through the filter.
 
-        If the sandbox keeps Chromium from starting (as root, or without user namespaces),
-        launch again without it and remember why; the browser is then isolated only by the
-        bot's own user account.
+        The context refuses downloads, and closes any tab a page opens. If the sandbox keeps
+        Chromium from starting (as root, or without user namespaces), launch again without it
+        and remember why; the browser is then isolated only by the bot's own user account.
         """
         assert self._playwright is not None, "start() must be called first"
         cfg = self._settings
@@ -295,11 +513,12 @@ class PlaywrightFetcher:
             context = await browser.new_context(
                 viewport={"width": 1366, "height": 900},
                 ignore_https_errors=True,
+                accept_downloads=False,
             )
+            context.on("page", self._tabs.on_page)
             await context.route("**/*", self._route)
         except BaseException:
-            with contextlib.suppress(Exception):
-                await browser.close()
+            await _quietly(browser.close)
             raise
         self._browser, self._context = browser, context
         self._launched = True
@@ -317,18 +536,22 @@ class PlaywrightFetcher:
         text = str(exc).lower()
         return any(sign in text for sign in _SANDBOX_TROUBLE)
 
-    async def _discard(self, context: pw.BrowserContext) -> None:
-        """Close the browser a failed tab used, unless another tab relaunched it already."""
+    async def _discard(self, context: pw.BrowserContext, *, driver: bool = False) -> None:
+        """Close the browser a failed tab used, unless another tab replaced it already.
+
+        With ``driver`` the Playwright driver is stopped as well, so a fresh one starts next.
+        """
         async with self._launch_lock:
             if self._context is context:
                 await self._close_browser()
+                if driver:
+                    await self._stop_driver()
 
     async def _close_browser(self) -> None:
-        """Close the browser, if there is one, and forget it and its context."""
+        """Close the browser, if there is one, and forget it and its context; errors are ignored."""
         browser, self._browser, self._context = self._browser, None, None
         if browser is not None:
-            with contextlib.suppress(pw.Error):
-                await browser.close()
+            await _quietly(browser.close)
 
     async def _route(self, route: pw.Route) -> None:
         """Abort a request the bot does not need; let any other through."""
@@ -338,7 +561,12 @@ class PlaywrightFetcher:
             await route.continue_()
 
     @staticmethod
-    def _browser_gone(exc: pw.Error) -> bool:
+    def _driver_gone(exc: BaseException) -> bool:
+        """True when the error means the Playwright driver process itself is gone."""
+        return _DRIVER_GONE in str(exc).lower()
+
+    @staticmethod
+    def _browser_gone(exc: BaseException) -> bool:
         """True when the error means the browser or the connection to it is gone."""
         message = str(exc).lower()
         return (
