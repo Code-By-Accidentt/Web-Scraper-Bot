@@ -4,7 +4,8 @@ A page may show a token's address before the token is deployed. The watch keeps 
 addresses and checks them in cheap batches (code and nonce on every EVM network, the
 account on Solana). When something appears there, a full validation decides, and a token
 is announced with the moment it was deployed. Wallets and other non-tokens are dropped for
-a week; an address that never becomes a token is given up after a day.
+a week; an address that never becomes a token is given up after a day. Tokens a site's
+pausing first check could not confirm in time go out together as one document instead.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from scraper_bot.models.addresses import (
     Address,
     AddressKind,
     Chain,
+    ConfirmedContract,
     ValidationResult,
     ValidationStatus,
     address_key,
@@ -45,6 +47,7 @@ from scraper_bot.monitoring.pending.entry import (
     entry_from_dict,
     entry_to_dict,
 )
+from scraper_bot.monitoring.pending.old_news import OldNews
 from scraper_bot.settings.env import Settings
 from scraper_bot.storage.files import atomic_write_text
 from scraper_bot.telegram.notifier import Notifier
@@ -111,6 +114,7 @@ class PendingWatch:
             for net in settings.evm_networks
         ]
         self._required = frozenset(net.name for net in settings.evm_networks if not net.optional)
+        self._optional = frozenset(net.name for net in settings.evm_networks if net.optional)
         self._solana = JsonRpcClient(http, settings.solana_rpc_url, timeout, retry=retry)
         self._validator = validator
         self._registry = registry
@@ -136,6 +140,7 @@ class PendingWatch:
         self._late_batches: dict[asyncio.Future[list[Any]], tuple[list[PendingEntry], float]] = {}
         self._in_flight: set[str] = set()  # networks whose last batch has not come back
         self._new_networks = frozenset(new_networks)
+        self._old_news = OldNews()
         self._dirty = False
         self._saved_at = 0.0
 
@@ -202,6 +207,34 @@ class PendingWatch:
             self._remove(entry)
         self._tell({site_url, *(entry.sites if entry else ())}, address)
 
+    def first_check_paused(self, site_url: str, results: Iterable[ValidationResult]) -> None:
+        """Note what the first check that just paused ``site_url`` could not confirm.
+
+        ``results`` are that check's verdicts without a token. A token confirmed later at
+        one of them, on a network the check had no answer from, was on the page all along:
+        it goes out with the rest of its burst as one document, never as an alert of its own.
+        """
+        self._old_news.remember(site_url, results, self._clock())
+        self._dirty = True
+
+    def take_old_news(
+        self, site_url: str, contract: ConfirmedContract, shown: Address | None = None
+    ) -> bool:
+        """Hold back a token the monitor confirmed, when it is old news of a first-check pause.
+
+        ``shown`` is the address the page showed, when it is not the token (an LP pair).
+        Return True when the token joined the site's next document of late tokens: the
+        monitor then neither announces it nor counts it for a pause.
+        """
+        shown = shown or contract.address
+        entry = self._entries.get(shown) or self._entries.get(contract.address)
+        if not self._old_news_of(site_url, contract, shown, entry):
+            return False
+        if entry is not None:
+            self._remove(entry)
+        self._old_news.queue(site_url, contract, self._clock())
+        return True
+
     def start_turbo(self, site_url: str, listener: Listener) -> None:
         """Check the site's addresses at the turbo pace and report its tokens to ``listener``."""
         self._turbo_sites.add(site_url)
@@ -224,6 +257,8 @@ class PendingWatch:
         """Forget a removed site; its addresses stay watched only if another site shows them."""
         for entry in [e for e in self._entries.values() if site_url in e.sites]:
             self._detach(entry, site_url)
+        self._old_news.forget(site_url)
+        self._dirty = True
 
     async def run(self) -> None:
         """Check due addresses every ``tick`` seconds; nothing is sent while none is watched.
@@ -238,7 +273,7 @@ class PendingWatch:
         while True:
             await self._sleep(self._tick)
             try:
-                if self._entries:
+                if self._entries or self._old_news.waiting:
                     await self.check_due(chain)
                 now = self._clock()
                 # A clock stepped back must not hold saves off until it catches up.
@@ -260,7 +295,8 @@ class PendingWatch:
         """Check the addresses that are due, only those of ``chain`` when it is given.
 
         Addresses watched for over a day are given up first. Fast entries go first, up to
-        ``EVM_PER_TICK`` EVM and ``SOLANA_PER_TICK`` Solana addresses per tick.
+        ``EVM_PER_TICK`` EVM and ``SOLANA_PER_TICK`` Solana addresses per tick. Old news whose
+        burst has gone quiet is sent last.
         """
         now = self._clock()
         for address, entry in list(self._entries.items()):
@@ -284,6 +320,23 @@ class PendingWatch:
             self._pass(self._look_evm(evm, now), now),
             self._pass(self._look_solana(solana, now), now),
         )
+        await self._send_old_news()
+
+    async def _send_old_news(self) -> None:
+        """Send the late tokens of each site whose burst has gone quiet as one document.
+
+        They are claimed only now, so a token another path announced meanwhile is left out.
+        """
+        for site_url, contracts in self._old_news.due(self._clock()):
+            self._dirty = True
+            fresh = [contract for contract in contracts if self._registry.claim(contract)]
+            if fresh:
+                log.info(
+                    "%d token(s) %s showed at its first check were confirmed late",
+                    len(fresh),
+                    site_url,
+                )
+                await self._notifier.late_contracts_batch(site_url, fresh)
 
     async def _pass(
         self,
@@ -509,8 +562,8 @@ class PendingWatch:
     ) -> None:
         """Fully validate an entry that just appeared and announce the tokens found.
 
-        Without a token the entry stays watched if it may still become one, and is dropped
-        otherwise.
+        Old news of a first-check pause joins that site's document instead. Without a token
+        the entry stays watched if it may still become one, and is dropped otherwise.
         """
         async with self._confirming[entry.address.chain]:
             results = await self._validator.validate_many(
@@ -524,6 +577,13 @@ class PendingWatch:
             for result in tokens:
                 contract = result.contract
                 assert contract is not None
+                shown = entry.address
+                late_for = next(
+                    (s for s in entry.sites if self._old_news_of(s, contract, shown, entry)), None
+                )
+                if late_for is not None:
+                    self._old_news.queue(late_for, contract, self._clock())
+                    continue
                 if self._registry.claim(contract):
                     await self._notifier.contract_found(
                         contract,
@@ -560,6 +620,24 @@ class PendingWatch:
         return Timeline(
             found_at, missing_at=max(misses), on_page_since=entry.first_seen, deployed=True
         )
+
+    def _old_news_of(
+        self,
+        site_url: str,
+        contract: ConfirmedContract,
+        shown: Address,
+        entry: PendingEntry | None,
+    ) -> bool:
+        """Return True when a token is old news of the first check that paused ``site_url``.
+
+        That check showed ``shown`` (or the token) and had no answer from the token's
+        network. A check here that found that network empty since makes it a deployment.
+        """
+        addresses = (shown, contract.address)
+        optional = contract.network in self._optional
+        if not self._old_news.covers(site_url, addresses, optional=optional, now=self._clock()):
+            return False
+        return entry is None or contract.network not in entry.absent_on
 
     def _tell(self, sites: Iterable[str], address: Address) -> None:
         """Tell the turbo sessions of ``sites`` that ``address`` is a token."""
@@ -701,10 +779,10 @@ class PendingWatch:
         return all(self._is_paused(site) for site in entry.sites)
 
     def load(self) -> None:
-        """Load the entries and dropped addresses of an earlier run; a broken file starts empty.
+        """Load the entries, dropped addresses and old news of an earlier run.
 
-        After new EVM networks were added, the saved EVM entries become baselines (see
-        :meth:`_forget_old_verdicts`).
+        A broken file starts the watch empty. After new EVM networks were added, the saved
+        EVM entries become baselines (see :meth:`_forget_old_verdicts`).
         """
         if not self._path.is_file():
             return
@@ -720,11 +798,13 @@ class PendingWatch:
                 for key, until in data.get(section, {}).items()
                 if (address := parse_address_key(key)) is not None and float(until) > now
             }
+            old_news = OldNews.from_dict(data.get("old_news"))
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             log.warning("pending watch file %s is unreadable (%s); starting empty", self._path, exc)
             return
         self._entries = {entry.address: entry for entry in entries if entry is not None}
         self._dropped = dict(sorted(dropped.items(), key=lambda item: item[1].until))
+        self._old_news = old_news
         self._trim_dropped()
         if self._new_networks:
             self._forget_old_verdicts()
@@ -769,6 +849,7 @@ class PendingWatch:
             # wallets and non-tokens; "expired" holds addresses only given up on
             "dropped": {address_key(a): d.until for a, d in self._dropped.items() if d.hard},
             "expired": {address_key(a): d.until for a, d in self._dropped.items() if not d.hard},
+            "old_news": self._old_news.to_dict(),
         }
         try:
             atomic_write_text(self._path, json.dumps(payload, ensure_ascii=False))

@@ -394,6 +394,23 @@ async def test_load_timeouts_in_a_row_stretch_the_timeout_and_alert_once() -> No
     assert h.checker.timeouts[-1] is None  # back to the configured timeout
 
 
+async def test_status_counts_a_slow_page_as_soon_as_its_alert_goes_out() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    counts: list[int] = []  # what /status shows while the 🐢 and the ✅ are being sent
+
+    async def record(*_: Any) -> None:
+        counts.append(h.monitor.stats.timing_out)
+
+    h.notifier.page_timing_out = record  # type: ignore[method-assign]
+    h.notifier.page_renders_again = record  # type: ignore[method-assign]
+    h.checker.outcomes[ROOT] = timed_out(ROOT)
+    for _ in range(5):
+        await h.monitor.run_once()
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()
+    assert counts == [1, 0]
+
+
 async def test_other_failures_neither_count_nor_break_a_timeout_streak() -> None:
     h = Harness(statuses={APP: 404, DOCS: 404})
     h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 500")
@@ -577,6 +594,12 @@ class RecordingPending:
 
     def announced(self, site_url: str, address: Address) -> None:
         self.announced_tokens.append((site_url, address))
+
+    def take_old_news(self, site_url, contract, shown=None) -> bool:
+        return False
+
+    def first_check_paused(self, site_url, results) -> None:
+        pass
 
 
 async def test_addresses_that_are_not_a_token_yet_go_to_the_pending_watch() -> None:

@@ -6,6 +6,8 @@ Playwright Chromium (``playwright install chromium``) and takes a few seconds.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import http.server
 import os
 import socketserver
@@ -15,6 +17,7 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import psutil
 import pytest
 
 from scraper_bot.chains.addresses.extractor import AddressExtractor
@@ -49,6 +52,13 @@ document.addEventListener("DOMContentLoaded", () => {{
 }});"""
 FRAME_HTML = f"<!doctype html><html><body><p>{ADDR.format(16)}</p></body></html>"
 API_JSON = f'{{"launch": "{ADDR.format(17)}"}}'
+HOSTILE = {
+    # an endless loop once the document has loaded: the page stops answering
+    "/spin": "<p>spin</p><script>setTimeout(() => { while (true) {} }, 50);</script>",
+    # a popup and a link that opens a new window
+    "/popups": "<p>popups</p><a id='x' href='/api?blank' target='_blank'>x</a><script>"
+    "window.open('/api?popup'); document.getElementById('x').click();</script>",
+}
 
 
 @pytest.fixture
@@ -75,6 +85,12 @@ def site(tmp_path: Path) -> Iterator[str]:
                 self.send_header("Content-Type", "text/html")
                 self.end_headers()
                 self.wfile.write(b"<html><body>slow</body></html>")
+                return
+            if self.path in HOSTILE:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(f"<html><body>{HOSTILE[self.path]}</body></html>".encode())
                 return
             super().do_GET()
 
@@ -141,3 +157,57 @@ async def test_load_timeout_override_is_reported(site: str, tmp_path: Path) -> N
         result = await fetcher.fetch(site.replace("/index.html", "/slow"), timeout=1)
     assert result.timed_out and not result.ok
     assert result.error == "timeout after 1s"
+
+
+async def test_a_page_that_stops_answering_times_out(site: str, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, DEEP_SCAN="true", SETTLE_DELAY="0")
+    async with browser(settings) as fetcher:
+        started = time.monotonic()
+        result = await fetcher.fetch(site.replace("/index.html", "/spin"), timeout=2)
+        took = time.monotonic() - started
+        assert (await fetcher.fetch(site)).ok  # the tab is gone, the browser still renders
+    assert result.timed_out and result.error == "page did not respond within 2s"
+    assert took < 15
+
+
+async def test_tabs_a_page_opens_are_closed(site: str, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, DEEP_SCAN="false", SETTLE_DELAY="0.5")
+    async with browser(settings) as fetcher:
+        result = await fetcher.fetch(site.replace("/index.html", "/popups"))
+        context = fetcher._context
+        assert context is not None
+        for _ in range(50):  # the popups close in the background
+            if not context.pages:
+                break
+            await asyncio.sleep(0.1)
+        assert result.ok and context.pages == []
+
+
+async def test_a_dead_playwright_driver_is_replaced(site: str, tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, DEEP_SCAN="false")
+    async with browser(settings) as fetcher:  # stop() at the end must not raise either
+        assert (await fetcher.fetch(site)).ok
+        for child in psutil.Process().children():  # the driver; Chromium runs under it
+            with contextlib.suppress(psutil.NoSuchProcess):
+                if child.name().lower().startswith("node"):
+                    child.kill()
+                    child.wait(10)
+        result = await fetcher.fetch(site)
+        assert result.ok and fetcher.is_connected
+
+
+async def test_playwright_starts_afresh_after_its_share_of_renders(
+    site: str, tmp_path: Path
+) -> None:
+    settings = make_settings(
+        tmp_path, DEEP_SCAN="false", NETWORK_IDLE_TIMEOUT="0", MAX_CONCURRENT_PAGES="3"
+    )
+    fetcher = PlaywrightFetcher(settings, recycle_renders=4)
+    await fetcher.start()
+    try:
+        first = fetcher._playwright
+        results = await asyncio.gather(*(fetcher.fetch(site) for _ in range(10)))
+        assert all(result.ok for result in results)  # none fell into a restart
+        assert fetcher._playwright is not first
+    finally:
+        await fetcher.stop()

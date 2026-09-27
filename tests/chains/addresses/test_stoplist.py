@@ -61,6 +61,7 @@ def test_well_known_evm_addresses_are_stopped(value: str, why: str) -> None:
     [
         MEME,
         "0x0000000000000000000000000000000000010000",  # first address past the system range
+        "0x41ffffffffffffffffffffffffffffffffffffff",  # last address before the predeploys
         "0x4200000000000000000000000000000000000800",  # first address past the predeploys
     ],
 )

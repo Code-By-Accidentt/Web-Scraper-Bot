@@ -14,9 +14,10 @@ from scraper_bot.models.addresses import Address, Chain
 EVM_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z]|::)")
 _BASE58 = "1-9A-HJ-NP-Za-km-z"
 SOLANA_ADDRESS_RE = re.compile(rf"(?<![0-9A-Za-z])[{_BASE58}]{{32,44}}(?![0-9A-Za-z])")
-# Base64 data: URIs (also JSON-escaped, image\/png) are full of base58-looking runs.
+# Base64 data: URIs (also JSON-escaped, image\/png) are full of base58-looking runs. The
+# parameter list is capped: an open one let every "data:" rescan the rest of the text.
 _DATA_URI_RE = re.compile(
-    r"data:[\w.+-]+\\?/[\w.+-]+(?:;[\w.+-]+=[^;,\s\"'<>]*)*;base64,[A-Za-z0-9+/=\\_-]*",
+    r"data:[\w.+-]+\\?/[\w.+-]+(?:;[\w.+-]+=[^;,\s\"'<>]*){0,8};base64,[A-Za-z0-9+/=\\_-]*",
     re.IGNORECASE,
 )
 SUI_COIN_TYPE_RE = re.compile(

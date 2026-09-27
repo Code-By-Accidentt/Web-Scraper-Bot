@@ -254,13 +254,15 @@ async def test_time_limit_and_manual_stop(tmp_path) -> None:
 
 
 async def test_stop_after_zero_keeps_running_after_a_find(tmp_path) -> None:
-    limits = replace(LIMITS, stop_after=0)
-    h = Harness(tmp_path, limits=limits, duration=0.05, real_clock=True)
+    async def pause(_seconds: float) -> None:
+        h.now += LIMITS.interval  # each pause moves the fake clock on by one interval
+
+    h = Harness(tmp_path, limits=replace(LIMITS, stop_after=0), duration=0.05, sleep=pause)
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
     h.validator.confirm(ADDRESS, "Base")
     stats = await h.session.run()
     assert [contract.address for contract in stats.found] == [ADDRESS]
-    assert stats.stop_reason == "time limit reached"
+    assert stats.stop_reason == "time limit reached" and stats.cycles > 2
 
 
 async def test_running_session_follows_live_limit_changes(tmp_path) -> None:

@@ -220,6 +220,7 @@ class FakeNotifier:
         self.digests: list[tuple[str, int]] = []
         self.problems: list[tuple[str, str, str, str | None]] = []
         self.started_calls: list[tuple[str, int, int]] = []
+        self.late_batches: list[tuple[str, tuple[ConfirmedContract, ...]]] = []
 
     async def page_discovered(self, page_url: str) -> None:
         self.discovered.append(page_url)
@@ -318,6 +319,11 @@ class FakeNotifier:
     async def started(self, version: str, total_sites: int, running: int) -> None:
         self.started_calls.append((version, total_sites, running))
 
+    async def late_contracts_batch(
+        self, site_url: str, contracts: Sequence[ConfirmedContract]
+    ) -> None:
+        self.late_batches.append((site_url, tuple(contracts)))
+
 
 class FakeChecker:
     """Scripted stand-in for PageChecker.
@@ -385,7 +391,14 @@ class FakeTelegram:
         self.messages[message.message_id] = (message.chat_id, text)
         return True
 
-    async def broadcast(self, chat_ids: Iterable[int], text: str, *, patient: bool = False) -> bool:
+    async def broadcast(
+        self,
+        chat_ids: Iterable[int],
+        text: str,
+        *,
+        patient: bool = False,
+        wait: float | None = None,
+    ) -> bool:
         for chat_id in chat_ids:
             await self.send_message(chat_id, text)
         return bool(chat_ids)

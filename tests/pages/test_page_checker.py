@@ -147,6 +147,21 @@ async def test_truncated_second_render_is_unstable_and_keeps_the_snapshot(tmp_pa
     assert h.snapshots.load(URL).signature == h.signature(BIG)
 
 
+SKELETON = "<html><body>" + "<p>…</p>" * 5 + "</body></html>"
+
+
+async def test_a_skeleton_replaces_the_snapshot_only_after_three_rounds_in_a_row(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, BIG, *[SKELETON] * 4, BIG, SKELETON)  # the last render repeats
+    await h.checker.check(URL)
+    statuses = [(await h.checker.check(URL)).status for _ in range(6)]
+    unstable, unchanged = PageStatus.UNSTABLE, PageStatus.UNCHANGED
+    assert statuses == [unstable, unstable, unchanged, unstable, unstable, PageStatus.CHANGED]
+    assert h.snapshots.load(URL).signature == h.signature(SKELETON)
+
+
 async def test_http_errors_are_unavailable(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     h.fetcher.html(URL, PAGE_A, status=503)

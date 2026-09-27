@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Iterable
+from itertools import islice
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from lxml import etree
@@ -49,6 +50,15 @@ TRACKING_PARAMS = frozenset(
         "rnd",
         "random",
     }
+)
+
+# Attributes kept per element, the first in document order. A script can set thousands on
+# one element, and lxml needs quadratic time to parse and to read that many.
+MAX_ATTRIBUTES = 200
+_NAME = r"[^\s\"'<>/=]"
+# A start tag with more attributes than that, written the way Chromium writes them.
+_ATTRIBUTE_FLOOD_RE = re.compile(
+    rf'(<[A-Za-z]{_NAME}*(?:\s+{_NAME}+="[^"]*"){{{MAX_ATTRIBUTES}}})(?:\s+{_NAME}+="[^"]*")+'
 )
 
 _WS_RE = re.compile(r"\s+")
@@ -104,19 +114,32 @@ class HtmlNormalizer:
 
     @staticmethod
     def _parse(html: str) -> lxml_html.HtmlElement | None:
-        """Return the document root, or None when the HTML is empty or cannot be parsed."""
+        """Return the document root, or None when the HTML is empty or cannot be parsed.
+
+        Start tags with more than :data:`MAX_ATTRIBUTES` attributes lose the rest first.
+        """
         text = html.replace("\x00", "").strip()
         if not text:
             return None
+        text = _ATTRIBUTE_FLOOD_RE.sub(r"\1", text)
         try:
             return lxml_html.document_fromstring(text.encode("utf-8"), parser=_parser())
         except (etree.ParserError, etree.XMLSyntaxError, ValueError, TypeError):
             return None
 
     def _node(self, element: lxml_html.HtmlElement) -> Node | None:
-        """Return the node for one element, or None when it has no attributes and no own text."""
+        """Return the node for one element, or None when it has no attributes and no own text.
+
+        Only the first :data:`MAX_ATTRIBUTES` attributes count.
+        """
+        attrib = element.attrib
+        if len(attrib) > MAX_ATTRIBUTES:
+            # Read lazily: lxml looks every value up from the first attribute on.
+            items = list(islice(attrib.iteritems(), MAX_ATTRIBUTES))
+        else:
+            items = attrib.items()
         attrs: list[tuple[str, str]] = []
-        for name, value in element.attrib.items():
+        for name, value in items:
             key = name.lower()
             if key in self._ignored:
                 continue

@@ -216,13 +216,16 @@ async def test_zero_budget_skips_every_lookup() -> None:
     assert backend.calls == []
 
 
-async def test_slow_sources_are_cut_off_at_the_budget() -> None:
+async def test_slow_sources_are_cut_off_at_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def at_once(self: TokenEnricher, contract: ConfirmedContract) -> dict[str, Any]:
+        return {"name": "USD Coin"}  # done in its first step: no load makes it miss the budget
+
+    monkeypatch.setattr(TokenEnricher, "_chain_details", at_once)
     backend = Backend()
-    backend.dex_delay = 0.5
+    backend.dex_delay = 60  # DexScreener would answer long after the budget
     backend.pairs = [pair()]
-    started = time.perf_counter()
-    info = await make(backend, enrich_timeout=0.05).enrich(ETH_CONTRACT)
-    assert time.perf_counter() - started < 0.4
+    enrich = make(backend, enrich_timeout=0.05).enrich(ETH_CONTRACT)
+    info = await asyncio.wait_for(enrich, timeout=5)  # cut off, not waited for
     assert info.name == "USD Coin" and not info.market_checked
 
 

@@ -78,14 +78,14 @@ The full list of live keys is in [configuration.md](configuration.md).
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Version and uptime, browser state, sites with their last round (duration, pages, rounds), last change, pages timing out, block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
+| `/status` | Version and uptime, browser state, sites with their last round (duration, pages, rounds), last change, pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
 | `/help` | The command list. |
 | `/start` | Your chat id (needed for `TELEGRAM_CHAT_IDS`) plus the command list. |
 
 Example `/status`:
 
 ```text
-🤖 scraper-bot 2.1.1, up 3h 12m
+🤖 scraper-bot 2.1.2, up 3h 12m
 Browser: connected
 ⚠️ RPC not answering: Fantom for 2m 10s
 Sites: 2 total, 2 running, 0 paused

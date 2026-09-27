@@ -33,7 +33,7 @@ needs a restart.
 | --- | --- | --- | --- |
 | `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX` | 4 / 10 | Pause between two rounds of one site, random in this range. A round itself takes about 2 s. `/set poll_interval_min` below 3 s asks for `confirm` (most sites rate-limit); `.env` accepts down to 1 s without asking. | `poll_interval_min`, `poll_interval_max` |
 | `MAX_CONCURRENT_PAGES` | 8 | Browser tabs rendering at the same time, shared by all sites and turbo sessions. | – |
-| `PAGE_LOAD_TIMEOUT` | 20 | Hard limit for the initial document. Stretched per page after repeated timeouts (see `RENDER_FAILURE_THRESHOLD`). | – |
+| `PAGE_LOAD_TIMEOUT` | 20 | Hard limit for the initial document, and for opening the tab and reading the page once it loaded (a page that stops answering times out too). Stretched per page after repeated timeouts (see `RENDER_FAILURE_THRESHOLD`). | – |
 | `NETWORK_IDLE_TIMEOUT` | 2 | Cap on the wait for the page to stop loading. Pages that go idle are not affected (measured: about 0.8 s); pages that keep polling wait the full cap on every render. 0 = do not wait. | `network_idle_timeout` |
 | `SETTLE_DELAY` | 0.25 | Extra pause after network idle so scripts can finish drawing. 0.25 s gave the same result as 0.5 s and 1 s on every measured page. | `settle_delay` |
 | `RENDER_FAILURE_THRESHOLD` | 5 | Load timeouts in a row on one page that send one 🐢 alert and double that page's load timeout (up to 3x) until it renders again. 0 = off. | `render_failure_threshold` |

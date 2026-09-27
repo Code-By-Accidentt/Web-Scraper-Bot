@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from itertools import islice
 
-from scraper_bot.models.addresses import Address, ConfirmedContract
+from scraper_bot.models.addresses import Address, ConfirmedContract, ValidationResult
 from scraper_bot.models.pages import PageCheckOutcome, PageStatus
 from scraper_bot.models.sightings import Observation, Sighting, Timeline
 from scraper_bot.models.sites import LastChange, SiteState
@@ -114,6 +114,8 @@ class SiteMonitor:
         self._last_read: dict[str, float] = {}  # page -> when it was last read successfully
         self._first_seen: dict[tuple[str, Address], float] = {}  # (page, address) -> first seen
         self._round_tokens: dict[str, int] = {}  # page -> tokens announced this round
+        self._first_round: list[ValidationResult] = []  # what the first round did not confirm
+        self._paused_first = False  # the first round paused the site
 
     @property
     def stats(self) -> MonitorStats:
@@ -172,13 +174,14 @@ class SiteMonitor:
                 )
         if self._watcher is not None:
             await self._watcher.recheck()
+        self._first_round = []
         self._stats.rounds += 1
         self._stats.last_round_at = time.time()
         self._stats.last_round_seconds = time.perf_counter() - started
         self._stats.last_pages = len(pages)
         for url in [url for url in self._health if url not in pages]:
             del self._health[url]
-        self._stats.timing_out = sum(1 for health in self._health.values() if health.warned)
+        self._count_timing_out()
         await self._update_block_state(outcomes)
         return outcomes
 
@@ -214,7 +217,9 @@ class SiteMonitor:
     async def _observed(self, observation: Observation) -> None:
         """Announce the tokens a render showed, before the page is even compared.
 
-        Addresses that may still become a token go to the pending watch.
+        Addresses that may still become a token go to the pending watch. A token the first
+        check that paused the site showed unconfirmed is old news: the watch sends it in a
+        document with the other late ones, and it counts for no pause.
         """
         page, seen_at = observation.page_url, observation.seen_at
         missing_at = self._last_read.get(page)
@@ -234,6 +239,7 @@ class SiteMonitor:
             del self._first_seen[key]
         sightings = {sighting.address: sighting for sighting in observation.sightings}
         found: list[tuple[ConfirmedContract, Sighting | None, Timeline]] = []
+        unconfirmed: list[ValidationResult] = []
         for result in observation.results:
             # A token behind an LP pair borrows the pair's place on the page.
             spot = result.via or result.address
@@ -241,7 +247,10 @@ class SiteMonitor:
             contract = result.contract
             if contract is None:
                 if self._pending is not None:
-                    self._pending.offer(self._site.url, page, sighting, result)
+                    self._pending.offer(site.url, page, sighting, result)
+                unconfirmed.append(result)
+                continue
+            if self._pending is not None and self._pending.take_old_news(site.url, contract, spot):
                 continue
             first = self._first_seen.get((page, spot), seen_at)
             if first < seen_at:
@@ -249,6 +258,10 @@ class SiteMonitor:
             else:
                 timeline = Timeline(seen_at, missing_at=missing_at)
             found.append((contract, sighting, timeline))
+        if unconfirmed and self._stats.rounds == 0:
+            self._first_round.extend(unconfirmed)
+            if self._paused_first and self._pending is not None:
+                self._pending.first_check_paused(site.url, unconfirmed)  # rendered after the pause
         if found:
             await self._announce(page, found, new_page=new_page)
 
@@ -262,7 +275,8 @@ class SiteMonitor:
         """Announce the tokens no other page or turbo announced yet, one message each.
 
         When a page reaches ``contract_pause_threshold`` tokens in one round, they go out as
-        a document instead and the site is paused.
+        a document instead and the site is paused. When that is the first round, the pending
+        watch hears what the round could not confirm: it may turn out a token later.
         """
         new = [item for item in found if self._registry.claim(item[0])]
         if not new:
@@ -285,6 +299,10 @@ class SiteMonitor:
         if self._stop.is_set():
             return  # another page of this round already paused the site
         self.request_stop()
+        first_check = self._stats.rounds == 0
+        if first_check and self._pending is not None:
+            self._paused_first = True
+            self._pending.first_check_paused(site.url, self._first_round)
         # Paused (and saved) first: the notice waits for the document and flood limits.
         await self._on_auto_pause(site.url, page_url)
         await self._notifier.site_auto_paused(
@@ -292,7 +310,7 @@ class SiteMonitor:
             page_url,
             count,
             self._deriver.pages(site.url),
-            first_check=self._stats.rounds == 0,
+            first_check=first_check,
         )
 
     async def _track_timeouts(self, outcome: PageCheckOutcome) -> None:
@@ -321,6 +339,7 @@ class SiteMonitor:
             )
             if not health.warned:
                 health.warned = True
+                self._count_timing_out()  # before the alert, so /status agrees with it
                 await self._notifier.page_timing_out(
                     outcome.url, health.timeouts, outcome.error or "timeout", stretched
                 )
@@ -329,7 +348,12 @@ class SiteMonitor:
             return  # another kind of failure neither extends nor ends a timeout streak
         del self._health[outcome.url]
         if health.warned:
+            self._count_timing_out()
             await self._notifier.page_renders_again(outcome.url, self._page_load_timeout)
+
+    def _count_timing_out(self) -> None:
+        """Update the /status count of pages the user was warned about for load timeouts."""
+        self._stats.timing_out = sum(1 for health in self._health.values() if health.warned)
 
     async def _handle(self, outcome: PageCheckOutcome) -> None:
         """Log a page's outcome and announce a new page, a captcha or a change.

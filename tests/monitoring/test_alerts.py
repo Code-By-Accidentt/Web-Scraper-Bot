@@ -28,6 +28,14 @@ def test_solana_is_case_sensitive_and_sui_is_keyed_by_package() -> None:
     assert not registry.claim(token(Chain.SUI, SUI_PKG, "Sui"))
 
 
+def test_two_different_sui_coins_are_two_tokens() -> None:
+    registry = AlertRegistry()
+    other = "0x" + "cd" * 32
+    assert registry.claim(token(Chain.SUI, f"{SUI_PKG}::a::A", "Sui"))
+    assert registry.claim(token(Chain.SUI, f"{other}::b::B", "Sui"))  # a key of its own
+    assert not registry.claim(token(Chain.SUI, other, "Sui"))
+
+
 def test_the_memory_is_bounded() -> None:
     registry = AlertRegistry(limit=2)
     first, second, third = (token(Chain.ETHEREUM, f"0x{i:040x}") for i in (1, 2, 3))

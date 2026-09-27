@@ -23,7 +23,7 @@ and a fix lands on `main` before anything is discussed publicly.
 | --- | --- | --- |
 | Telegram bot token | `.env` only (`TELEGRAM_BOT_TOKEN`) | Never logged: every error message that could contain the API URL is redacted to `<token>`. `.env` is git-ignored. |
 | Chat ids | `.env` (`TELEGRAM_CHAT_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`) | Alerts go only to `TELEGRAM_CHAT_IDS`. |
-| Monitored URLs, page snapshots, found and rejected addresses, live settings | `data/` | Plain files, git-ignored. They hold page text of the sites you watch and every address the bot saw. Back them up and protect them like any other data. |
+| Monitored URLs, page snapshots, found and rejected addresses, unsent alerts, live settings | `data/` | Plain files, git-ignored. They hold page text of the sites you watch and every address the bot saw. Back them up and protect them like any other data. |
 | Logs | console or `LOG_FILE` | Contain URLs and addresses, never the token. |
 
 The bot only reads: it renders pages, calls read-only JSON-RPC methods (`eth_getCode`,
@@ -58,10 +58,12 @@ Keep these points in mind:
   broken or intercepted certificate still renders. The bot only reads pages, but the
   content it reports could be tampered with on the way.
 - Images, media and fonts are not downloaded, nor are Next.js prefetches and analytics
-  beacons; scripts run. WebGL is off by default (`BROWSER_ARGS`). Chromium runs with its
-  own sandbox. Where the sandbox cannot start (as root, or without user namespaces, as in
-  containers) the bot runs the browser without it and sends one 🛑; the dedicated user
-  is then the only isolation (`--no-sandbox` in `BROWSER_ARGS` does the same on purpose).
+  beacons; scripts run. Downloads are refused, and a tab that a page opens itself (a
+  popup, a link to a new window) is closed at once. WebGL is off by default
+  (`BROWSER_ARGS`). Chromium runs with its own sandbox. Where the sandbox cannot start (as
+  root, or without user namespaces, as in containers) the bot runs the browser without it
+  and sends one 🛑; the dedicated user is then the only isolation (`--no-sandbox` in
+  `BROWSER_ARGS` does the same on purpose).
   Keep Playwright and the bundled browser current: raise the `playwright` pin in
   `requirements.txt`, `pip install -r requirements.txt`, then `playwright install chromium`.
 - Everything the bot sends to Telegram is HTML-escaped (`scraper_bot/telegram/markup.py`),
@@ -106,5 +108,6 @@ Keep these points in mind:
 - Watch the 🛑 alerts: they report crashed monitors and turbo sessions, page checks that
   raised, a failing pending watch, RPC endpoints silent for minutes (once per outage), an
   RPC endpoint that serves another chain, a browser that could not start, Chromium running
-  without its sandbox, and a damaged or unsaved `state.json`, at most once per ten minutes
-  per problem while the bot runs (a restart may repeat one).
+  without its sandbox, a damaged or unsaved `state.json` or `outbox.json`, and address
+  caches with unreadable lines or that cannot be read or saved, at most once per ten
+  minutes per problem while the bot runs (a restart may repeat one).

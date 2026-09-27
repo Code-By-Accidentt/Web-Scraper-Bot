@@ -22,6 +22,8 @@ from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)
 
+STOP_WAIT = 10.0  # seconds /remove, /pause and a shutdown wait for a cancelled monitor to end
+
 MonitorFactory = Callable[[SiteState, PersistCallback, AutoPauseCallback], SiteMonitor]
 
 
@@ -345,7 +347,11 @@ class MonitorManager:
         self._tasks[site.url] = task
 
     async def _stop_monitor(self, url: str) -> None:
-        """Ask the site's monitor to stop, cancel its task and wait until it ends."""
+        """Ask the site's monitor to stop, cancel its task and wait for it, ``STOP_WAIT`` s at most.
+
+        A task still running then (stuck in a browser call) is left to end on its own, so the
+        command that stopped it still gets its answer.
+        """
         monitor = self._monitors.pop(url, None)
         task = self._tasks.pop(url, None)
         if monitor is not None:
@@ -353,7 +359,9 @@ class MonitorManager:
         if task is not None and not task.done():
             task.cancel()
             # asyncio.wait, not `await task`: suppressing its CancelledError would hide ours too.
-            await asyncio.wait({task})
+            done, _ = await asyncio.wait({task}, timeout=STOP_WAIT)
+            if not done:
+                log.warning("monitor for %s did not stop within %.0fs; moving on", url, STOP_WAIT)
 
     def _on_monitor_done(self, url: str, task: asyncio.Task[None]) -> None:
         """Forget a finished monitor task, then restart or report it.

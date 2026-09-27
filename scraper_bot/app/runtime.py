@@ -42,6 +42,7 @@ from scraper_bot.settings.live import Preferences
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.storage.files import atomic_write_text
 from scraper_bot.storage.legacy import LegacyStateImporter
+from scraper_bot.storage.outbox import Outbox
 from scraper_bot.storage.snapshots import SnapshotStore
 from scraper_bot.storage.state import StateStore
 from scraper_bot.telegram.client import TelegramClient
@@ -55,6 +56,7 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_FILE = "heartbeat"
 PENDING_FILE = "pending.json"  # addresses watched until they become a token
+OUTBOX_FILE = "outbox.json"  # token alerts and documents on their way to Telegram
 IGNORE_FILE = "ignore.txt"  # the operator's own stop-list, one address per line
 NETWORKS_FILE = "evm_networks.txt"  # the EVM networks the caches were built with
 SHUTDOWN_STEP = 8.0  # seconds for each shutdown step that may talk to Telegram
@@ -88,7 +90,10 @@ class Runtime:
     _pending_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def start(self) -> None:
-        """Start the monitors and the pending watch, then tell the chat the bot is up."""
+        """Start the monitors and the pending watch, then tell the chat the bot is up.
+
+        Alerts and documents the last run could not deliver go out right after that.
+        """
         self.pending.load()
         await self.manager.start()
         self._pending_task = asyncio.create_task(self.pending.run(), name="pending-watch")
@@ -98,6 +103,7 @@ class Runtime:
         sites = self.manager.sites()
         running = sum(1 for site in sites if self.manager.is_running(site.url))
         await self.notifier.started(__version__, len(sites), running)
+        self.notifier.resend_unsent()
 
     async def serve(self) -> None:
         """Start the monitors, then poll Telegram, write heartbeats and keep RPC warm.
@@ -133,7 +139,8 @@ class Runtime:
         """Stop everything within the supervisor's grace period (``STOP_GRACE`` in rebooter.py).
 
         The pending watch is saved first, so a slow Telegram cannot lose it. Each step that
-        talks to Telegram gets ``SHUTDOWN_STEP`` seconds; alerts already on their way still go out.
+        talks to Telegram gets ``SHUTDOWN_STEP`` seconds; alerts already on their way still go
+        out, and a token alert that does not make it in time is sent by the next start.
         """
         self.pending.save()
         for name, step in (
@@ -170,15 +177,17 @@ def build_runtime(
 
     Tests pass ``sleep`` to replace the pauses between monitor rounds and turbo cycles.
     ``probe_http`` (default ``http``) checks which sub-pages exist; production gives it a
-    plain HTTP/1.1 client, so an HTTP/2 glitch never makes a live page look absent.
+    plain HTTP/1.1 client, so an HTTP/2 glitch never makes a live page look absent. The
+    notifier gets its outbox in the data directory.
     """
     cfg = settings
+    notifier.outbox = Outbox(cfg.data_dir / OUTBOX_FILE)
     legacy = LegacyStateImporter(legacy_dir)
     networks_file = cfg.data_dir / NETWORKS_FILE
     networks_known = networks_file.is_file()
     current = tuple(net.name for net in cfg.evm_networks)
     added = added_networks(networks_file, current, existing_data=_has_data(cfg))
-    cache = _load_address_cache(cfg, prefs, legacy)
+    cache = _load_address_cache(cfg, prefs, legacy, notifier.report_later)
     if added:
         # A rejection made without these networks may be a token on one of them.
         forgotten = cache.forget_rejected(Chain.ETHEREUM)
@@ -373,11 +382,15 @@ def _log_crash(task: asyncio.Task[None]) -> None:
 
 
 def _load_address_cache(
-    settings: Settings, prefs: Preferences, legacy: LegacyStateImporter
+    settings: Settings,
+    prefs: Preferences,
+    legacy: LegacyStateImporter,
+    report: Callable[[str, str, str, str], None] | None = None,
 ) -> AddressCache:
     """Load the address cache from the data directory and return it.
 
     On the very first run the known contracts of the old bot (found_wallets.txt) are imported.
+    ``report`` hears about cache files that cannot be read or saved.
     """
     known_path = settings.data_dir / "known_contracts.txt"
     first_run = not known_path.exists()
@@ -385,6 +398,7 @@ def _load_address_cache(
         known_path,
         settings.data_dir / "rejected_addresses.txt",
         rejected_ttl=lambda: prefs.rejected_ttl,
+        report=report,
     )
     cache.load()
     if first_run and legacy.has_data():

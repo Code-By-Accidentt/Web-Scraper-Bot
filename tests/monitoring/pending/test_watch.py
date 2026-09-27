@@ -21,6 +21,7 @@ from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.pending import watch as pending_module
 from scraper_bot.monitoring.pending.entry import PendingEntry, check_interval
+from scraper_bot.monitoring.pending.old_news import QUIET
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from tests.conftest import FakeNotifier, FakeValidator, make_settings
 
@@ -332,6 +333,29 @@ async def test_a_token_on_an_optional_network_is_announced_once_it_answers(h) ->
     [(_, timeline)] = h.notifier.contract_details
     # Nobody saw Arc empty, so nothing is said about when it was deployed.
     assert timeline is not None and not timeline.deployed and timeline.missing_at is None
+
+
+async def test_late_tokens_of_a_first_check_pause_go_out_as_one_document(h) -> None:
+    h.watch = h.build(ARC_RPC_URL="https://arc.rpc")  # Arc: an optional network
+    unanswered = Address(Chain.ETHEREUM, "0x" + "6f" * 20)
+    for address in (EVM, OTHER):
+        h.watch.offer(SITE, PAGE, text(address), rejected(address, AddressKind.NO_CODE))
+    verdicts = [rejected(EVM, AddressKind.NO_CODE), rejected(OTHER, AddressKind.NO_CODE)]
+    verdicts.append(ValidationResult(unanswered, ValidationStatus.UNAVAILABLE))
+    h.watch.first_check_paused(SITE, verdicts)
+    h.chains.host_code[("arc.rpc", EVM.value.lower())] = "0x6080"  # there all along: late
+    h.chains.host_code[("base.rpc", OTHER.value.lower())] = "0x6080"  # a launch meanwhile
+    h.validator.confirm(EVM, "Arc")
+    h.validator.confirm(OTHER, "Base")
+    await h.tick(0)
+    assert h.notifier.contracts == [(ConfirmedContract(OTHER, "Base"), PAGE)]  # news
+    assert h.watch.take_old_news(SITE, ConfirmedContract(unanswered, "Base"))  # the monitor's
+    await h.tick(1)
+    assert h.notifier.late_batches == []  # the burst is still coming in
+    await h.tick(QUIET)
+    late = (ConfirmedContract(EVM, "Arc"), ConfirmedContract(unanswered, "Base"))
+    assert h.notifier.late_batches == [(SITE, late)]
+    assert len(h.notifier.contracts) == 1 and not h.registry.claim(late[0])
 
 
 async def test_entries_survive_a_restart_and_a_broken_file_is_ignored(h) -> None:

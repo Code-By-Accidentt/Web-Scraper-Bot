@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from scraper_bot.chains.addresses.extractor import AddressExtractor
@@ -140,7 +142,12 @@ def solana(text: str) -> list[tuple[str, int]]:
 
 @pytest.mark.parametrize(
     "prefix",
-    ["data:image/png;base64,", "DATA:image/png;base64,", "data:image\\/png;base64,"],
+    [
+        "data:image/png;base64,",
+        "DATA:image/png;base64,",
+        "data:image\\/png;base64,",
+        "data:image/svg+xml;charset=utf-8;name=logo.svg;base64,",
+    ],
 )
 def test_inline_files_are_not_read_for_addresses(prefix: str) -> None:
     text = f'<img src="{prefix}{PNG}"> CA: {PUMP_MINT}'
@@ -183,3 +190,10 @@ def test_a_run_glued_to_other_letters_is_a_fragment(glued: str) -> None:
 def test_an_upper_case_data_uri_is_blanked_too() -> None:
     text = f'<img src="data:image/png;BASE64,{PNG}"> CA: {PUMP_MINT}'
     assert solana(text) == [(PUMP_MINT, text.index(PUMP_MINT))]
+
+
+def test_unfinished_data_uris_do_not_stall_the_search() -> None:
+    hostile = "base64," + "data:a/b;x=yyyyy" * 6_000 + f" CA: {PUMP_MINT}"  # took 9 s
+    started = time.perf_counter()
+    assert solana(hostile) == [(PUMP_MINT, hostile.index(PUMP_MINT))]
+    assert time.perf_counter() - started < 1.0
