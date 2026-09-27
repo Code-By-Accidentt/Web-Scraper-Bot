@@ -1,1 +1,1 @@
-"""Addresses and blockchains: extraction, JSON-RPC, on-chain validation, token details."""
+"""Addresses and blockchains: finding addresses, JSON-RPC, on-chain checks and token details."""

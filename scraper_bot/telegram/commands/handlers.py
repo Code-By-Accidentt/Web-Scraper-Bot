@@ -45,7 +45,11 @@ _STRANGER_MEMORY = 1000
 
 
 class BotCommands:
-    """Turns commands into manager, turbo and preferences calls and phrases the replies (HTML)."""
+    """Runs the commands that come from Telegram and phrases the replies in HTML.
+
+    Commands are taken from the allowlist or, when it is empty, from the alert chats; any
+    other chat can only learn its chat id with /start.
+    """
 
     def __init__(
         self,
@@ -59,11 +63,14 @@ class BotCommands:
         preferences: Preferences | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Wire the commands to the monitor manager and the optional parts.
+
+        A part left out (status, turbo, preferences) makes its commands answer that it is
+        not available. ``status_provider`` returns the /status text.
+        """
         self._manager = manager
         self._telegram = telegram
         self._alerts_configured = bool(alert_chat_ids)
-        # Commands come from the allowlist or, when it is empty, from the alert chats;
-        # any other chat can only learn its chat id with /start.
         self._allowlist = frozenset(allowed_chat_ids)
         self._commanders = self._allowlist or frozenset(alert_chat_ids)
         self._status_provider = status_provider
@@ -92,6 +99,11 @@ class BotCommands:
         }
 
     async def handle_update(self, update: dict[str, Any]) -> None:
+        """Run the command in one Telegram update and send the reply.
+
+        Anything that is not a command for this bot is ignored; a chat that may not command
+        the bot gets only its chat id, on /start.
+        """
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -120,6 +132,11 @@ class BotCommands:
         await self._telegram.send_message(chat_id, reply)
 
     async def execute(self, chat_id: int, command: ParsedCommand) -> str:
+        """Run a parsed command and return the reply text.
+
+        Known errors become plain replies; an unexpected one is logged and reported, and
+        the bot keeps running.
+        """
         handler = self._handlers.get(command.name)
         if handler is None:
             return f"Unknown command {code('/' + command.name)}. Send {code('/help')} for the list."
@@ -142,7 +159,7 @@ class BotCommands:
             )
 
     async def _answer_stranger(self, chat_id: int, name: str) -> None:
-        """An unauthorised chat gets its chat id for /start (rate limited), nothing else."""
+        """Tell an unauthorised chat its chat id on /start (rate limited); ignore the rest."""
         if name != "start":
             log.warning("ignoring %r from unauthorised chat %s", "/" + name, chat_id)
             return
@@ -171,19 +188,22 @@ class BotCommands:
             f"to {where} in .env and restart the bot.",
         )
 
-    # ── handlers ────────────────────────────────────────────────────────────
     async def _start(self, chat_id: int, _argument: str) -> str:
+        """Reply to /start with the chat id and the list of commands."""
         return f"👋 Your chat id is {code(chat_id)}.\n\n{HELP_TEXT}"
 
     async def _help(self, _chat_id: int, _argument: str) -> str:
+        """Reply to /help with the list of commands."""
         return HELP_TEXT
 
     async def _status(self, _chat_id: int, _argument: str) -> str:
+        """Reply to /status with the health report of the bot."""
         if self._status_provider is None:
             return "Status is not available."
         return self._status_provider()
 
     async def _turbo_command(self, _chat_id: int, argument: str) -> str:
+        """Start, schedule or stop a turbo session, or show the current ones (/turbo)."""
         if self._turbo is None:
             return "Turbo mode is not available."
         tokens = argument.split()
@@ -211,8 +231,8 @@ class BotCommands:
             f"{limits.interval:.0f}s for {started.seconds_left / 60:.0f} min."
         )
 
-    # ── settings ────────────────────────────────────────────────────────────
     async def _settings(self, _chat_id: int, argument: str) -> str:
+        """Show all settings or one of them, or reset them to the .env values (/settings)."""
         if self._preferences is None:
             return "Settings are not available."
         tokens = argument.split()
@@ -233,6 +253,7 @@ class BotCommands:
         return describe_setting(self._preferences, tokens[0])
 
     async def _set(self, _chat_id: int, argument: str) -> str:
+        """Change one live setting (/set); a risky value needs a trailing ``confirm``."""
         if self._preferences is None:
             return "Settings are not available."
         tokens = argument.split()
@@ -247,6 +268,7 @@ class BotCommands:
         )
 
     def _describe_confirmation(self, exc: ConfirmationRequired) -> str:
+        """Return the warning for a risky value and the command that applies it anyway."""
         value = "on" if exc.value is True else "off" if exc.value is False else f"{exc.value:g}"
         return (
             f"⚠️ {escape(exc.warning)}\n"
@@ -254,6 +276,7 @@ class BotCommands:
         )
 
     async def _unverified(self, _chat_id: int, argument: str) -> str:
+        """Turn unverified mode on or off for a site, or list where it is on (/unverified)."""
         tokens = argument.split()
         if not tokens:
             sites = [s for s in self._manager.sites() if s.unverified_enabled]
@@ -281,6 +304,7 @@ class BotCommands:
         )
 
     def _turbo_status(self) -> str:
+        """Return the running and scheduled turbo sessions, or the usage when there are none."""
         assert self._turbo is not None
         lines = []
         for session in self._turbo.active():
@@ -303,6 +327,7 @@ class BotCommands:
         return "\n".join(lines)
 
     async def _add(self, _chat_id: int, argument: str) -> str:
+        """Start monitoring a site (/add); warn when it shares pages with another site."""
         if not argument:
             return usage("/add <url>")
         site = await self._manager.add_site(argument)
@@ -318,6 +343,7 @@ class BotCommands:
         return reply
 
     async def _remove(self, _chat_id: int, argument: str) -> str:
+        """Stop monitoring a site (/remove) and end its turbo session, if any."""
         if not argument:
             return usage("/remove <url>")
         url = self._manager.resolve(argument)
@@ -329,12 +355,14 @@ class BotCommands:
         return f"✅ {escape(site.url)} removed from monitoring."
 
     async def _pause(self, _chat_id: int, argument: str) -> str:
+        """Pause the monitoring of a site (/pause)."""
         if not argument:
             return usage("/pause <url>")
         site = await self._manager.pause_site(argument)
         return f"⏸️ {escape(site.url)} paused. Resume with {code(f'/resume {site.url}')}"
 
     async def _resume(self, _chat_id: int, argument: str) -> str:
+        """Resume a paused site, or restart a monitor that an error stopped (/resume)."""
         if not argument:
             return usage("/resume <url>")
         site, restarted = await self._manager.resume_site(argument)
@@ -343,18 +371,21 @@ class BotCommands:
         return f"▶️ {escape(site.url)} resumed."
 
     async def _notify(self, _chat_id: int, argument: str, name: str = "notify") -> str:
+        """Turn change alerts for a site back on (/notify or /unmute, given as ``name``)."""
         if not argument:
             return usage(f"/{name} <url>")
         site = self._manager.set_notifications(argument, True)
         return f"🔔 Change alerts enabled for {escape(site.url)}."
 
     async def _nonotifi(self, _chat_id: int, argument: str, name: str = "nonotifi") -> str:
+        """Mute change alerts for a site (/nonotifi or /mute, given as ``name``)."""
         if not argument:
             return usage(f"/{name} <url>")
         site = self._manager.set_notifications(argument, False)
         return f"🔇 Change alerts disabled for {escape(site.url)}."
 
     async def _list(self, _chat_id: int, _argument: str) -> str:
+        """List the monitored sites with their state (/list)."""
         sites = self._manager.sites()
         if not sites:
             return f"‼️ No site is monitored. Add one with {code('/add <url>')}."
@@ -362,15 +393,15 @@ class BotCommands:
         lines.extend(self._describe_site(site) for site in sites)
         return "\n".join(lines)
 
-    # ── formatting ──────────────────────────────────────────────────────────
     def _describe_site(self, site: SiteState) -> str:
+        """Return the /list line of one site: alerts, state, block and last change."""
         notifications = "ON" if site.notifications_enabled else "OFF"
         if site.paused:
             state = "PAUSED"
         elif self._manager.is_running(site.url):
             state = "RUNNING"
         else:
-            state = "STOPPED"  # the monitor crashed and did not come back; /resume restarts it
+            state = "STOPPED"
         line = f"• {escape(site.url)} [alerts: {notifications}] [{state}]"
         if site.unverified_enabled:
             line += " [unverified]"
@@ -383,6 +414,7 @@ class BotCommands:
 
     @staticmethod
     def _describe_turbo(error: TurboError) -> str:
+        """Return the reply for a turbo error."""
         if isinstance(error, TurboAlreadyRunning):
             return f"🚀 Turbo is already running (or scheduled) for {escape(error.url)}."
         if isinstance(error, TurboLimitReached):
@@ -396,6 +428,7 @@ class BotCommands:
 
     @staticmethod
     def _describe(error: MonitorError) -> str:
+        """Return the reply for a monitor error, such as an unknown or already paused site."""
         if isinstance(error, SiteAlreadyTracked):
             return f"‼️ {escape(error.url)} is already monitored."
         if isinstance(error, SiteNotTracked):

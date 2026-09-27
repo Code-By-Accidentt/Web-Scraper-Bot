@@ -25,7 +25,6 @@ CONTEXT_CHARS = 60
 HINT_WINDOW = 32  # characters before the address that decide the hint (as in X Scraper)
 _RAW_WINDOW = 400  # characters of raw HTML or script read back for the context
 
-# Words that point at a token's own address, and words that point elsewhere.
 _POSITIVE_RE = re.compile(
     r"\b(?:ca|contract|mint|token)\b|/coin/|/token/|pump\.fun/|dexscreener\.com/|birdeye\.so/"
     r"|gmgn\.ai/",
@@ -57,10 +56,10 @@ _CAPTCHA_FIELD_RE = re.compile(
 
 
 def shown_on_a_challenge(sightings: Iterable[Sighting]) -> list[Sighting]:
-    """The addresses a page that looks like a challenge shows as its own content.
+    """Return the sightings a page that looks like a challenge shows as its own content.
 
-    Its text, and links that name a token; not its source or form values, where challenge
-    scripts keep fresh random tokens, some of them shaped like a Solana key.
+    That is its text and the links that name a token. Its source and form values are left
+    out: challenge scripts keep fresh random tokens there, some shaped like a Solana key.
     """
     return [
         s
@@ -76,16 +75,15 @@ def find_sightings(
     extras: Sequence[str] = (),
     dom: Sequence[str] = (),
 ) -> list[Sighting]:
-    """One sighting per address in order of first appearance, the most telling one kept.
+    """Return one sighting per address in order of first appearance, the most telling one kept.
 
-    Visible text and attributes come from ``signature`` (scripts, styles and comments are
-    already gone there). What is left only in ``html``, frames or shadow roots (``dom``) is
-    page source; what is only in the other ``extras`` (deep scan) is a loaded script. Among
-    text and attribute sightings a hinted one beats an unhinted one, then text beats link.
-    Page source and loaded scripts count only for addresses no element shows.
+    Text and attributes come from ``signature``, where scripts, styles and comments are
+    already gone. An address only in ``html`` or in frames and shadow roots (``dom``) counts
+    as page source, one only in the other ``extras`` (deep scan) as a loaded script. A hinted
+    sighting beats an unhinted one, then text beats a link; source and scripts count only for
+    addresses no element shows.
     """
-    # Bare 64-hex ids count as Sui only where the text itself talks about Sui: the page
-    # decides for its elements and source, each loaded script for itself.
+    # Bare 64-hex ids are Sui only where the text talks about Sui; each script decides alone.
     sui_context = SUI_CONTEXT_RE.search(html) is not None
     if "-response" in html:
         html = _CAPTCHA_FIELD_RE.sub(lambda match: " " * len(match.group(0)), html)
@@ -104,14 +102,18 @@ def find_sightings(
         if node.text:
             previous = node.text
     _offer_raw(best, extractor, (html,), SightingSource.SOURCE, sui_context)
-    # Frames and shadow roots (``dom``, also among ``extras``) are page content, not scripts.
+    # Before extras, which also hold dom: frames and shadow roots are page source, not scripts.
     _offer_raw(best, extractor, dom, SightingSource.SOURCE, None)
     _offer_raw(best, extractor, extras, SightingSource.SCRIPT, None)
     return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
 
 
 def hint_score(before: str) -> int:
-    """Positive when the words right before an address name it as a token."""
+    """Return a positive score when the words right before an address name it as a token.
+
+    Only the last ``HINT_WINDOW`` characters count: each token word adds one, each word
+    pointing elsewhere (wallet, treasury, an explorer's address page) takes one away.
+    """
     window = before[-HINT_WINDOW:]
     return len(_POSITIVE_RE.findall(window)) - len(_NEGATIVE_RE.findall(window))
 
@@ -123,6 +125,10 @@ def _offer_raw(
     source: SightingSource,
     sui_context: bool | None,
 ) -> None:
+    """Add a sighting from ``source`` for each address in ``texts`` that has none yet.
+
+    With ``sui_context`` None each text decides for itself whether bare hex ids are Sui.
+    """
     for text in texts:
         for address, start in extractor.locate(text, sui_context=sui_context):
             if address not in best:
@@ -132,15 +138,21 @@ def _offer_raw(
 
 
 def _sighting(address: Address, source: SightingSource, before: str) -> Sighting:
+    """Build a sighting whose context is the text before the address, others masked as "…".
+
+    The context keeps the last ``CONTEXT_CHARS`` characters; the hint is scored on it too.
+    """
     masked = _SPACES_RE.sub(" ", _ADDRESS_LIKE_RE.sub("…", before)).strip()
     return Sighting(address, source, masked[-CONTEXT_CHARS:], hint_score(masked) > 0)
 
 
 def _offer(best: dict[Address, Sighting], sighting: Sighting) -> None:
+    """Keep ``sighting`` if its address has none yet or it ranks better than the one kept."""
     current = best.get(sighting.address)
     if current is None or _rank(sighting) < _rank(current):
         best[sighting.address] = sighting
 
 
 def _rank(sighting: Sighting) -> tuple[bool, int]:
+    """Return the sort key of a sighting (lower wins): hinted first, then by source."""
     return not sighting.hinted, _RANK[sighting.source]

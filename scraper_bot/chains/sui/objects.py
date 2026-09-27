@@ -1,9 +1,8 @@
 """Sui JSON-RPC helpers shared by the validator and the token details.
 
-A Sui token is a *coin type* ``0x<package>::<module>::<NAME>``. The chain keeps
-metadata (name, symbol, decimals) for real coins only, which makes "is this a
-token?" a single call. A bare 32-byte id is a token candidate when it is a package
-that defines such a coin.
+A Sui token is a *coin type* ``0x<package>::<module>::<NAME>``. The chain keeps metadata
+(name, symbol, decimals) for real coins only, which makes "is this a token?" a single call.
+A bare 32-byte id is a token candidate when it is a package that defines such a coin.
 """
 
 from __future__ import annotations
@@ -14,13 +13,12 @@ from typing import Any
 from scraper_bot.chains.rpc.client import JsonRpcClient
 
 COIN_CHECK_BATCH = 8  # metadata lookups in flight per package
-MAX_COIN_CANDIDATES = 128  # at most this many structs per package are tried as coin types
+MAX_COIN_CANDIDATES = 128  # structs per package tried as coin types
 
 
 async def object_kind(client: JsonRpcClient, address: str) -> str:
-    """``package``, ``object`` or ``missing`` (wallets and unknown ids are missing)."""
-    # With showType a package answers ``type: "package"``; Move objects carry their
-    # struct type there instead (checked against mainnet).
+    """Return "package", "object" or "missing" for a Sui id (wallets and unknown ids: missing)."""
+    # With showType a package answers type "package", a Move object its struct type (mainnet).
     result = await client.call("sui_getObject", [address, {"showType": True}])
     data = result.get("data") if isinstance(result, dict) else None
     if isinstance(data, dict):
@@ -29,12 +27,13 @@ async def object_kind(client: JsonRpcClient, address: str) -> str:
 
 
 async def coin_metadata(client: JsonRpcClient, coin_type: str) -> dict[str, Any] | None:
-    """The coin's metadata, or ``None`` when the type is not a coin."""
+    """Return the coin's metadata, or None when the type is not a coin."""
     result = await client.call("suix_getCoinMetadata", [coin_type])
     return result if isinstance(result, dict) else None
 
 
 async def total_supply(client: JsonRpcClient, coin_type: str) -> int | None:
+    """Return the coin's total supply in raw units, or None when the answer holds no number."""
     result = await client.call("suix_getTotalSupply", [coin_type])
     value = result.get("value") if isinstance(result, dict) else None
     try:
@@ -44,7 +43,10 @@ async def total_supply(client: JsonRpcClient, coin_type: str) -> int | None:
 
 
 async def coin_type_candidates(client: JsonRpcClient, package: str) -> list[str]:
-    """Struct types of ``package`` that could be coins, likeliest first."""
+    """Return the struct types of ``package`` that could be coins, likeliest first.
+
+    At most ``MAX_COIN_CANDIDATES`` are returned.
+    """
     modules = await client.call("sui_getNormalizedMoveModulesByPackage", [package])
     if not isinstance(modules, dict):
         return []
@@ -59,10 +61,11 @@ async def coin_type_candidates(client: JsonRpcClient, package: str) -> list[str]
 
 
 async def find_coin(client: JsonRpcClient, package: str) -> tuple[str, dict[str, Any]] | None:
-    """The first coin type defined by ``package`` together with its metadata.
+    """Return the first coin type defined by ``package`` with its metadata, or None.
 
-    Every candidate is tried (likeliest first, a batch at a time), so a coin that sits
-    behind many helper structs is still found.
+    Every candidate is tried (likeliest first, a batch at a time), so a coin behind many
+    helper structs is still found. When no coin is found and a lookup failed, that error is
+    raised: without it there is no verdict.
     """
     candidates = await coin_type_candidates(client, package)
     failure: BaseException | None = None
@@ -76,5 +79,5 @@ async def find_coin(client: JsonRpcClient, package: str) -> tuple[str, dict[str,
                 return candidate, metadata
         failure = failure or next((a for a in answers if isinstance(a, BaseException)), None)
     if failure is not None:
-        raise failure  # nothing confirmed and a lookup failed: no verdict possible
+        raise failure
     return None

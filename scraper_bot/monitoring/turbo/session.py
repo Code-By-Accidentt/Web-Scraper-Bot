@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class TurboLimits:
+    """The turbo settings in force: the pace, how long sessions last, how many sites and pages."""
+
     interval: float  # seconds between render cycles
     default_minutes: float
     max_minutes: float
@@ -37,8 +39,7 @@ class TurboLimits:
     max_pages: int  # pages rendered per cycle, the root page included
 
 
-# A session takes either fixed limits or a callable returning the current ones, so that
-# /set changes reach sessions that are already running.
+# Fixed limits, or a callable returning the current ones so /set reaches running sessions.
 LimitsSource = TurboLimits | Callable[[], TurboLimits]
 
 MANUAL_STOP = "stopped manually"
@@ -46,6 +47,8 @@ MANUAL_STOP = "stopped manually"
 
 @dataclass(slots=True)
 class TurboStats:
+    """Counters and results of one turbo session."""
+
     started_at: float | None = None
     deadline: float | None = None
     cycles: int = 0
@@ -56,7 +59,11 @@ class TurboStats:
 
 
 class TurboSession:
-    """One site rendered in a tight loop until its token appears or the time is up."""
+    """One site rendered in a tight loop until its token appears or the time is up.
+
+    Addresses already on a page at its first read go to the pending watch as baselines;
+    addresses that show up later are validated at once.
+    """
 
     def __init__(
         self,
@@ -77,6 +84,10 @@ class TurboSession:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
+        """Set up a session over ``pages`` of ``url`` that lasts ``duration`` seconds once run.
+
+        ``sleep`` replaces the stop-aware pause between cycles (tests pass an instant one).
+        """
         self._url = url
         self._pages = list(pages)
         self._fetcher = fetcher
@@ -91,18 +102,20 @@ class TurboSession:
         self._pending = pending
         self._registry = registry
         self._clock = clock
-        self._sleep = sleep  # tests replace the stop-aware pause with an instant one
+        self._sleep = sleep
         self._stats = TurboStats()
         self._stop = asyncio.Event()
         self._seen: set[Address] = set()
-        self._last_read: dict[str, float] = {}  # page -> when the previous cycle began
+        self._last_read: dict[str, float] = {}  # page -> when its last good render began
 
     @property
     def url(self) -> str:
+        """The site this session renders."""
         return self._url
 
     @property
     def pages(self) -> list[str]:
+        """The pages rendered in every cycle."""
         return list(self._pages)
 
     @property
@@ -113,6 +126,7 @@ class TurboSession:
 
     @property
     def stats(self) -> TurboStats:
+        """The counters and results so far."""
         return self._stats
 
     @property
@@ -122,14 +136,22 @@ class TurboSession:
 
     @property
     def seconds_left(self) -> float:
+        """Seconds until the time limit; the full duration before the session starts."""
         if self._stats.deadline is None:
             return self._duration
         return max(self._stats.deadline - self._clock(), 0.0)
 
     def request_stop(self) -> None:
+        """Ask the session to stop after the current cycle."""
         self._stop.set()
 
     async def run(self) -> TurboStats:
+        """Render the pages in cycles until the session ends, then return its stats.
+
+        It ends on the time limit, a stop request, ``stop_after`` tokens or a block signal.
+        The user hears when it starts and ends; meanwhile the pending watch checks the site's
+        addresses at the turbo pace.
+        """
         stats, limits = self._stats, self.limits
         stats.started_at = self._clock()
         stats.deadline = stats.started_at + self._duration
@@ -175,24 +197,25 @@ class TurboSession:
         return stats
 
     async def _cycle(self) -> BlockSignal | None:
+        """Render every page once, check what they show, and return the first block signal.
+
+        A page's first good render is its baseline: its addresses go to the pending watch as
+        baselines. A page that answers normally is read even when another one is blocked in
+        the same cycle, since the CA may be on it.
+        """
         started = self._clock()
         results = await asyncio.gather(*(self._fetcher.fetch(page) for page in self._pages))
         seen_at = self._clock()
         self._stats.cycles += 1
         self._stats.renders += len(results)
         signals = {result.url: self._blocks.inspect(result) for result in results}
-        # Pages read before go first: an address a late page shows on its baseline render is
-        # then already known from them as news, not taken for old news. A page that answers
-        # normally is read even when another one is blocked in the same cycle: the CA may be
-        # on it (challenges come most often at the launch). So is what a 2xx answer that looks
-        # like a challenge shows (not its scripts): it may be the real page.
+        # Pages read before go first: an address a new page also shows is news, not baseline.
         for result in sorted(results, key=lambda r: r.url not in self._last_read):
             if not result.ok:
                 continue
             signature = await asyncio.to_thread(self._normalizer.signature, result.html)
             if not signature:
                 continue  # a blank render (hydrating, a deploy in progress) shows nothing yet
-            # A page's first good render is its baseline, even when an earlier cycle failed.
             baseline = result.url not in self._last_read
             found = await asyncio.to_thread(
                 find_sightings,
@@ -204,26 +227,24 @@ class TurboSession:
             )
             blocked = signals[result.url] is not None
             if blocked:
+                # A 2xx that looks like a challenge may be the real page: read its text only.
                 found = shown_on_a_challenge(found)
             fresh = [s for s in found if s.address not in self._seen]
             self._seen.update(sighting.address for sighting in fresh)
-            # Known tokens (a trending list, an old token, one the regular monitor just
-            # announced and the pending watch passed on) are not news for this session.
+            # Known tokens (a trending list, one the monitor just announced) are not news here.
             fresh = [s for s in fresh if not self._cache.is_known(s.address)]
             if baseline:
-                # Already on the page when it was first read: news only if it does not exist.
                 for sighting in fresh:
                     self._pending.offer_baseline(self._url, result.url, sighting)
             elif fresh:
                 await self._check(result.url, fresh, seen_at)
-            # What this cycle read may predate its end, so the next window opens at its start.
-            # A challenge render did not show the page: the next good one is still the baseline.
+            # A challenge did not show the page, so the next good render is still the baseline.
             if not blocked:
                 self._last_read[result.url] = result.started_at or started
         return next((signal for signal in signals.values() if signal is not None), None)
 
     async def _check(self, page_url: str, sightings: Sequence[Sighting], seen_at: float) -> None:
-        """A new address: announce it if it is a token, else let the pending watch wait."""
+        """Validate new addresses; announce the tokens and hand the rest to the pending watch."""
         results = await self._validator.validate_many(
             [s.address for s in sightings], negative_cache=False
         )
@@ -239,20 +260,23 @@ class TurboSession:
                         result.contract, page_url, sighting=sighting, timeline=timeline
                     )
             elif result.status is ValidationStatus.ALREADY_KNOWN and result.via is None:
-                # announced by the regular monitor meanwhile (an old token behind a new LP
-                # pair is not this launch)
+                # the monitor announced it meanwhile (an old token behind a new pair is not news)
                 self._deployed(result.address)
             elif self._pending.offer(self._url, page_url, sighting, result, fast=True):
                 self._stats.pending += 1
 
     def _deployed(self, address: Address) -> None:
-        """A token of this site: found by the session or by the pending watch."""
+        """Add a token of this site to the session's finds, once.
+
+        Both the session and the pending watch call this.
+        """
         if any(contract.address == address for contract in self._stats.found):
             return
         network = self._cache.known_network(address) or "unknown network"
         self._stats.found.append(ConfirmedContract(address, network))
 
     async def _pause(self, seconds: float) -> None:
+        """Wait ``seconds`` before the next cycle, or less if a stop is requested."""
         if self._sleep is not None:
             await self._sleep(max(seconds, 0.0))
             return

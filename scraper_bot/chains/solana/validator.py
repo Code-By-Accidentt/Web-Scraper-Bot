@@ -1,4 +1,4 @@
-"""Checking whether a Solana address is a token mint."""
+"""Checks whether a Solana address is a token mint."""
 
 from __future__ import annotations
 
@@ -29,10 +29,15 @@ class SolanaContractValidator:
         retry: RetryPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        """Create the RPC client; the endpoint's health is tracked under the name "Solana"."""
         self._client = JsonRpcClient(http, rpc_url, timeout, retry=retry)
         self.health = EndpointHealth(clock)
 
     async def inspect(self, address: str) -> AddressKind:
+        """Return what the account at ``address`` is: a token mint, an NFT, missing and so on.
+
+        Raises :class:`RpcUnavailable` when the node fails.
+        """
         params = {"encoding": "base64", "commitment": "confirmed"}
         try:
             result = await self._client.call("getAccountInfo", [address, params])
@@ -51,5 +56,5 @@ class SolanaContractValidator:
         if decimals == 0 and supply == 1:
             return AddressKind.NFT
         if decimals == 0 and supply == 0:
-            return AddressKind.NOT_YET_MINTED  # an NFT or a token between creation and minting
+            return AddressKind.NOT_YET_MINTED  # an NFT or a token not minted yet
         return AddressKind.TOKEN

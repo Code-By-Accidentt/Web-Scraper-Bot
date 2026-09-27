@@ -1,9 +1,9 @@
 """Addresses that are never a new launch: stablecoins, wrapped natives, system contracts.
 
-App pages load wallet-connect bundles and swap widgets full of these; without the list a
-first round on such a site announces a dozen "contracts" and auto-pauses it. Every token
-below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24; those on Arc
-and Robinhood Chain, taken from the chains' own docs, on 2026-09-27.
+App pages load wallet-connect bundles and swap widgets full of these. Without this list,
+the first round on such a site would announce a dozen "contracts" and auto-pause it.
+Every token below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24;
+those on Arc and Robinhood Chain were taken from the chains' own docs on 2026-09-27.
 """
 
 from __future__ import annotations
@@ -108,8 +108,7 @@ EVM_SENTINELS = (
     "0x000000000000000000000000000000000000dEaD",
     "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
 )
-# Everything below this is the zero address, precompiles or chain system contracts
-# (BSC 0x1000-0x2005, Arbitrum 0x64-0xff): no launch lives there.
+# Lower: zero address, precompiles, system contracts (BSC 0x1000-0x2005, Arbitrum 0x64-0xff).
 EVM_SYSTEM_LIMIT = 0x10000
 # OP-stack predeploys (Base, Optimism): WETH 0x4200...0006, GasPriceOracle ...000F, OP ...0042.
 OP_STACK_PREDEPLOYS = range(0x42 << 152, (0x42 << 152) + 0x800)
@@ -135,9 +134,13 @@ SUI_PACKAGES: tuple[tuple[str, str], ...] = (
 
 
 class StopList:
-    """Built-in well-known addresses plus the operator's own list (``data/ignore.txt``)."""
+    """The addresses never reported: the built-in ones plus the operator's ``data/ignore.txt``.
+
+    EVM addresses match in any letter case, and a Sui coin matches by its package.
+    """
 
     def __init__(self, extra: Iterable[Address] = ()) -> None:
+        """Start from the built-in lists and add the ``extra`` addresses."""
         self._evm = {address.lower() for pairs in EVM_TOKENS.values() for _, address in pairs}
         self._evm.update(address.lower() for address in EVM_SENTINELS)
         self._solana = {mint for _, mint in SOLANA_MINTS}
@@ -147,12 +150,15 @@ class StopList:
 
     @classmethod
     def load(cls, path: Path) -> StopList:
-        """The built-in list plus ``path``: one address per line, ``#`` starts a comment."""
+        """Return the built-in list plus the addresses in ``path``.
+
+        The file has one address per line, and ``#`` starts a comment. Bad lines are logged
+        and skipped; if the file is missing or unreadable, only the built-in list applies.
+        """
         extra: list[Address] = []
         if path.is_file():
             try:
-                # utf-8-sig: Notepad's byte-order mark must not cost the first line. A file in
-                # another encoding still loads; only its comments may come out garbled.
+                # utf-8-sig drops Notepad's BOM; a file in another encoding still loads.
                 text = path.read_text(encoding="utf-8-sig", errors="replace")
             except OSError as exc:
                 log.warning("%s is unreadable (%s); only the built-in stop-list applies", path, exc)
@@ -170,6 +176,7 @@ class StopList:
         return cls(extra)
 
     def add(self, address: Address) -> None:
+        """Add one address to the list; a Sui coin adds its whole package."""
         if address.chain is Chain.ETHEREUM:
             self._evm.add(address.value.lower())
         elif address.chain is Chain.SOLANA:
@@ -178,6 +185,7 @@ class StopList:
             self._sui.add(sui_package(address.value))
 
     def __contains__(self, address: object) -> bool:
+        """Return True when ``address`` is on the list; anything but an Address is not."""
         if not isinstance(address, Address):
             return False
         if address.chain is Chain.ETHEREUM:
@@ -187,7 +195,10 @@ class StopList:
         return sui_package(address.value) in self._sui
 
     def contains_evm(self, value: str) -> bool:
-        """``value`` is a ``0x`` address in any letter case."""
+        """Return True when the ``0x`` address ``value``, in any letter case, is on the list.
+
+        Addresses below ``EVM_SYSTEM_LIMIT`` and the OP-stack predeploys always are.
+        """
         lowered = value.lower()
         if lowered in self._evm:
             return True

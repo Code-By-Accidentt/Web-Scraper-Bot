@@ -1,4 +1,4 @@
-"""How /settings shows the live knobs (Telegram HTML)."""
+"""How /settings shows the live settings (Telegram HTML)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from scraper_bot.telegram.markup import code, escape
 
 
 def settings_overview(prefs: Preferences) -> str:
-    """Every live knob by section, with its current value; ``*`` marks a /set override."""
+    """Return every live setting by section with its value; ``*`` marks a /set override."""
     lines = ["⚙️ Settings (live values; * = changed from .env)"]
     for section, title in SECTIONS.items():
         lines.append(f"\n{title}")
@@ -26,7 +26,10 @@ def settings_overview(prefs: Preferences) -> str:
 
 
 def describe_setting(prefs: Preferences, key: str) -> str:
-    """What one knob does, its range, current value and .env default."""
+    """Return what one setting does, its range, current value and .env default.
+
+    Raises PreferenceError for an unknown key.
+    """
     spec = prefs.spec(key)
     lines = [f"⚙️ {code(spec.key)}: {escape(spec.label)}", escape(spec.description)]
     if spec.kind == "bool":

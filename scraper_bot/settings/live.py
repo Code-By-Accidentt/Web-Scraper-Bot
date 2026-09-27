@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 class Tuning(Protocol):
-    """Knobs read at use time, in base units (seconds, counts)."""
+    """Settings the bot reads each time it uses them, in base units (seconds, counts)."""
 
     poll_interval_min: float
     poll_interval_max: float
@@ -61,6 +61,7 @@ class ConfirmationRequired(PreferenceError):
     """The change is allowed but risky; repeat the command with ``confirm``."""
 
     def __init__(self, spec: PreferenceSpec, value: Any, warning: str) -> None:
+        """Keep the setting, the parsed value and the warning for the reply."""
         super().__init__(warning)
         self.spec = spec
         self.value = value
@@ -69,27 +70,35 @@ class ConfirmationRequired(PreferenceError):
 
 @dataclass(frozen=True, slots=True)
 class PreferenceChange:
+    """One applied change: the setting with its old and new value, in the user's unit."""
+
     spec: PreferenceSpec
     old: Any
     new: Any
 
 
 class Preferences:
-    """Validated, persisted overrides of :class:`Settings`; readable as a :class:`Tuning`."""
+    """The /set overrides of :class:`Settings`, checked and saved to a JSON file.
+
+    Reading a Settings attribute on it (``prefs.rejected_ttl``) gives the value in effect,
+    in base units, so it serves as a :class:`Tuning`.
+    """
 
     def __init__(self, settings: Settings, path: Path) -> None:
+        """Start with no overrides; :meth:`load` reads them from ``path``."""
         self._settings = settings
         self._path = path
         self._overrides: dict[str, Any] = {}
 
-    # ── lookup ──────────────────────────────────────────────────────────────
     def spec(self, key: str) -> PreferenceSpec:
+        """Return the setting named ``key`` (any case); raise PreferenceError if unknown."""
         spec = BY_KEY.get(key.strip().lower())
         if spec is None:
             raise PreferenceError(f"unknown setting {key!r}; /settings lists them all")
         return spec
 
     def default(self, spec: PreferenceSpec) -> Any:
+        """Return the value from .env or the built-in default, in the user's unit."""
         base = getattr(self._settings, spec.attr)
         if spec.kind == "bool":
             return bool(base)
@@ -97,13 +106,15 @@ class Preferences:
         return round(value) if spec.kind == "int" else float(value)
 
     def current(self, spec: PreferenceSpec) -> Any:
+        """Return the value in effect, in the user's unit: the override, else the default."""
         return self._overrides.get(spec.key, self.default(spec))
 
     def is_overridden(self, spec: PreferenceSpec) -> bool:
+        """Return True when /set changed this setting away from its default."""
         return spec.key in self._overrides
 
     def __getattr__(self, name: str) -> Any:
-        # Effective value in base units, under the Settings attribute name.
+        """Return the value in effect in base units, looked up by its Settings attribute name."""
         spec = BY_ATTR.get(name)
         if spec is None:
             raise AttributeError(name)
@@ -112,8 +123,12 @@ class Preferences:
             return value
         return value * spec.scale
 
-    # ── changes ─────────────────────────────────────────────────────────────
     def set(self, key: str, raw: str, *, confirmed: bool = False) -> PreferenceChange:
+        """Change a setting to the value the user typed, save it and return the change.
+
+        Raises PreferenceError for a bad value, and ConfirmationRequired for a risky one
+        unless ``confirmed``. Setting the default value removes the override.
+        """
         spec = self.spec(key)
         value = self._parse(spec, raw)
         self._check_relations(spec, value)
@@ -130,6 +145,11 @@ class Preferences:
         return PreferenceChange(spec, old, value)
 
     def reset(self, key: str | None = None) -> list[PreferenceChange]:
+        """Drop the override of ``key``, or of every setting without a key; return the changes.
+
+        When one side of a min/max pair goes back to its default and no longer fits the
+        other side, the other side is reset too.
+        """
         if key is None:
             keys = [s.key for s in PREFERENCES if s.key in self._overrides]
         else:
@@ -139,7 +159,6 @@ class Preferences:
             if name not in self._overrides:
                 continue
             changes.append(self._drop_override(name))
-            # Resetting one side of a related pair must not leave e.g. min > max behind.
             partner = PARTNERS.get(name)
             if partner in self._overrides and not self._consistent(name):
                 changes.append(self._drop_override(partner))
@@ -148,10 +167,12 @@ class Preferences:
         return changes
 
     def _drop_override(self, key: str) -> PreferenceChange:
+        """Remove the override of ``key`` and return the change back to the default."""
         spec = self.spec(key)
         return PreferenceChange(spec, self._overrides.pop(key), self.default(spec))
 
     def _consistent(self, key: str) -> bool:
+        """Return True when the value of ``key`` still fits its min/max partner."""
         spec = self.spec(key)
         try:
             self._check_relations(spec, self.current(spec))
@@ -159,8 +180,12 @@ class Preferences:
             return False
         return True
 
-    # ── persistence ─────────────────────────────────────────────────────────
     def load(self) -> None:
+        """Read the overrides from the file, dropping values that are unknown or invalid.
+
+        A missing or unreadable file keeps the overrides as they are. A hand-edited min/max
+        pair that contradicts itself is dropped whole.
+        """
         if not self._path.is_file():
             return
         try:
@@ -180,8 +205,6 @@ class Preferences:
                 continue
             if value != self.default(spec):
                 self._overrides[spec.key] = value
-        # Every value is range-checked above, but a hand-edited file can still hold
-        # a pair that contradicts itself (min > max); such a pair is not trusted.
         for lower, upper in ORDERED_PAIRS:
             if self.current(self.spec(lower)) > self.current(self.spec(upper)):
                 log.warning(
@@ -192,10 +215,15 @@ class Preferences:
         log.info("%d preference override(s) loaded", len(self._overrides))
 
     def save(self) -> None:
+        """Write the overrides to the file."""
         atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
 
     @staticmethod
     def _parse(spec: PreferenceSpec, raw: str) -> Any:
+        """Return the value the user typed for ``spec``, checked against its type and limits.
+
+        Raises PreferenceError, with a message for the user, when the value does not fit.
+        """
         text = raw.strip().lower()
         if spec.kind == "bool":
             if text in TRUE_WORDS:
@@ -222,6 +250,7 @@ class Preferences:
         return value
 
     def _check_relations(self, spec: PreferenceSpec, value: Any) -> None:
+        """Raise PreferenceError when ``value`` would put a min above its max or the reverse."""
         for lower, upper in ORDERED_PAIRS:
             if spec.key == lower:
                 limit = self.current(self.spec(upper))

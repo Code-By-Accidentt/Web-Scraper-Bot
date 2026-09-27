@@ -1,9 +1,9 @@
-"""A small asynchronous JSON-RPC 2.0 client used by every chain validator and helper.
+"""A small async JSON-RPC 2.0 client used by every chain validator and helper.
 
-Only quick failures are retried (HTTP 429 / 5xx, a refused or reset connection, an
-HTTP/2 protocol error, a rate-limit error inside a 200 answer), and only within the
-call's timeout, which is a hard deadline. A timeout is not retried: the budget is spent.
-After an HTTP 429 every client of the same HTTP pool leaves the host alone for its
+Only quick failures are retried (HTTP 429 or 5xx, a refused or reset connection, an HTTP/2
+protocol error, a rate-limit error inside a 200 answer), and only within the call's
+timeout, which is a hard deadline. A timeout is not retried: the time is already spent.
+After an HTTP 429, every client on the same HTTP pool leaves that host alone for its
 ``Retry-After`` (capped), so a burst does not turn into a storm.
 """
 
@@ -24,27 +24,28 @@ import httpx
 log = logging.getLogger(__name__)
 
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
-# JSON-RPC error codes and phrases public nodes use for rate limits inside an HTTP 200.
+# How public nodes report a rate limit inside an HTTP 200 answer.
 _RATE_LIMIT_CODES = frozenset({-32005, -32029, 429})
 _RATE_LIMIT_PHRASES = ("rate limit", "too many requests", "limit exceeded")
 BATCH_LIMIT = 50  # calls per HTTP request; public nodes refuse much larger batches
 SINGLE_CALLS_FOR = 600.0  # seconds a node that refused a batch gets single calls
-# Answers to a batch request that mean "no batches here", not "this call is wrong".
+# HTTP answers to a batch that mean "no batches here", not "this call is wrong".
 _BATCH_REFUSED_STATUSES = frozenset({400, 405, 413, 415, 422, 501})
-# 429 pauses per host, shared by every client of one HTTP pool (see JsonRpcClient).
+# Per HTTP pool: host -> clock time its 429 pause ends, shared by every client on the pool.
 _COOLDOWNS: weakref.WeakKeyDictionary[httpx.AsyncClient, dict[str, float]] = (
     weakref.WeakKeyDictionary()
 )
 
 
 class RpcError(Exception):
-    """Transport failure, non-200 answer or a JSON-RPC error object."""
+    """A failed call: transport failure, non-200 answer or a JSON-RPC error object."""
 
 
 class RpcCallError(RpcError):
     """The node answered, but with a JSON-RPC error object (e.g. ``execution reverted``)."""
 
     def __init__(self, text: str, code: int | None, message: str) -> None:
+        """Keep the node's error ``code`` (None if it gave none) and ``message`` beside ``text``."""
         super().__init__(text)
         self.code = code
         self.message = message
@@ -52,9 +53,10 @@ class RpcCallError(RpcError):
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    delays: tuple[float, ...] = (0.25, 1.0)  # pauses before the 2nd and 3rd attempt
-    # longest retry pause taken from a Retry-After; the 429 cooldown below is still
-    # waited out when the call's budget allows it
+    """How a client retries quick failures and backs off from a host after an HTTP 429."""
+
+    delays: tuple[float, ...] = (0.25, 1.0)  # pause before each retry; one retry per entry
+    # Cap on a pause taken from Retry-After; the host's 429 cooldown may still be longer.
     max_retry_after: float = 3.0
     cooldown_cap: float = 30.0  # longest pause for a host after an HTTP 429
 
@@ -65,7 +67,10 @@ Sleep = Callable[[float], Awaitable[None]]
 
 
 class JsonRpcClient:
-    """Sends JSON-RPC requests (single or batched) over a shared :class:`httpx.AsyncClient`."""
+    """Sends JSON-RPC requests (single or batched) over a shared :class:`httpx.AsyncClient`.
+
+    Each call, retries included, must finish within ``timeout`` seconds.
+    """
 
     def __init__(
         self,
@@ -77,6 +82,7 @@ class JsonRpcClient:
         clock: Callable[[], float] = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        """Talk to ``url`` through ``http``; ``clock`` and ``sleep`` can be faked in tests."""
         self._http = http
         self._url = url
         self._timeout = timeout
@@ -84,14 +90,12 @@ class JsonRpcClient:
         self._clock = clock
         self._sleep = sleep
         self._host = urlsplit(url).hostname or url
-        # Every client of one HTTP pool (validators, enrichment, pending watch, warm-up)
-        # honours the pause a host asked for with an HTTP 429.
         self._cooldowns = _COOLDOWNS.setdefault(http, {})
-        self._single_until = 0.0  # a node that refused a batch gets single calls till then
+        self._single_until = 0.0
 
     @property
     def batches(self) -> bool:
-        """False while the node is sent single calls (it refused a batch lately)."""
+        """True unless the node refused a batch lately and is sent single calls for now."""
         return self._clock() >= self._single_until
 
     async def call(self, method: str, params: list[Any]) -> Any:
@@ -101,14 +105,13 @@ class JsonRpcClient:
     async def call_batch(
         self, calls: Sequence[tuple[str, list[Any]]], *, same_block: bool = False
     ) -> list[Any]:
-        """Results in order; a failed element comes back as an :class:`RpcError` instance.
+        """Return the results of several calls in order; a failed call yields an RpcError.
 
-        Batches above :data:`BATCH_LIMIT` are split. A node that does not take batches
-        (it refuses them or answers with anything but a list) gets the calls one by one,
-        within the same time budget. One batch is answered by one node; single calls
-        behind a load balancer may reach several, so with ``same_block`` they all ask
-        about the current block number instead of "latest" (a node that lacks the block
-        answers with an error, not with an empty result).
+        Batches above ``BATCH_LIMIT`` are split. A node that does not take batches gets the
+        calls one by one, within the same time budget. Single calls behind a load balancer
+        may reach different nodes, so with ``same_block`` they ask about the current block
+        instead of "latest"; a node that lacks that block then errors instead of answering
+        empty.
         """
         deadline = self._clock() + self._timeout
         chunks = [calls[start : start + BATCH_LIMIT] for start in range(0, len(calls), BATCH_LIMIT)]
@@ -118,6 +121,7 @@ class JsonRpcClient:
         return [result for chunk in answers for result in chunk]
 
     async def _call(self, method: str, params: list[Any], deadline: float) -> Any:
+        """Make one call before ``deadline`` and return its ``result``."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         data = await self._post(payload, method, deadline)
         if not isinstance(data, dict):
@@ -127,6 +131,11 @@ class JsonRpcClient:
     async def _batch(
         self, calls: Sequence[tuple[str, list[Any]]], deadline: float, same_block: bool
     ) -> list[Any]:
+        """Send ``calls`` as one batch and return their results or RpcErrors in order.
+
+        A node that refuses the batch, or answers with anything but a list, gets single
+        calls for a while, starting with these.
+        """
         if not self.batches:
             return await self._one_by_one(calls, deadline, same_block)
         payload = [
@@ -155,6 +164,7 @@ class JsonRpcClient:
         return results
 
     def _no_batches(self, reason: str) -> None:
+        """Use single calls for the next ``SINGLE_CALLS_FOR`` seconds; log ``reason`` once."""
         if self.batches:
             log.info("%s refused a batch (%s); single calls for a while", self._host, reason)
         self._single_until = self._clock() + SINGLE_CALLS_FOR
@@ -162,6 +172,11 @@ class JsonRpcClient:
     async def _one_by_one(
         self, calls: Sequence[tuple[str, list[Any]]], deadline: float, same_block: bool = False
     ) -> list[Any]:
+        """Send ``calls`` as parallel single calls and return results or RpcErrors in order.
+
+        With ``same_block``, "latest" is first replaced by the current block number; if
+        that lookup fails, every call gets its error.
+        """
         if same_block:
             try:
                 block = await self._call("eth_blockNumber", [], deadline)
@@ -171,16 +186,18 @@ class JsonRpcClient:
         return list(await asyncio.gather(*(self._single(m, p, deadline) for m, p in calls)))
 
     async def _single(self, method: str, params: list[Any], deadline: float) -> Any:
+        """Make one call and return its result, or its RpcError instead of raising it."""
         try:
             return await self._call(method, params, deadline)
         except RpcError as exc:
             return exc
 
     async def _post(self, payload: Any, method: str, deadline: float) -> Any:
-        """The decoded answer body; quick failures are retried, all before ``deadline``.
+        """Send ``payload`` and return the decoded answer, retrying quick failures.
 
-        The deadline is hard: httpx applies its timeout per phase and per read, so a node
-        that drips its answer would otherwise hold the call far longer.
+        Everything must finish before ``deadline``, else RpcError. The deadline is enforced
+        here because httpx times each phase and read on its own, so a node that drips its
+        answer could otherwise hold the call far longer.
         """
         left = deadline - self._clock()
         if left <= 0:
@@ -192,6 +209,11 @@ class JsonRpcClient:
             raise RpcError(f"{method} via {self._host}: timed out after {left:.1f}s") from exc
 
     async def _attempts(self, payload: Any, method: str, deadline: float) -> Any:
+        """Try the request until it works, fails for good or runs out of retries.
+
+        Each try first waits out the host's 429 cooldown. When a pause would pass
+        ``deadline``, it gives up at once with an RpcError.
+        """
         attempt = 0
         while True:
             pause = self._cooldown_left()
@@ -214,10 +236,15 @@ class JsonRpcClient:
             await self._sleep(delay)
 
     def _cooldown_left(self) -> float:
+        """Return the seconds left of this host's 429 pause; zero or less means none."""
         return self._cooldowns.get(self._host, 0.0) - self._clock()
 
     async def _attempt(self, payload: Any, method: str, deadline: float) -> Any:
-        """One request: the decoded body, :class:`_Retryable` or a final :class:`RpcError`."""
+        """Send one request and return the decoded body.
+
+        Raises :class:`_Retryable` for a failure worth another try and :class:`RpcError`
+        for a final one. An HTTP 429 also starts a pause for the host on the whole pool.
+        """
         timeout = max(deadline - self._clock(), 0.1)
         try:
             response = await self._http.post(self._url, json=payload, timeout=timeout)
@@ -246,8 +273,7 @@ class JsonRpcClient:
         except ValueError as exc:
             raise RpcError(f"{method} via {self._host}: invalid JSON") from exc
         if isinstance(payload, list) and isinstance(data, dict):
-            # One error object for a whole batch: a rate limit by its code, else a node that
-            # refuses batches (or batches this big), which then gets single calls.
+            # One error for the whole batch: a rate limit, or else the node refuses such batches.
             error = data.get("error")
             if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
                 raise _Retryable(RpcError(f"{method} via {self._host}: rate limited"))
@@ -257,11 +283,13 @@ class JsonRpcClient:
         return data
 
     def _transport_error(self, method: str, exc: Exception) -> RpcError:
+        """Wrap a transport exception in an RpcError that names the method and host."""
         error = RpcError(f"{method} via {self._host}: {type(exc).__name__}: {exc}")
         error.__cause__ = exc
         return error
 
     def _result(self, data: dict[str, Any], method: str) -> Any:
+        """Return the ``result`` of one answer, or raise RpcCallError for its error object."""
         error = data.get("error")
         if error:
             code = error.get("code") if isinstance(error, dict) else None
@@ -282,19 +310,21 @@ class _Retryable(Exception):
     """A failure worth another attempt; carries the error to raise if none is left."""
 
     def __init__(self, error: RpcError, retry_after: float | None = None) -> None:
+        """Wrap ``error``; ``retry_after`` is the pause in seconds the server asked for."""
         super().__init__(str(error))
         self.error = error
         self.retry_after = retry_after
 
 
 def _is_rate_limited(data: Any) -> bool:
-    """A rate-limit error in the answer, or in any element of a batch answer."""
+    """Return True if the answer, or any element of a batch answer, is a rate-limit error."""
     if isinstance(data, list):
         return any(isinstance(item, dict) and _is_rate_limit(item.get("error")) for item in data)
     return isinstance(data, dict) and _is_rate_limit(data.get("error"))
 
 
 def _is_rate_limit(error: Any) -> bool:
+    """Return True if a JSON-RPC error object is the node's rate limit."""
     if not isinstance(error, dict):
         return False
     message = str(error.get("message", "")).lower()
@@ -306,13 +336,14 @@ def _is_rate_limit(error: Any) -> bool:
 
 
 def _error_text(error: Any) -> str:
+    """Return up to 200 characters describing the error that answered a whole batch."""
     if isinstance(error, dict):
         return str(error.get("message") or error)[:200]
     return "the answer was not a list"[:200]
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """Seconds from a ``Retry-After`` header; HTTP-date forms are ignored."""
+    """Return the seconds of a ``Retry-After`` header, or None if absent, negative or a date."""
     if value is None:
         return None
     try:

@@ -14,26 +14,28 @@ _NUMBER_RE = re.compile(r"\d[\d.,]*")
 
 
 def shape(text: str) -> str:
-    """``text`` with every number replaced by ``#``: ``Raised: 12.5 SOL`` -> ``Raised: # SOL``.
+    """Return ``text`` with every number replaced by ``#``: "Raised: 12.5 SOL" -> "Raised: # SOL".
 
-    Two texts of one shape are the same element showing another value (a timer, a counter).
+    Two texts of the same shape are one element showing another value, like a timer or a
+    counter.
     """
     return _NUMBER_RE.sub("#", text)
 
 
 class ChangeDetector:
-    """Ordered diff of node lists that can leave volatile nodes out.
+    """Compares node lists in order and can leave volatile nodes out.
 
-    Volatile nodes differ between two renders taken a few seconds apart (timers,
-    counters, banners); they and their previous values stay out of the report.
+    Volatile nodes differ between two renders taken a few seconds apart (timers, counters,
+    banners); they and their previous values stay out of the report.
     """
 
     @staticmethod
     def differs(old: Signature, new: Signature) -> bool:
+        """True when the two signatures are not identical."""
         return old != new
 
     def volatile_nodes(self, first: Signature, second: Signature) -> frozenset[Node]:
-        """Nodes that are not identical in two consecutive renders of the same page."""
+        """Return the nodes that differ between two consecutive renders of the same page."""
         volatile: set[Node] = set()
         for op, i1, i2, j1, j2 in self._matcher(first, second).get_opcodes():
             if op != "equal":
@@ -52,17 +54,18 @@ class ChangeDetector:
     def compare(
         self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()
     ) -> ChangeReport:
+        """Return only the change report of :meth:`diff`."""
         return self.diff(old, new, url, ignore)[0]
 
     def diff(
         self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()
     ) -> tuple[ChangeReport, Signature]:
-        """What changed from ``old`` to ``new`` (``ignore``: the volatile nodes), and what to
-        keep as the next snapshot.
+        """Return the changes from ``old`` to ``new`` and the signature to store as the snapshot.
 
-        Only confirmed content is kept: ``new`` without the volatile nodes ``old`` did not
-        have, plus the old nodes that vanished only between the two renders. A change that
-        happened between the renders is therefore reported by the next round, if it lasts.
+        ``ignore`` holds the volatile nodes, which stay out of the report. The snapshot keeps
+        only confirmed content: ``new`` without the volatile nodes ``old`` lacked, plus the old
+        nodes that vanished only between the two renders. So a change made between the renders
+        is reported by the next round, if it lasts.
         """
         known, confirmed = set(old), set(new)
         removed: list[Node] = []
@@ -86,23 +89,23 @@ class ChangeDetector:
 
     @staticmethod
     def _matcher(a: Signature, b: Signature) -> SequenceMatcher[Node]:
+        """Return a sequence matcher over two node lists, with autojunk off."""
         return SequenceMatcher(None, a, b, autojunk=False)
 
     @staticmethod
     def _without_volatile(
         old_block: Signature, new_block: Signature, ignore: frozenset[Node]
     ) -> tuple[list[Node], list[Node]]:
-        """Drop volatile nodes and, on the old side, their previous incarnations.
+        """Return both blocks without volatile nodes and, on the old side, their previous values.
 
-        An old node is the previous value of a volatile one when both show the same text
-        with other attributes, or the same attributes with a text of the same shape (the
-        timer read 00:05:30, now 00:05:28). "Presale is live" turning into a ticking
-        "Launch in 00:05:30" is a change, not a previous value.
+        An old node is a volatile node's previous value when both show the same text with other
+        attributes, or the same attributes with a text of the same shape (a timer read
+        00:05:30, now 00:05:28). "Presale is live" turning into a ticking "Launch in 00:05:30"
+        is a real change.
         """
         volatile_new = [node for node in new_block if node in ignore]
         stable_new = [node for node in new_block if node not in ignore]
-        # Indexed, so that a block of thousands of rows is paired in one pass: the earliest
-        # unused candidate by equal text, or by equal attributes and shape.
+        # Indexed so a block of thousands of rows is paired in one pass, not a quadratic search.
         by_text: dict[tuple[str, str], deque[int]] = defaultdict(deque)
         by_shape: dict[tuple[str, tuple[tuple[str, str], ...], str], deque[int]] = defaultdict(
             deque
@@ -113,6 +116,7 @@ class ChangeDetector:
         used: set[int] = set()
 
         def first_unused(queue: deque[int] | None) -> int | None:
+            """Return the earliest index in ``queue`` not paired yet, or None."""
             while queue and queue[0] in used:
                 queue.popleft()
             return queue[0] if queue else None
@@ -136,7 +140,10 @@ class ChangeDetector:
     def _pair_attribute_changes(
         old_block: list[Node], new_block: list[Node]
     ) -> tuple[list[Node], list[Node], list[tuple[Node, Node]]]:
-        """Match removed/added nodes with equal tag and text: attribute-only changes."""
+        """Pair removed and added nodes with the same tag and text as attribute-only changes.
+
+        Return the unpaired old nodes, the unpaired new nodes and the pairs.
+        """
         remaining_new = list(new_block)
         unpaired_old: list[Node] = []
         pairs: list[tuple[Node, Node]] = []

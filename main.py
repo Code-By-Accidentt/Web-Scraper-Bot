@@ -1,4 +1,4 @@
-"""Entry point kept for backwards compatibility: ``python main.py``."""
+"""Starts the bot with ``python main.py``, the command older setups and rebooter.py use."""
 
 from scraper_bot.app.cli import main
 

@@ -1,4 +1,4 @@
-"""EVM constants and ABI decoding shared by the validators and the token details."""
+"""EVM constants and ABI decoding shared by the validator and the token details."""
 
 from __future__ import annotations
 
@@ -6,41 +6,43 @@ from typing import Any
 
 from scraper_bot.models.addresses import clean_label
 
-# ERC-20 function selectors (first four bytes of the keccak256 of the signature).
-ERC20_NAME = "0x06fdde03"  # name()
-ERC20_SYMBOL = "0x95d89b41"  # symbol()
-ERC20_DECIMALS = "0x313ce567"  # decimals()
-ERC20_TOTAL_SUPPLY = "0x18160ddd"  # totalSupply()
+# Function selectors: the first four bytes of keccak256 of the signature, e.g. "name()".
+ERC20_NAME = "0x06fdde03"
+ERC20_SYMBOL = "0x95d89b41"
+ERC20_DECIMALS = "0x313ce567"
+ERC20_TOTAL_SUPPLY = "0x18160ddd"
 
-# Uniswap V2/V3, Aerodrome and their forks: the two tokens of an LP pair or pool.
-PAIR_TOKEN0 = "0x0dfe1681"  # token0()
-PAIR_TOKEN1 = "0xd21220a7"  # token1()
-# ERC-4626: the asset a vault holds; its shares are ERC-20 but never a launch.
-VAULT_ASSET = "0x38d52e0f"  # asset()
+# token0()/token1() of Uniswap V2/V3, Aerodrome and their forks; asset() of ERC-4626 vaults.
+PAIR_TOKEN0 = "0x0dfe1681"
+PAIR_TOKEN1 = "0xd21220a7"
+VAULT_ASSET = "0x38d52e0f"
 
-# The calls that classify a contract (see EvmContractValidator), in this order.
+# EvmContractValidator unpacks the answers in exactly this order.
 TOKEN_PROBE = (ERC20_TOTAL_SUPPLY, ERC20_DECIMALS, PAIR_TOKEN0, PAIR_TOKEN1, VAULT_ASSET)
 
-# EIP-7702: a wallet that delegates to a contract answers eth_getCode with
-# 0xef0100 followed by the delegate's 20-byte address.
+# EIP-7702: a delegated wallet's code is 0xef0100 plus the delegate's 20-byte address.
 DELEGATION_PREFIX = "0xef0100"
 DELEGATION_CODE_LENGTH = 2 + 2 * 23
 
-# How nodes spell "no bytecode here" in an eth_getCode answer.
 _EMPTY_CODE = frozenset({"", "0x", "0x0"})
 
 
 def has_code(code: object) -> bool:
-    """True when an eth_getCode answer holds bytecode (an EIP-7702 delegation included)."""
+    """Return True when an eth_getCode answer holds bytecode, EIP-7702 delegations included."""
     return isinstance(code, str) and code.lower() not in _EMPTY_CODE
 
 
 def is_delegated_wallet(code: str) -> bool:
+    """Return True when the code is an EIP-7702 delegation: a wallet, not a contract."""
     return len(code) == DELEGATION_CODE_LENGTH and code.lower().startswith(DELEGATION_PREFIX)
 
 
 def word_address(result: object) -> str | None:
-    """The address in an ABI-encoded 32-byte word, or ``None`` when it is not one."""
+    """Return the address in the first 32-byte ABI word of a call result.
+
+    Returns None when the word is missing, is not hex, or does not hold an address (its high
+    bytes are set, or it is the zero address).
+    """
     if not isinstance(result, str) or len(result) < 66 or not result.startswith("0x"):
         return None
     word = result[2:66].lower()
@@ -54,7 +56,7 @@ def word_address(result: object) -> str | None:
 
 
 def word_uint(result: object) -> int | None:
-    """The number in an ABI-encoded 32-byte word, or ``None``."""
+    """Return the number in the first 32-byte ABI word of a call result, or None."""
     if not isinstance(result, str) or len(result) < 66 or not result.startswith("0x"):
         return None
     try:
@@ -64,7 +66,10 @@ def word_uint(result: object) -> int | None:
 
 
 def decode_abi_string(result: Any) -> str | None:
-    """Decode a ``string`` return value; ``bytes32`` symbols (MKR-style) are accepted."""
+    """Decode a ``string`` returned by a call, or return None when it is not one.
+
+    Old tokens such as MKR return their symbol as ``bytes32``; that form is read too.
+    """
     if not isinstance(result, str) or not result.startswith("0x"):
         return None
     try:
@@ -88,6 +93,7 @@ def decode_abi_string(result: Any) -> str | None:
 
 
 def decode_abi_uint(result: Any, *, limit: int | None = None) -> int | None:
+    """Return a call result as a number, or None when it is not hex or is above ``limit``."""
     if not isinstance(result, str) or not result.startswith("0x") or len(result) < 3:
         return None
     try:

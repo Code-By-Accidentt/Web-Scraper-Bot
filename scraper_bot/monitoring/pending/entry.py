@@ -14,13 +14,15 @@ SLOW_INTERVAL = 30.0
 
 @dataclass(slots=True)
 class PendingEntry:
+    """One address the pending watch checks until it becomes a token or is let go."""
+
     address: Address
-    site_url: str  # the site (and page, below) that showed it first: named in the alert
+    site_url: str  # the site and page named in the alert: the first to show it
     page_url: str
     first_seen: float  # when a page showed it first (epoch seconds)
     fast: bool  # named as the token on the page, or seen by a turbo session
     sighting: Sighting | None = None
-    classified: bool = False  # checked once: nothing lives there yet (EVM: and no wallet)
+    classified: bool = False  # a check found nothing there yet (EVM: and not a wallet)
     # On a page when a turbo session started: news only where it was seen absent since.
     baseline: bool = False
     next_check: float = 0.0
@@ -32,11 +34,16 @@ class PendingEntry:
     late: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
+        """Add the first site and its page to ``sites``."""
         self.sites.setdefault(self.site_url, self.page_url)
 
 
 def check_interval(entry: PendingEntry, now: float, turbo: float | None = None) -> float:
-    """Seconds until the next check: every second while fresh, slower later."""
+    """Return how many seconds to wait before checking this address again.
+
+    A fast entry is checked every second for its first 15 minutes, every 5 seconds up to an
+    hour, then every 30 seconds like the rest. A turbo pace (``turbo``) can make it faster.
+    """
     interval = SLOW_INTERVAL
     if entry.fast:
         age = now - entry.first_seen
@@ -46,11 +53,14 @@ def check_interval(entry: PendingEntry, now: float, turbo: float | None = None) 
 
 @dataclass(frozen=True, slots=True)
 class Dropped:
+    """An address the watch let go, kept out until ``until`` (epoch seconds)."""
+
     until: float
     hard: bool  # True: a wallet or a non-token; False: only given up on (expired)
 
 
 def entry_to_dict(entry: PendingEntry) -> dict[str, Any]:
+    """Return the entry as a JSON-ready dict for the pending watch file."""
     sighting = entry.sighting
     return {
         "address": address_key(entry.address),
@@ -69,7 +79,7 @@ def entry_to_dict(entry: PendingEntry) -> dict[str, Any]:
 
 
 def _sites_from(raw: Any, page_url: str) -> dict[str, str]:
-    """Sites and their pages; an earlier build stored the sites alone, as a list."""
+    """Return the saved sites and their pages; an earlier build saved the sites alone, as a list."""
     if isinstance(raw, dict):
         return {str(site): str(page) for site, page in raw.items()}
     if isinstance(raw, list):
@@ -78,6 +88,10 @@ def _sites_from(raw: Any, page_url: str) -> dict[str, str]:
 
 
 def entry_from_dict(raw: dict[str, Any], *, forget_baseline: bool = False) -> PendingEntry | None:
+    """Rebuild an entry from its saved dict; None when the address cannot be parsed.
+
+    With ``forget_baseline`` a turbo baseline comes back as an ordinary entry.
+    """
     address = parse_address_key(str(raw["address"]))
     if address is None:
         return None

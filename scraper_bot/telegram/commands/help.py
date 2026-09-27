@@ -41,4 +41,5 @@ SETTINGS_USAGE = "Usage:\n" + "\n".join(
 
 
 def usage(command: str) -> str:
+    """Return a one-line usage hint for ``command``."""
     return f"Usage: {code(command)}"

@@ -35,19 +35,23 @@ KEEPALIVE = 60.0  # seconds an idle HTTP connection is kept for reuse
 
 
 class Application:
-    """Owns the process-level resources (HTTP client, browser) and serves a :class:`Runtime`."""
+    """Owns the process-wide resources (HTTP clients, browser) and serves a :class:`Runtime`."""
 
     def __init__(self, settings: Settings) -> None:
+        """Keep the settings; the /set preferences are read later, in :meth:`run`."""
         self._settings = settings
         self._prefs = Preferences(settings, settings.data_dir / "preferences.json")
 
     async def run(self) -> None:
+        """Open the HTTP clients and the browser, serve the bot, and close them when it stops.
+
+        Raises TelegramAuthError for a rejected token, and BrowserUnavailable (after telling
+        the chat) when the browser cannot start.
+        """
         cfg = self._settings
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         self._prefs.load()
-        # httpx drops idle connections after 5 s by default. With KEEPALIVE the warm-up calls
-        # every 30 s keep the RPC connections open between alerts. Telegram's long poll keeps
-        # its own connection open, and over HTTP/2 the alerts share it.
+        # httpx drops idle connections after 5 s; KEEPALIVE lets the 30 s warm-up keep RPC open.
         limits = httpx.Limits(
             max_connections=64, max_keepalive_connections=32, keepalive_expiry=KEEPALIVE
         )
@@ -111,7 +115,7 @@ class Application:
 
     @staticmethod
     async def _check_token(telegram: TelegramClient) -> None:
-        """Fail fast on a wrong token; a network hiccup only produces a warning."""
+        """Stop at once on a rejected token; if Telegram cannot be reached, only warn."""
         profile = await telegram.get_me()
         if profile is None:
             log.warning("could not verify the Telegram token now; continuing anyway")
@@ -120,7 +124,10 @@ class Application:
 
 
 def _http2(settings: Settings) -> bool:
-    """HTTP/2 when configured and h2 is installed (an update may skip ``pip install``)."""
+    """Return True when HTTP2 is on and the h2 package is installed.
+
+    An update may skip ``pip install``, so a missing h2 falls back to HTTP/1.1 with a warning.
+    """
     if not settings.http2:
         return False
     try:

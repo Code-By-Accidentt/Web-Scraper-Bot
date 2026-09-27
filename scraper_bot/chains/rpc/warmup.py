@@ -1,9 +1,9 @@
-"""Keeping RPC connections warm and checking that every EVM endpoint is the chain it claims.
+"""Keeps RPC connections warm and checks that every EVM endpoint serves the chain it claims.
 
 A cold connection (DNS, TCP and TLS) costs 0.4-1.2 s on the first call of an alert, and
 httpx drops idle connections after ``keepalive_expiry``. One cheap call per endpoint every
-``interval`` seconds keeps them open; with HTTP/2 every parallel call of a check then
-shares that connection.
+``interval`` seconds keeps them open; with HTTP/2, all parallel calls of a check then
+share that connection.
 """
 
 from __future__ import annotations
@@ -21,15 +21,15 @@ log = logging.getLogger(__name__)
 
 WARM_INTERVAL = 30.0
 
-# Told an endpoint's failure: the endpoint health of the validators.
+# Gets an endpoint's name and failure; in the app, the validators' endpoint health.
 Recorder = Callable[[str, BaseException | None], None]
 
 
 class ConnectionWarmer:
-    """Pings every configured endpoint periodically; its failures feed the endpoint health.
+    """Pings every configured endpoint on a timer and reports failures to the endpoint health.
 
-    Only failures: a cheap ping that works says nothing about the heavier calls of an
-    address check, whose own answers end an outage.
+    Successes are not reported: a cheap ping that works says nothing about the heavier
+    calls of an address check, whose own answers end an outage.
     """
 
     def __init__(
@@ -41,6 +41,7 @@ class ConnectionWarmer:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         record: Recorder | None = None,
     ) -> None:
+        """Make one client without retries per configured endpoint; failures go to ``record``."""
         timeout = settings.rpc_timeout
         self._evm = [
             (net, JsonRpcClient(http, net.rpc_url, timeout, retry=NO_RETRY))
@@ -60,10 +61,14 @@ class ConnectionWarmer:
         ]
         self._interval = interval
         self._sleep = sleep
-        self._record = record  # each failure feeds the endpoint health
+        self._record = record
 
     async def wrong_chains(self) -> list[str]:
-        """EVM endpoints that answer eth_chainId with another chain, e.g. ``Base: chain 1``."""
+        """Return a line for each EVM endpoint whose eth_chainId names another chain.
+
+        A line reads like ``Base: chain 1, expected 8453``. Endpoints that do not answer
+        now are skipped.
+        """
         answers = await asyncio.gather(
             *(client.call("eth_chainId", []) for _, client in self._evm), return_exceptions=True
         )
@@ -80,6 +85,7 @@ class ConnectionWarmer:
         return wrong
 
     async def run(self) -> None:
+        """Ping every endpoint every ``interval`` seconds until cancelled, reporting failures."""
         while True:
             results = await asyncio.gather(
                 *(client.call(method, []) for _, client, method in self._pings),

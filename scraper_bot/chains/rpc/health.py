@@ -1,4 +1,4 @@
-"""Tracking which RPC endpoints are failing."""
+"""Which RPC endpoints are failing, since when, and which optional ones to leave alone."""
 
 from __future__ import annotations
 
@@ -10,14 +10,11 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 
-# ...and have failed again this recently: an endpoint nobody asked for an hour is not down.
+# A reported outage needs a failure this recent: an endpoint nobody asks lately is not down.
 _RECENT_FAILURE = 60.0
-# Failures further apart than this are separate outages (RPC_RETRY_DELAY may space the
-# checks of a stuck address minutes apart; that is still one outage).
+# Failures further apart start a new outage; RPC_RETRY_DELAY can space checks minutes apart.
 _NEW_OUTAGE_AFTER = 1800.0
-# An optional endpoint failing this many times in a row is left alone (no waiting on it),
-# but for probes: the first right away, then after 2 s, the gap doubling up to 30 s. A
-# probe's answer ends the rest.
+# An optional endpoint rests after this many failures in a row; probe gaps grow 2 s -> 30 s.
 _REST_AFTER = 2
 _FIRST_PROBE_GAP = 2.0
 _PROBE_EVERY = 30.0
@@ -34,19 +31,20 @@ class FailingEndpoint:
     name: str
     seconds: float  # failing for this long
     error: str  # its latest failure
-    optional: bool = False  # its failure holds up no verdict (see EvmNetwork.optional)
+    optional: bool = False  # its failure holds up no verdict
 
 
-# Called with the endpoints failing for minutes and RPC_RETRY_DELAY; the Notifier sends a 🛑.
+# Gets the endpoints failing for minutes and RPC_RETRY_DELAY; the Notifier sends a 🛑.
 StuckReporter = Callable[[Sequence[FailingEndpoint], float], None]
 
 
 class EndpointHealth:
-    """Since when each RPC endpoint has been failing; its next answer clears the entry."""
+    """Remembers since when each RPC endpoint has been failing; its next answer clears that."""
 
     def __init__(
         self, clock: Callable[[], float] = time.monotonic, optional: Collection[str] = ()
     ) -> None:
+        """Track endpoints by name; those named in ``optional`` may rest while they fail."""
         self._clock = clock
         self._optional = frozenset(optional)
         self._since: dict[str, float] = {}
@@ -57,17 +55,18 @@ class EndpointHealth:
         self._probe_gap: dict[str, float] = {}
 
     def failed(self, name: str, error: BaseException) -> None:
+        """Record a failure of endpoint ``name``; the start of an outage is logged."""
         now = self._clock()
         last = self._last.get(name)
         self._last[name] = now
         self._errors[name] = str(error)
         self._streak[name] = self._streak.get(name, 0) + 1
-        # Two hiccups an hour apart are two short outages, not one long one.
         if name not in self._since or (last is not None and now - last > _NEW_OUTAGE_AFTER):
             self._since[name] = now
             log.warning("RPC endpoint %s is failing: %s", name, error)
 
     def answered(self, name: str) -> None:
+        """Record an answer from endpoint ``name``: its outage, if any, ends and is logged."""
         self._last.pop(name, None)
         self._errors.pop(name, None)
         self._streak.pop(name, None)
@@ -77,11 +76,11 @@ class EndpointHealth:
             log.info("RPC endpoint %s recovered", name)
 
     def resting(self, name: str) -> bool:
-        """True while an optional endpoint that keeps failing is not asked at all.
+        """Return True while an optional endpoint that keeps failing should not be asked.
 
-        Probes still go through (this call lets one pass): at once, then 2 s later, the gap
-        doubling up to ``_PROBE_EVERY``, so a short hiccup costs seconds, not half a minute.
-        A probe's answer ends the rest. Required endpoints are always asked.
+        Now and then it returns False to let a probe through: at once, then 2 s later, the
+        gap doubling up to ``_PROBE_EVERY``, so a short hiccup costs seconds, not half a
+        minute. A probe's answer ends the rest; required endpoints never rest.
         """
         if name not in self._optional or self._streak.get(name, 0) < _REST_AFTER:
             return False
@@ -96,11 +95,11 @@ class EndpointHealth:
         return True
 
     def down(self) -> set[str]:
-        """Endpoints in an outage: failed since their last answer."""
+        """Return the endpoints in an outage: those that failed since their last answer."""
         return set(self._since)
 
     def failing(self, seconds: float = 0.0) -> list[FailingEndpoint]:
-        """Endpoints down for ``seconds`` or more that also failed lately."""
+        """Return the endpoints down for ``seconds`` or more that also failed lately."""
         now = self._clock()
         return [
             FailingEndpoint(name, now - since, self._errors[name], name in self._optional)

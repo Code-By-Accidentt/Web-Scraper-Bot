@@ -28,7 +28,10 @@ from scraper_bot.settings.defaults import (
 
 
 def _masked(url: str) -> str:
-    """``url`` fit for a log: scheme and host only, since API keys hide in paths and logins."""
+    """Return ``url`` quoted and cut down to its scheme and host, fit for a log.
+
+    API keys often hide in the path or the login, so both are replaced with an ellipsis.
+    """
     match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)?([^/?#]*)(.*)$", url.strip(), re.S)
     if match is None:
         return "'…'"
@@ -54,7 +57,6 @@ class EvmNetwork:
 
 _LIST_SEPARATOR_RE = re.compile(r"[,;\s]+")
 
-# Accepted spellings of booleans in .env and /set
 TRUE_WORDS = frozenset({"1", "true", "yes", "on"})
 FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 
@@ -64,14 +66,16 @@ LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    """Immutable, validated configuration for one bot process."""
+    """The checked, unchangeable configuration of one bot process.
 
-    # Telegram
+    Durations are in seconds, even where the .env key takes minutes or hours; only the
+    fields named ``*_minutes`` hold minutes.
+    """
+
     telegram_bot_token: str
     chat_ids: tuple[int, ...]
     allowed_chat_ids: tuple[int, ...]
 
-    # Monitoring
     poll_interval_min: float
     poll_interval_max: float
     max_concurrent_pages: int
@@ -88,11 +92,9 @@ class Settings:
     flap_window: float
     flap_threshold: int
 
-    # Address discovery
     deep_scan: bool
     deep_scan_max_bytes: int
 
-    # Turbo mode and blocking
     turbo_interval: float
     turbo_default_minutes: float
     turbo_max_minutes: float
@@ -102,19 +104,16 @@ class Settings:
     turbo_recheck_interval: float
     block_max_backoff: float
 
-    # Unverified mode (/unverified <url> on)
     unverified_recheck: float
     unverified_watch: float
     unverified_max_per_hour: int
 
-    # Browser
     browser_channel: str
     headless: bool
     blocked_resource_types: tuple[str, ...]
-    browser_args: tuple[str, ...]  # extra Chromium command-line switches
+    browser_args: tuple[str, ...]
 
-    # Blockchain
-    http2: bool  # RPC and Telegram over HTTP/2: parallel calls share one warm connection
+    http2: bool  # RPC and Telegram over HTTP/2, so parallel calls share one warm connection
     evm_networks: tuple[EvmNetwork, ...]
     solana_rpc_url: str
     sui_rpc_url: str
@@ -124,14 +123,12 @@ class Settings:
     rejected_ttl: float
     rpc_retry_delay: float
 
-    # Misc
     data_dir: Path
     log_level: str
     log_file: Path | None
     heartbeat_interval: float
 
-    # Keys still set to a default of an earlier release (see CHANGED_DEFAULTS)
-    outdated_defaults: tuple[ChangedDefault, ...] = ()
+    outdated_defaults: tuple[ChangedDefault, ...] = ()  # keys still set to an old default
 
     @classmethod
     def from_env(
@@ -139,7 +136,11 @@ class Settings:
         env: Mapping[str, str] | None = None,
         dotenv_path: str | os.PathLike[str] | None = ".env",
     ) -> Settings:
-        """Settings from ``env`` (default ``os.environ``) over ``.env``; real variables win."""
+        """Read and check the settings from ``env`` (default ``os.environ``) and ``.env``.
+
+        Real variables win over ``.env``. An empty EVM RPC URL skips that network, but
+        Solana and Sui cannot be skipped. Raises ConfigError for a missing or bad value.
+        """
         merged: dict[str, str] = {}
         if dotenv_path is not None and Path(dotenv_path).is_file():
             merged.update({k: v for k, v in dotenv_values(dotenv_path).items() if v is not None})
@@ -215,7 +216,6 @@ class Settings:
             browser_args=reader.arguments("BROWSER_ARGS", DEFAULT_BROWSER_ARGS),
             http2=reader.flag("HTTP2", True),
             evm_networks=networks,
-            # (an empty EVM URL skips that network; Solana and Sui cannot be skipped)
             solana_rpc_url=solana_rpc_url,
             sui_rpc_url=sui_rpc_url,
             require_erc20=reader.flag("REQUIRE_ERC20", True),
@@ -234,9 +234,10 @@ class Settings:
 def find_outdated_defaults(
     values: Mapping[str, str], changes: tuple[ChangedDefault, ...] | None = None
 ) -> tuple[ChangedDefault, ...]:
-    """The changed defaults (``CHANGED_DEFAULTS``) that ``values`` still set to the old value.
+    """Return the changed defaults that ``values`` still set to their old value.
 
-    ``previous`` of each result is the value as ``values`` spell it (``on`` for ``true``).
+    ``changes`` defaults to ``CHANGED_DEFAULTS``. In each result ``previous`` holds the
+    value as ``values`` spell it, e.g. ``on`` for ``true``.
     """
     return tuple(
         dataclasses.replace(change, previous=values[change.key].strip())
@@ -246,7 +247,10 @@ def find_outdated_defaults(
 
 
 def _same_setting(value: str, previous: str) -> bool:
-    """Equal when read as ``previous``'s type: ``on`` == ``true``, ``600`` == ``600.0``."""
+    """Return True when ``value`` means the same as ``previous``, read as a flag, number or text.
+
+    So ``on`` equals ``true``, ``600`` equals ``600.0``, and a trailing slash does not count.
+    """
     text, old = value.strip().lower(), previous.strip().lower()
     if old in {"true", "false"}:
         return (text in TRUE_WORDS) if old == "true" else (text in FALSE_WORDS)
@@ -259,12 +263,16 @@ def _same_setting(value: str, previous: str) -> bool:
 def split_arguments(
     text: str, key: str = "value", *, windows: bool | None = None
 ) -> tuple[str, ...]:
-    """``text`` split into command-line arguments, quotes removed."""
+    """Split ``text`` into command-line arguments the way a shell does, removing quotes.
+
+    On Windows (or with ``windows=True``) a backslash is a path separator, not an escape.
+    Raises ConfigError naming ``key`` when the quotes do not match.
+    """
     lexer = shlex.shlex(text, posix=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
     if os.name == "nt" if windows is None else windows:
-        lexer.escape = ""  # a backslash in a Windows path is a separator, not an escape
+        lexer.escape = ""
     try:
         return tuple(lexer)
     except ValueError as exc:
@@ -272,12 +280,14 @@ def split_arguments(
 
 
 class _EnvReader:
-    """Typed accessors over a flat string mapping with uniform error reporting."""
+    """Reads typed values from the merged environment; a bad one raises ConfigError."""
 
     def __init__(self, values: Mapping[str, str]) -> None:
+        """Read from ``values``, the environment merged with ``.env``."""
         self._values = values
 
     def text(self, key: str, default: str = "") -> str:
+        """Return the value of ``key`` without surrounding spaces, or ``default`` if unset."""
         return self._values.get(key, default).strip()
 
     def text_or_default(self, key: str, default: str) -> str:
@@ -286,7 +296,10 @@ class _EnvReader:
 
     @staticmethod
     def url(key: str, value: str) -> str:
-        """``value`` when it is an http(s) URL httpx can send to; a typo stops the start."""
+        """Return ``value`` if it is an http(s) URL with a host; otherwise raise ConfigError.
+
+        The error shows only the masked URL, so an API key in it stays out of the log.
+        """
         try:
             parsed = httpx.URL(value)
         except httpx.InvalidURL as exc:
@@ -296,12 +309,14 @@ class _EnvReader:
         return value
 
     def choice(self, key: str, default: str, allowed: frozenset[str]) -> str:
+        """Return the value of ``key`` in upper case; it must be one of ``allowed``."""
         value = self.text_or_default(key, default).upper()
         if value not in allowed:
             raise ConfigError(f"{key} must be one of {', '.join(sorted(allowed))}, got {value!r}")
         return value
 
     def flag(self, key: str, default: bool) -> bool:
+        """Return the value of ``key`` as a boolean (on/off, yes/no, ...), or ``default``."""
         raw = self.text(key)
         if not raw:
             return default
@@ -313,6 +328,7 @@ class _EnvReader:
         raise ConfigError(f"{key} must be a boolean, got {raw!r}")
 
     def integer(self, key: str, default: int, *, minimum: int | None = None) -> int:
+        """Return the value of ``key`` as an integer not below ``minimum``, or ``default``."""
         raw = self.text(key)
         if not raw:
             return default
@@ -325,6 +341,7 @@ class _EnvReader:
         return value
 
     def number(self, key: str, default: float, *, minimum: float | None = None) -> float:
+        """Return the value of ``key`` as a finite number not below ``minimum``, or ``default``."""
         raw = self.text(key)
         if not raw:
             return default
@@ -339,7 +356,10 @@ class _EnvReader:
         return value
 
     def text_list(self, key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-        """Comma separated list; brackets, semicolons, quotes and stray spaces are tolerated."""
+        """Return the value of ``key`` as a list of items, or ``default`` when it is empty.
+
+        Commas, semicolons or spaces separate the items; brackets and quotes are dropped.
+        """
         raw = self.text(key).strip("[]()")
         if not raw.strip():
             return default
@@ -347,14 +367,15 @@ class _EnvReader:
         return tuple(item for item in items if item)
 
     def arguments(self, key: str, default: str) -> tuple[str, ...]:
-        """Command-line switches split like a shell does, so ``--x=a,b`` stays whole.
+        """Return the value of ``key`` split into switches the way a shell does.
 
-        Only an absent key gets ``default``; an empty value means no switches at all. On
-        Windows backslashes are path separators, not escapes (``--user-data-dir=C:\\x``).
+        So ``--x=a,b`` stays whole, and on Windows ``--user-data-dir=C:\\x`` keeps its
+        backslash. Only an absent key gets ``default``; an empty value means no switches.
         """
         return split_arguments(self.text(key, default), key)
 
     def int_list(self, key: str) -> tuple[int, ...]:
+        """Return the value of ``key`` as a list of integers, such as chat ids."""
         items = self.text_list(key)
         try:
             return tuple(int(item) for item in items)

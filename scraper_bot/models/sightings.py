@@ -13,8 +13,7 @@ class SightingSource(Enum):
 
     TEXT = "page text"  # the visible text of an element
     LINK = "link"  # an attribute of an element: href, src, data-*
-    SOURCE = "page source"  # only in the raw HTML (inline scripts, meta tags) or in frames
-    # and shadow roots (deep scan)
+    SOURCE = "page source"  # only in raw HTML (inline scripts, meta tags), frames or shadow roots
     SCRIPT = "loaded script"  # scripts and JSON the page loaded (deep scan)
 
 
@@ -30,7 +29,11 @@ class Sighting:
 
 @dataclass(frozen=True, slots=True)
 class Observation:
-    """What one render of a page showed, reported before the page is compared."""
+    """What one render of a page showed, reported before the page is compared.
+
+    ``read`` is False for a render that did not show the page itself (a 2xx challenge, a
+    blank page): it does not count as a moment the page was seen without the token.
+    """
 
     page_url: str
     seen_at: float  # when the page content was read (epoch seconds)
@@ -39,8 +42,6 @@ class Observation:
     results: tuple[ValidationResult, ...]
     # when the render began: what the page shows is from between this and ``seen_at``
     started_at: float | None = None
-    # False for a render that did not show the page itself (a 2xx challenge, a blank page):
-    # the next appearance window does not open at it
     read: bool = True
 
 

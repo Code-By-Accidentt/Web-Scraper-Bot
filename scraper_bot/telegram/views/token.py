@@ -10,12 +10,13 @@ from scraper_bot.telegram.markup import code, escape, link
 from scraper_bot.telegram.timefmt import format_duration, format_precise, format_utc_offset
 
 NO_PAIR_YET = "No DEX pair listed yet."
-# Every RPC node keeps at least this much transaction history (seconds). The oldest
-# transaction a public node still has may be days younger than the token itself.
+# Seconds of history every RPC node keeps; past that, the oldest transaction a node still
+# has may be days younger than the token, so the age is only a lower bound.
 _HISTORY_SURELY_KEPT = 3600.0
 
 
 def _short(value: float) -> str:
+    """Return ``value`` with 2, 1 or 0 decimals by its size, without trailing zeros."""
     if abs(value) >= 100:
         text = f"{value:.0f}"
     elif abs(value) >= 10:
@@ -26,7 +27,7 @@ def _short(value: float) -> str:
 
 
 def format_amount(value: float) -> str:
-    """``1.23K``, ``12.4M``, ``5B``; plain numbers below a thousand."""
+    """Return a short amount like ``1.23K``, ``12.4M`` or ``5B``; plain below a thousand."""
     for unit, threshold in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
         if abs(value) >= threshold:
             return f"{_short(value / threshold)}{unit}"
@@ -34,6 +35,7 @@ def format_amount(value: float) -> str:
 
 
 def format_usd(value: float) -> str:
+    """Return a dollar amount such as ``$1.2M``, ``$3.50`` or ``$0.00042``."""
     if value >= 1000:
         return f"${format_amount(value)}"
     if value >= 1:
@@ -44,7 +46,7 @@ def format_usd(value: float) -> str:
 
 
 def found_line(contract: ConfirmedContract, sighting: Sighting | None) -> str | None:
-    """Where on the page the address stood and what stood in front of it."""
+    """Return where on the page the address stood and the text in front of it, or None."""
     if sighting is None:
         return None
     via = sighting.address != contract.address  # the page showed the token's LP pair
@@ -53,6 +55,7 @@ def found_line(contract: ConfirmedContract, sighting: Sighting | None) -> str | 
 
 
 def timeline_line(timeline: Timeline, sent_at: float) -> str:
+    """Return the timing line of an alert: when the token showed up and when it was sent."""
     when = format_precise
     if timeline.deployed and timeline.on_page_since is not None and timeline.missing_at is not None:
         text = (
@@ -69,12 +72,17 @@ def timeline_line(timeline: Timeline, sent_at: float) -> str:
 
 
 def link_lines(contract: ConfirmedContract, identifier: str | None = None) -> list[str]:
+    """Return the line of explorer and market links, or no line when none are known.
+
+    ``identifier`` stands in for the address in the links (the Sui coin type found
+    behind a bare package id).
+    """
     links = token_links(contract, identifier)
     return ["Links: " + " · ".join(link(label, url) for label, url in links)] if links else []
 
 
 def _risk_lines(info: TokenInfo) -> list[str]:
-    """Solana: what the issuer can still do to holders (a rug needs one of these)."""
+    """Return the Solana lines on what the issuer can still do to holders (mint, freeze)."""
     lines: list[str] = []
     if info.mint_authority is not None and info.freeze_authority is not None:
         kept = [
@@ -93,11 +101,12 @@ def _risk_lines(info: TokenInfo) -> list[str]:
 
 
 def _age_lines(info: TokenInfo, now: float) -> list[str]:
+    """Return the line on how old the token is, or no line when that is unknown."""
     if info.created_at is not None:
         age = max(now - info.created_at, 0.0)
         if age < _HISTORY_SURELY_KEPT:
             return [f"🆕 Created {format_duration(age)} ago"]
-        return [f"Created more than {format_duration(age)} ago"]  # the node may forget
+        return [f"Created more than {format_duration(age)} ago"]
     if info.busy:
         return ["Active token: 1000+ transactions"]
     if info.deployed_within is not None:
@@ -108,7 +117,7 @@ def _age_lines(info: TokenInfo, now: float) -> list[str]:
 
 
 def describe_token(info: TokenInfo, now: float) -> list[str]:
-    """Lines for a token alert; unknown parts are left out."""
+    """Return the detail lines of a token alert; unknown parts are left out."""
     lines: list[str] = []
     if info.coin_type:
         lines.append(f"Coin type: {code(info.coin_type)}")
@@ -128,8 +137,7 @@ def describe_token(info: TokenInfo, now: float) -> list[str]:
     if info.also_on:
         lines.append("Also on: " + ", ".join(escape(name) for name in info.also_on))
     if info.pair_url:
-        # Plain text on purpose: the pair page URL holds the pair's own address, and an
-        # alert must name exactly one token.
+        # No link: the pair URL holds the pair's own address, and an alert names one token.
         market = [escape(f"{info.dex or 'DEX'} {info.pair or ''}".strip())]
         if info.price_usd is not None:
             market.append(f"price {format_usd(info.price_usd)}")

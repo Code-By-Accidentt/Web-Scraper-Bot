@@ -1,4 +1,4 @@
-"""Human readable health report behind the /status command."""
+"""The human-readable health report behind the /status command."""
 
 from __future__ import annotations
 
@@ -17,12 +17,16 @@ from scraper_bot.telegram.timefmt import format_clock, format_duration, format_s
 
 
 class BrowserHealth(Protocol):
+    """What the status report needs to know about the browser."""
+
     @property
-    def is_connected(self) -> bool: ...
+    def is_connected(self) -> bool:
+        """True while the browser is running and connected."""
+        ...
 
 
 class StatusReporter:
-    """Collects uptime, browser state, per-site round timing, turbo sessions and caches."""
+    """Builds the /status text: uptime, browser, RPC, sites, turbo sessions and caches."""
 
     def __init__(
         self,
@@ -36,17 +40,22 @@ class StatusReporter:
         rpc_health: Callable[[], list[FailingEndpoint]] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Keep the parts the report reads; optional parts left out are not shown.
+
+        Uptime counts from this moment.
+        """
         self._version = version
         self._manager = manager
         self._cache = cache
         self._browser = browser
         self._turbo = turbo
         self._pending = pending
-        self._rpc_health = rpc_health  # endpoints that stopped answering
+        self._rpc_health = rpc_health  # returns the endpoints that stopped answering
         self._clock = clock
         self._started_at = clock()
 
     def render(self) -> str:
+        """Return the /status text."""
         now = self._clock()
         sites = self._manager.sites()
         running = sum(1 for site in sites if self._manager.is_running(site.url))
@@ -93,6 +102,7 @@ class StatusReporter:
         return "\n".join(lines)
 
     def _describe(self, site: SiteState, now: float) -> str:
+        """Return the state of one site: paused, stopped, starting, or its last round."""
         if site.paused:
             return "paused"
         if not self._manager.is_running(site.url):

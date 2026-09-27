@@ -1,4 +1,4 @@
-"""Receiving commands from Telegram."""
+"""Receives commands from Telegram."""
 
 from __future__ import annotations
 
@@ -27,19 +27,23 @@ class TelegramListener:
         poll_timeout: int = 30,
         error_backoff: float = 5.0,
     ) -> None:
+        """Set the long-poll timeout and the pause after a failed poll, both in seconds."""
         self._telegram = telegram
         self._commands = commands
         self._poll_timeout = poll_timeout
         self._error_backoff = error_backoff
 
     async def run(self) -> None:
+        """Poll for updates forever and hand each one to the commands.
+
+        While the bot's own name is unknown (the getMe at start may have failed), getMe is
+        retried every minute: commands for another bot are told apart by that name.
+        """
         log.info("Telegram listener started")
         offset: int | None = None
         profile_due = 0.0
         while True:
             if self._telegram.username is None and time.monotonic() >= profile_due:
-                # Commands addressed to another bot are told apart by our own name; the
-                # getMe at the start may have failed.
                 profile_due = time.monotonic() + _PROFILE_RETRY
                 with contextlib.suppress(Exception):
                     await self._telegram.get_me()

@@ -26,31 +26,35 @@ MonitorFactory = Callable[[SiteState, PersistCallback, AutoPauseCallback], SiteM
 
 
 class MonitorError(Exception):
-    """Base class for errors that a command turns into a reply (see ``BotCommands``)."""
+    """Base of the site errors that a command turns into a reply (see ``BotCommands``)."""
 
     def __init__(self, url: str) -> None:
+        """Keep the URL of the site the error is about."""
         super().__init__(url)
         self.url = url
 
 
 class SiteAlreadyTracked(MonitorError):
-    pass
+    """The site is already monitored."""
 
 
 class SiteNotTracked(MonitorError):
-    pass
+    """No monitored site matches the URL."""
 
 
 class SiteAlreadyPaused(MonitorError):
-    pass
+    """The site is already paused."""
 
 
 class SiteNotPaused(MonitorError):
-    pass
+    """The site is running, not paused."""
 
 
 class MonitorManager:
-    """Owns the site registry and one asyncio task per running monitor."""
+    """Owns the site list and one asyncio task per running monitor.
+
+    Every change to the list is saved to state.json at once.
+    """
 
     def __init__(
         self,
@@ -64,6 +68,11 @@ class MonitorManager:
         notifier: Notifier | None = None,
         on_removed: Callable[[str], None] | None = None,
     ) -> None:
+        """Set up the manager; :meth:`start` loads the sites and starts their monitors.
+
+        ``restart_delay`` is how long a crashed monitor waits before it restarts (0: never),
+        and ``on_removed`` is called with the URL of every removed site.
+        """
         self._state_store = state_store
         self._snapshot_store = snapshot_store
         self._deriver = deriver
@@ -76,16 +85,19 @@ class MonitorManager:
         self._monitors: dict[str, SiteMonitor] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._restart_timers: set[asyncio.TimerHandle] = set()
-        self._closing = False  # shutting down: no monitor starts any more
+        self._closing = False
         # state.json is damaged and could not be set aside: saving would overwrite it.
         self._frozen = False
 
-    # ── lifecycle ───────────────────────────────────────────────────────────
     async def start(self) -> None:
+        """Load the sites and start the monitors of those that are not paused.
+
+        A damaged state.json is reported to the user. The files of version 1 are imported
+        only when there is no site list at all.
+        """
         self._sites = self._state_store.load()
         broken = self._state_store.broken
-        # While a damaged copy waits for repair, its sites may come back: their snapshots
-        # stay, and the files of version 1 are not imported in their place.
+        # A damaged copy may still be repaired: keep its snapshots, import no version-1 files.
         repairing = bool(self._state_store.broken_copies())
         if broken is not None:
             problem, moved_to = broken
@@ -116,6 +128,7 @@ class MonitorManager:
         log.info("%d site(s) loaded, %d running", len(self._sites), len(self._tasks))
 
     async def shutdown(self) -> None:
+        """Stop every monitor and cancel pending restarts; nothing starts afterwards."""
         self._closing = True
         for timer in self._restart_timers:
             timer.cancel()
@@ -123,7 +136,11 @@ class MonitorManager:
         await asyncio.gather(*(self._stop_monitor(url) for url in list(self._tasks)))
 
     def persist(self) -> None:
-        """Save the site list; a failed write is reported and retried by the next change."""
+        """Save the site list to state.json.
+
+        A failed write is reported to the user and tried again on the next change. Nothing
+        is saved while a damaged state.json is still in place.
+        """
         if self._frozen:
             log.error("the site list is not saved: state.json is damaged and still in place")
             return
@@ -140,15 +157,17 @@ class MonitorManager:
                     "another program keeps the file open.",
                 )
 
-    # ── queries ─────────────────────────────────────────────────────────────
     def sites(self) -> list[SiteState]:
+        """Return every site, sorted by URL."""
         return sorted(self._sites.values(), key=lambda site: site.url)
 
     def is_running(self, url: str) -> bool:
+        """Return True when the site's monitor task is running."""
         task = self._tasks.get(url)
         return task is not None and not task.done()
 
     def is_paused(self, url: str) -> bool:
+        """Return True when the site is monitored and paused."""
         site = self._sites.get(url)
         return site is not None and site.paused
 
@@ -158,14 +177,15 @@ class MonitorManager:
         return self._restart_delay
 
     def is_tracked(self, url: str) -> bool:
+        """Return True when ``url`` is the key of a monitored site."""
         return url in self._sites
 
     def resolve(self, raw_url: str) -> str:
-        """The key of the monitored site ``raw_url`` names; :class:`SiteNotTracked` if none."""
+        """Return the key of the monitored site ``raw_url`` names; raise SiteNotTracked if none."""
         return self._resolve(raw_url)
 
     def sharing_pages(self, url: str) -> list[str]:
-        """The other sites whose monitors also render one of the pages of ``url``."""
+        """Return the other sites whose monitors also render one of the pages of ``url``."""
         pages = set(self._deriver.pages(url))
         return sorted(
             other
@@ -174,11 +194,16 @@ class MonitorManager:
         )
 
     def stats(self, url: str) -> MonitorStats | None:
+        """Return the counters of the site's monitor, or None when it has no monitor."""
         monitor = self._monitors.get(url)
         return monitor.stats if monitor is not None else None
 
-    # ── commands ────────────────────────────────────────────────────────────
     async def add_site(self, raw_url: str) -> SiteState:
+        """Add a site, save the list and start its monitor.
+
+        Raises SiteAlreadyTracked for a site already monitored and InvalidUrlError for a bad
+        URL.
+        """
         url = normalize_url(raw_url)
         if url in self._sites:
             raise SiteAlreadyTracked(url)
@@ -189,10 +214,13 @@ class MonitorManager:
         return site
 
     async def remove_site(self, raw_url: str) -> SiteState:
+        """Stop and forget a site, delete its page snapshots and return it.
+
+        Snapshots of pages that another site renders too are kept.
+        """
         url = self._resolve(raw_url)
         site = self._sites.pop(url)
         await self._stop_monitor(url)
-        # Pages another site renders too keep their snapshots.
         still_used = {page for other in self._sites for page in self._deriver.pages(other)}
         self._snapshot_store.delete_many(
             page for page in self._deriver.pages(url) if page not in still_used
@@ -203,6 +231,7 @@ class MonitorManager:
         return site
 
     async def pause_site(self, raw_url: str) -> SiteState:
+        """Pause a site and stop its monitor; raise SiteAlreadyPaused if it is paused."""
         url = self._resolve(raw_url)
         site = self._sites[url]
         if site.paused:
@@ -213,10 +242,11 @@ class MonitorManager:
         return site
 
     async def resume_site(self, raw_url: str) -> tuple[SiteState, bool]:
-        """Resume a paused site; ``True`` second when it was STOPPED and got a new monitor.
+        """Resume a paused site and start its monitor; return the site and a flag.
 
-        A site that is neither paused nor running lost its monitor to a crash the automatic
-        restart did not cure; resuming it starts a fresh one.
+        The flag is True when the site was not paused but had lost its monitor to a crash
+        the automatic restart did not cure; a fresh monitor starts then. A running site
+        raises SiteNotPaused.
         """
         url = self._resolve(raw_url)
         site = self._sites[url]
@@ -232,6 +262,7 @@ class MonitorManager:
         return site, False
 
     def set_notifications(self, raw_url: str, enabled: bool) -> SiteState:
+        """Turn the change notifications of a site on or off, and save."""
         url = self._resolve(raw_url)
         site = self._sites[url]
         site.notifications_enabled = enabled
@@ -239,7 +270,7 @@ class MonitorManager:
         return site
 
     def set_unverified(self, raw_url: str, enabled: bool) -> SiteState:
-        """Switch the report-first mode of a site; picked up by its monitor on the next round."""
+        """Turn the report-first mode of a site on or off; its monitor sees it next round."""
         url = self._resolve(raw_url)
         site = self._sites[url]
         site.unverified_enabled = enabled
@@ -247,7 +278,11 @@ class MonitorManager:
         return site
 
     async def auto_pause(self, url: str, page_url: str) -> None:
-        """Invoked by a monitor from inside its own task, so it never awaits that task."""
+        """Pause a site whose page listed too many new tokens at once, and save.
+
+        A monitor calls this from inside its own task, so it only asks the monitor to stop
+        and never waits for it.
+        """
         site = self._sites.get(url)
         if site is None or site.paused:
             return
@@ -276,6 +311,7 @@ class MonitorManager:
             self.persist()
 
     def _import_legacy(self) -> None:
+        """Take the sites from the version-1 state files, if there are any, and save them."""
         if self._legacy_importer is None or not self._legacy_importer.has_data():
             return
         self._sites = self._legacy_importer.sites()
@@ -284,12 +320,13 @@ class MonitorManager:
             log.info("imported %d site(s) from the legacy state files", len(self._sites))
 
     def _resolve(self, raw_url: str) -> str:
+        """Return the key of the monitored site ``raw_url`` names, or raise SiteNotTracked."""
         try:
             url = normalize_url(raw_url)
         except InvalidUrlError as exc:
             raise SiteNotTracked(raw_url) from exc
         if url not in self._sites and "#" in url:
-            # Before 2.1.1 a route was dropped: "/add app.io/#/presale" stored app.io.
+            # Before 2.1.1 "/add app.io/#/presale" stored app.io: match that key too.
             parts = urlsplit(url)
             path = parts.path if parts.path not in {"", "/"} else ""
             url = urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
@@ -298,6 +335,7 @@ class MonitorManager:
         return url
 
     def _start_monitor(self, site: SiteState) -> None:
+        """Create the site's monitor and run it as a task, unless it runs or the bot stops."""
         if self._closing or self.is_running(site.url):
             return
         monitor = self._monitor_factory(site, self.persist, self.auto_pause)
@@ -307,17 +345,22 @@ class MonitorManager:
         self._tasks[site.url] = task
 
     async def _stop_monitor(self, url: str) -> None:
+        """Ask the site's monitor to stop, cancel its task and wait until it ends."""
         monitor = self._monitors.pop(url, None)
         task = self._tasks.pop(url, None)
         if monitor is not None:
             monitor.request_stop()
         if task is not None and not task.done():
             task.cancel()
-            # asyncio.wait, not `await task`: a suppressed CancelledError would also
-            # swallow the cancellation of the caller (e.g. Ctrl-C during /remove).
+            # asyncio.wait, not `await task`: suppressing its CancelledError would hide ours too.
             await asyncio.wait({task})
 
     def _on_monitor_done(self, url: str, task: asyncio.Task[None]) -> None:
+        """Forget a finished monitor task, then restart or report it.
+
+        A monitor that stopped itself (auto-pause) gets a fresh one if /resume came
+        meanwhile. A crashed one restarts after ``restart_delay`` and the user is told.
+        """
         if self._tasks.get(url) is task:
             del self._tasks[url]
             self._monitors.pop(url, None)
@@ -325,8 +368,6 @@ class MonitorManager:
             return
         error = task.exception()
         if error is None:
-            # The monitor stopped itself (auto-pause) while finishing its round. If
-            # /resume cleared the pause flag meanwhile, the site needs a fresh monitor.
             self._restart(url)
             return
         log.error("monitor for %s crashed: %r", url, error, exc_info=error)
@@ -347,9 +388,11 @@ class MonitorManager:
             )
 
     def _restart_later(self, url: str) -> None:
+        """Restart the site's monitor after ``restart_delay`` seconds; shutdown cancels it."""
         loop = asyncio.get_running_loop()
 
         def fire() -> None:
+            """Forget the timer and restart the monitor."""
             self._restart_timers.discard(timer)
             self._restart(url)
 
@@ -357,6 +400,7 @@ class MonitorManager:
         self._restart_timers.add(timer)
 
     def _restart(self, url: str) -> None:
+        """Start the site's monitor again if it is still monitored, not paused and not running."""
         site = self._sites.get(url)
         if self._closing or site is None or site.paused or self.is_running(url):
             return

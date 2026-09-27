@@ -1,11 +1,8 @@
 """One alert per token, however many pages, renders and modes find it at the same moment.
 
-Concurrent checks of one address share a single lookup, so every page, turbo session and
-the pending watch receive CONFIRMED for it at once. The first to claim the token announces
-it; the others stay silent. A claim also writes the token to the known cache
-(``known_contracts.txt``), which does the same job across restarts: a token becomes
-"known" only when an alert for it is on its way, so a check whose caller was cancelled
-(``/pause``, a shutdown) cannot hide a token that nobody announced.
+Pages, turbo sessions and the pending watch may confirm the same token at once; the first
+to claim it sends the alert and the others stay silent. Only a claim marks a token as known
+in the cache, so a check cancelled by /pause or a shutdown cannot hide an unannounced token.
 """
 
 from __future__ import annotations
@@ -18,20 +15,27 @@ _REMEMBERED = 10_000
 
 
 class AlertRegistry:
-    """Tokens announced by this process; a claim is made right before sending."""
+    """Remembers the tokens this process announced, so each one gets a single alert.
+
+    Callers claim a token right before they send its alert. Only the latest ``limit``
+    claims stay in memory; the known cache remembers the tokens across restarts.
+    """
 
     def __init__(self, cache: AddressCache | None = None, limit: int = _REMEMBERED) -> None:
+        """Record claimed tokens in ``cache`` (if given) and remember at most ``limit``."""
         self._cache = cache
         self._limit = limit
         self._claimed: dict[str, None] = {}
 
     def claim(self, contract: ConfirmedContract) -> bool:
-        """True for the first claim of the token: that caller sends the alert."""
+        """Claim a token and return True if it is the first claim: that caller sends the alert.
+
+        Every claim also adds the address to the known cache.
+        """
         key = self._key(contract.address)
         if key in self._claimed:
             if self._cache is not None:
-                # A Sui coin type and its bare package are one token but two addresses:
-                # both must be known, or the other one is checked (and claimed) again later.
+                # A Sui coin type and its package are one token but two addresses: record both.
                 self._cache.add_known(contract)
             return False
         if len(self._claimed) >= self._limit:
@@ -43,8 +47,11 @@ class AlertRegistry:
 
     @staticmethod
     def _key(address: Address) -> str:
+        """Return the registry key of an address: one key per token.
+
+        A Sui coin type and its package share a key, and EVM addresses ignore case.
+        """
         if address.chain is Chain.SUI:
-            # A coin type and its bare package are one token.
             return f"Sui:{sui_package(address.value)}"
         if address.chain is Chain.ETHEREUM:
             return f"EVM:{address.value.lower()}"

@@ -1,4 +1,4 @@
-"""Wiring every part of the bot together and running it."""
+"""Wires every part of the bot together and runs it."""
 
 from __future__ import annotations
 
@@ -57,8 +57,8 @@ HEARTBEAT_FILE = "heartbeat"
 PENDING_FILE = "pending.json"  # addresses watched until they become a token
 IGNORE_FILE = "ignore.txt"  # the operator's own stop-list, one address per line
 NETWORKS_FILE = "evm_networks.txt"  # the EVM networks the caches were built with
-SHUTDOWN_STEP = 8.0  # seconds each shutdown step that may talk to Telegram gets
-RPC_STATUS_AFTER = 60.0  # /status names an RPC endpoint failing at least this long
+SHUTDOWN_STEP = 8.0  # seconds for each shutdown step that may talk to Telegram
+RPC_STATUS_AFTER = 60.0  # seconds an RPC endpoint must fail before /status names it
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -69,7 +69,10 @@ class Browser(PageFetcher, BrowserHealth, Protocol):
 
 @dataclass(slots=True)
 class Runtime:
-    """The wired bot. :class:`Application` serves it; tests drive its parts directly."""
+    """The wired bot, ready to serve.
+
+    :class:`Application` serves it; tests drive its parts directly.
+    """
 
     manager: MonitorManager
     turbo: TurboManager
@@ -80,11 +83,12 @@ class Runtime:
     validator: ContractValidator
     warmer: ConnectionWarmer
     pending: PendingWatch
-    # Called once the start went through: remembers the EVM networks the caches now match.
+    # runs once the start went through: saves the EVM networks the caches now match
     started_hook: Callable[[], None] | None = None
     _pending_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     async def start(self) -> None:
+        """Start the monitors and the pending watch, then tell the chat the bot is up."""
         self.pending.load()
         await self.manager.start()
         self._pending_task = asyncio.create_task(self.pending.run(), name="pending-watch")
@@ -98,7 +102,8 @@ class Runtime:
     async def serve(self) -> None:
         """Start the monitors, then poll Telegram, write heartbeats and keep RPC warm.
 
-        Whatever stops it, even a SIGTERM during the start, ends in :meth:`shutdown`.
+        An RPC endpoint that serves the wrong chain is reported first. Whatever stops the
+        bot, even a SIGTERM during the start, ends in :meth:`shutdown`.
         """
         tasks: list[asyncio.Task[None]] = []
         try:
@@ -125,10 +130,10 @@ class Runtime:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        """Stop everything within the supervisor's grace period (``STOP_GRACE``, rebooter.py).
+        """Stop everything within the supervisor's grace period (``STOP_GRACE`` in rebooter.py).
 
-        The pending watch is saved first, so a slow Telegram cannot cost it; every step
-        that talks to Telegram gets a bounded time.
+        The pending watch is saved first, so a slow Telegram cannot lose it. Each step that
+        talks to Telegram gets ``SHUTDOWN_STEP`` seconds; alerts already on their way still go out.
         """
         self.pending.save()
         for name, step in (
@@ -145,7 +150,7 @@ class Runtime:
             await asyncio.gather(self._pending_task, return_exceptions=True)
             self._pending_task = None
         self.pending.save()
-        await self.notifier.drain()  # alerts already on their way still go out
+        await self.notifier.drain()
         await self.validator.aclose()
 
 
@@ -161,10 +166,10 @@ def build_runtime(
     sleep: Sleep | None = None,
     probe_http: httpx.AsyncClient | None = None,
 ) -> Runtime:
-    """Wire monitoring, turbo and commands around the given adapters.
+    """Build the whole bot around the given clients and browser, and return it unstarted.
 
-    ``sleep`` replaces the pauses between monitor rounds and turbo cycles (tests).
-    ``probe_http`` serves the sub-page probes (default: ``http``); in production it is a
+    Tests pass ``sleep`` to replace the pauses between monitor rounds and turbo cycles.
+    ``probe_http`` (default ``http``) checks which sub-pages exist; production gives it a
     plain HTTP/1.1 client, so an HTTP/2 glitch never makes a live page look absent.
     """
     cfg = settings
@@ -210,10 +215,8 @@ def build_runtime(
     )
     prober = HttpProber(probe_http or http)
     deriver = SubUrlDeriver(cfg.sub_url_patterns)
-    # One token, one alert, shared by every site and mode; a claim records it as known.
+    # One registry for every site and mode, so each token alerts only once.
     registry = AlertRegistry(cache)
-    # Addresses that may still become a token; the manager (built below) says which
-    # sites are paused.
     pending = PendingWatch(
         http,
         cfg,
@@ -222,23 +225,22 @@ def build_runtime(
         notifier=notifier,
         path=cfg.data_dir / PENDING_FILE,
         turbo_interval=lambda: prefs.turbo_recheck_interval,
-        # A site only in turbo (never added) keeps its addresses watched after the session:
-        # the launch may come later. /remove ends a site's session and forgets its addresses.
+        # manager is built below. A turbo-only site is never paused: its launch may come later.
         is_paused=lambda url: manager.is_paused(url),
         sleep=sleep or asyncio.sleep,
         health=validator.record,
         new_networks=added,
-        # A network switched off and on again: its absences from before are stale. (On the
-        # first start with no networks file every network counts as new, but the absences
-        # 2.1 saw on its networks are real.)
+        # A re-enabled network's old absences are stale. With no networks file yet every
+        # network counts as added, but the absences an earlier release recorded are real.
         stale_absences=added if networks_known else frozenset(),
     )
-    # A token Arc or Robinhood Chain reports after its verdict is confirmed at the next tick.
+    # A token that Arc or Robinhood Chain reports too late is confirmed at the next tick.
     validator.on_late_token = pending.hurry
 
     def build_monitor(
         site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
     ) -> SiteMonitor:
+        """Build the monitor of one site, with its own unverified-mode watcher."""
         watcher = UnverifiedWatcher(
             site,
             validator=validator,
@@ -267,6 +269,7 @@ def build_runtime(
     def build_turbo(
         url: str, pages: list[str], duration: float, limits: LimitsSource
     ) -> TurboSession:
+        """Build a turbo session that renders ``pages`` of ``url`` for ``duration`` seconds."""
         return TurboSession(
             url,
             pages,
@@ -333,10 +336,10 @@ def build_runtime(
 
 
 def added_networks(path: Path, current: Sequence[str], *, existing_data: bool) -> frozenset[str]:
-    """EVM networks the saved verdicts were not made with.
+    """Return the EVM networks the saved verdicts were not made with.
 
-    Without the file (the first start of this version) every network counts as new when
-    there is data from an earlier run, and none on a fresh install.
+    Without the file (the first start of this version) every network counts as new when an
+    earlier run left data, and none on a fresh install. An unreadable file makes all new.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -349,11 +352,13 @@ def added_networks(path: Path, current: Sequence[str], *, existing_data: bool) -
 
 
 def remember_networks(path: Path, current: Sequence[str]) -> None:
+    """Save the names of the current EVM networks to ``path``; a failed write is ignored."""
     with contextlib.suppress(OSError):
         atomic_write_text(path, "".join(f"{name}\n" for name in sorted(current)))
 
 
 def _has_data(settings: Settings) -> bool:
+    """Return True when an earlier run left address data in the data directory."""
     data = settings.data_dir
     return any(
         (data / name).is_file()
@@ -362,7 +367,7 @@ def _has_data(settings: Settings) -> bool:
 
 
 def _log_crash(task: asyncio.Task[None]) -> None:
-    """A background loop that should never end did: make it visible in the log."""
+    """Log the error of a background task that crashed; such loops should never end."""
     if not task.cancelled() and task.exception() is not None:
         log.error("%s stopped: %r", task.get_name(), task.exception(), exc_info=task.exception())
 
@@ -370,6 +375,10 @@ def _log_crash(task: asyncio.Task[None]) -> None:
 def _load_address_cache(
     settings: Settings, prefs: Preferences, legacy: LegacyStateImporter
 ) -> AddressCache:
+    """Load the address cache from the data directory and return it.
+
+    On the very first run the known contracts of the old bot (found_wallets.txt) are imported.
+    """
     known_path = settings.data_dir / "known_contracts.txt"
     first_run = not known_path.exists()
     cache = AddressCache(

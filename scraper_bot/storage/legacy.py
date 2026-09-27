@@ -23,12 +23,18 @@ class LegacyStateImporter:
     WALLETS_FILE = "found_wallets.txt"
 
     def __init__(self, directory: Path) -> None:
+        """Look for the version 1 files in ``directory``."""
         self._dir = directory
 
     def has_data(self) -> bool:
+        """Return True when a version 1 site list or wallet list is there."""
         return (self._dir / self.SITES_FILE).is_file() or (self._dir / self.WALLETS_FILE).is_file()
 
     def sites(self) -> dict[str, SiteState]:
+        """Return the version 1 sites with their notification flags, keyed by normalised URL.
+
+        Lines that are not valid URLs are logged and skipped.
+        """
         path = self._dir / self.SITES_FILE
         if not path.is_file():
             return {}
@@ -48,6 +54,7 @@ class LegacyStateImporter:
         return sites
 
     def known_addresses(self) -> list[Address]:
+        """Return the addresses listed in found_wallets.txt, skipping lines that are not one."""
         path = self._dir / self.WALLETS_FILE
         if not path.is_file():
             return []
@@ -64,6 +71,7 @@ class LegacyStateImporter:
 
     @staticmethod
     def _load_json(path: Path) -> dict[str, Any]:
+        """Return the JSON object in a file, or an empty dict when it is missing or unreadable."""
         if not path.is_file():
             return {}
         try:

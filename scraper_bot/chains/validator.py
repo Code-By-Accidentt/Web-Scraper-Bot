@@ -29,11 +29,9 @@ log = logging.getLogger(__name__)
 
 
 _MAX_PAIRS = 10_000  # LP pairs remembered with the tokens they hold
-# An endpoint must fail this long (seconds) before the user hears about it.
-_PROBLEM_AFTER = 300.0
-_MAX_PARTIAL = 20_000  # addresses remembered as rejected without an optional network's answer
-# Re-checks of such rejections run in the background, this many at once: the page that
-# shows the address never waits for them, and new addresses never queue behind them.
+_PROBLEM_AFTER = 300.0  # seconds an endpoint must fail before the user hears about it
+_MAX_PARTIAL = 20_000  # entries kept in _partial, and in _retry_after
+# A limit of their own, so new addresses never queue behind re-checks of partial rejections.
 _RECHECKS_AT_ONCE = 2
 
 
@@ -41,13 +39,17 @@ _RECHECKS_AT_ONCE = 2
 class _Partial:
     """A rejection made without the answer of some optional networks."""
 
-    due: float  # when those networks are asked again
+    due: float  # clock time when the missing networks are asked again
     missing: frozenset[str]
     kind: AddressKind  # what the networks that answered said
 
 
 class ContractValidator:
-    """Validates addresses once, remembers verdicts and merges concurrent checks."""
+    """Validates addresses once, remembers verdicts and merges concurrent checks.
+
+    A rejection made without an optional network's answer is not cached as final: that
+    network alone is asked again later.
+    """
 
     def __init__(
         self,
@@ -61,6 +63,11 @@ class ContractValidator:
         clock: Callable[[], float] = time.monotonic,
         on_stuck: StuckReporter | None = None,
     ) -> None:
+        """Tie the chain validators to the address cache and hook into late EVM answers.
+
+        At most ``max_concurrent`` regular checks run at once. An address without a verdict
+        is asked again after ``retry_delay`` seconds. ``on_stuck`` hears of long outages.
+        """
         self._evm = evm
         self._solana = solana
         self._sui = sui
@@ -75,8 +82,7 @@ class ContractValidator:
         self._retry_after: dict[Address, float] = {}
         # Rejected without an optional network's answer: that network alone is asked again.
         self._partial: dict[Address, _Partial] = {}
-        # Told when an optional network found a token too late for its verdict (the pending
-        # watch confirms it at once instead of at its next look).
+        # Called with (address, network) when an optional network finds a token late.
         self.on_late_token: Callable[[Address, str], None] | None = None
         evm.on_late = self._late_answer
         self._inflight: dict[
@@ -93,11 +99,12 @@ class ContractValidator:
         networks: Collection[str] | None = None,
         urgent: bool = False,
     ) -> list[ValidationResult]:
-        """Verdicts in input order, then (``follow_pairs``) the tokens behind LP pairs.
+        """Check several addresses and return one result per address.
 
-        A page often shows only a chart link, i.e. the pair's address; its tokens are
-        checked like any other candidate and come back with ``via`` set to the pair.
-        ``networks`` and ``urgent`` apply to the given addresses (see :meth:`validate`).
+        Results come in the same order as the input. With ``follow_pairs`` the tokens held by
+        any LP pair are checked too and added at the end with ``via`` set to the pair: a page
+        often shows only a chart link, i.e. the pair's address. ``networks`` and ``urgent``
+        apply only to the given addresses (see :meth:`validate`).
         """
         batch = list(addresses)
         results = await self._each(
@@ -126,7 +133,11 @@ class ContractValidator:
         networks: Collection[str] | None,
         urgent: bool,
     ) -> list[ValidationResult]:
-        """One verdict per address; an unexpected error costs only its own address."""
+        """Validate the addresses together and return one result each, in input order.
+
+        An unexpected error makes only its own address UNAVAILABLE; a cancellation (shutdown)
+        is raised.
+        """
         outcomes = await asyncio.gather(
             *(
                 self.validate(a, negative_cache=negative_cache, networks=networks, urgent=urgent)
@@ -137,7 +148,7 @@ class ContractValidator:
         results: list[ValidationResult] = []
         for address, outcome in zip(addresses, outcomes, strict=True):
             if isinstance(outcome, asyncio.CancelledError):
-                raise outcome  # the checks were stopped (shutdown)
+                raise outcome
             if isinstance(outcome, BaseException):
                 log.error(
                     "checking %s %s failed: %r",
@@ -158,13 +169,13 @@ class ContractValidator:
         networks: Collection[str] | None = None,
         urgent: bool = False,
     ) -> ValidationResult:
-        """Verdict for ``address``.
+        """Return the verdict for ``address``, from the caches when they know it.
 
         With ``negative_cache=False`` (turbo, /unverified and the pending watch) earlier
-        rejections and RPC failures are ignored and a new rejection is not remembered, so
-        an address published before its contract is deployed can be re-checked freely.
-        ``networks`` asks only those EVM networks; ``urgent`` skips the queue of
-        ``max_concurrent`` checks (the pending watch confirming a deployment it just saw).
+        rejections and RPC failures are ignored and a new rejection is not remembered, so an
+        address published before its contract is deployed can be re-checked freely.
+        ``networks`` asks only those EVM networks; ``urgent`` skips the ``max_concurrent``
+        queue (the pending watch confirming a deployment it just saw).
         """
         if self._cache.is_known(address):
             return ValidationResult(address, ValidationStatus.ALREADY_KNOWN)
@@ -190,13 +201,11 @@ class ContractValidator:
                     return ValidationResult(
                         address, ValidationStatus.ALREADY_REJECTED, kind=partial.kind
                     )
-                # An optional network found a token here after the verdict: the lookup
-                # below answers from what it said, at once.
+                # An optional network found a token here late: the lookup below returns it.
                 del self._partial[address]
 
-        # Only checks of the same kind are shared: an urgent one must not wait in the
-        # queue behind a regular one, and a page check must not get a verdict from fewer
-        # networks than it asked.
+        # Share only checks of the same kind: an urgent one must not queue behind a regular
+        # one, and a check must not get a verdict from fewer networks than it asked.
         key = (address, None if networks is None else frozenset(networks), urgent)
         task = self._inflight.get(key)
         if task is None:
@@ -215,12 +224,16 @@ class ContractValidator:
         networks: Collection[str] | None,
         urgent: bool,
     ) -> ValidationResult:
+        """Look the address up on its chain, log the verdict and remember a rejection.
+
+        A token is not written to the known cache here: the alert's claim does that
+        (AlertRegistry), so a caller cancelled meanwhile cannot hide the token.
+        """
         async with contextlib.nullcontext() if urgent else self._semaphore:
             try:
                 verdict = await self._lookup(address, networks)
             except RpcUnavailable as exc:
-                # Endpoint-level failures are logged once by the validators; per address
-                # this is routine, so keep it at INFO.
+                # Routine per address (the validators log the endpoint failure), so INFO.
                 log.info(
                     "%s %s: %s; retry in %.0fs",
                     address.chain.value,
@@ -237,8 +250,6 @@ class ContractValidator:
         chain = address.chain.value
         self._partial.pop(address, None)
         if verdict.kind is AddressKind.TOKEN and verdict.network:
-            # Not written to the known cache here: the alert's claim does that
-            # (AlertRegistry), so a caller cancelled meanwhile cannot hide the token.
             log.info("%s %s confirmed as a token on %s", chain, address, verdict.network)
             return ValidationResult(
                 address, ValidationStatus.CONFIRMED, verdict.network, kind=AddressKind.TOKEN
@@ -259,9 +270,8 @@ class ContractValidator:
         # A decimals-0 mint with nothing minted may still become a token: never cache it.
         if negative_cache and verdict.kind is not AddressKind.NOT_YET_MINTED:
             if verdict.partial:
-                # Without the optional network's answer the rejection is not final: that
-                # network alone is asked again after the retry delay (and at once when it
-                # finds a token late), instead of hiding the address for rejected_ttl.
+                # Not final without the optional network: ask it again later (at once when it
+                # finds a token late) instead of hiding the address for rejected_ttl.
                 self._set_partial(address, verdict.missing, verdict.kind)
             else:
                 self._cache.add_rejected(address)
@@ -287,19 +297,24 @@ class ContractValidator:
         The page showing the address does not wait: a token found now is confirmed from
         this answer at the address's next check, and the pending watch hears of it at once.
         """
-        # Moved on first, so the checks of the address meanwhile start no second one.
+        # Moved on first, so checks of the address meanwhile start no second re-check.
         self._partial[address] = dataclasses.replace(partial, due=self._clock() + self._retry_delay)
         task = asyncio.create_task(self._recheck(address, partial))
         self._rechecks.add(task)
         task.add_done_callback(self._rechecks.discard)
 
     async def _recheck(self, address: Address, partial: _Partial) -> None:
+        """Ask the missing networks again and update or settle the partial rejection.
+
+        A token or pair found now is handled like a late answer. When the networks still do
+        not answer, they are asked again after the retry delay.
+        """
         async with self._recheck_slots:
             try:
                 verdict = await self._evm.find_network(address.value, partial.missing)
             except RpcUnavailable:
                 self._report_stuck_endpoints()
-                return  # still silent (or resting): asked again after the retry delay
+                return
             except Exception:
                 log.exception("re-checking %s %s failed", address.chain.value, address)
                 return
@@ -314,13 +329,16 @@ class ContractValidator:
                 self._settle_partial(address, partial.kind)
 
     def _settle_partial(self, address: Address, kind: AddressKind) -> None:
-        """Every network has answered: a plain rejection now."""
+        """Every network has answered: turn the partial rejection into a cached one."""
         self._partial.pop(address, None)
         if kind is not AddressKind.NOT_YET_MINTED and not self._cache.is_known(address):
             self._cache.add_rejected(address)
 
     def _retry_later(self, address: Address) -> None:
-        """No verdict now: ask again after the retry delay (a bounded memory of such)."""
+        """Answer UNAVAILABLE for ``address`` until the retry delay has passed.
+
+        The memory is bounded: expired entries go first, then the oldest one.
+        """
         if len(self._retry_after) >= _MAX_PARTIAL:
             now = self._clock()
             self._retry_after = {a: t for a, t in self._retry_after.items() if t > now}
@@ -329,16 +347,18 @@ class ContractValidator:
         self._retry_after[address] = self._clock() + self._retry_delay
 
     def _set_partial(self, address: Address, missing: frozenset[str], kind: AddressKind) -> None:
+        """Remember a rejection made without the ``missing`` networks, due after the delay."""
         self._partial.pop(address, None)
         if len(self._partial) >= _MAX_PARTIAL:
             del self._partial[next(iter(self._partial))]
         self._partial[address] = _Partial(self._clock() + self._retry_delay, missing, kind)
 
     def _late_answer(self, value: str, network: str, verdict: ChainVerdict) -> None:
-        """An optional network answered after its lookup.
+        """Handle an answer an optional network gave after its lookup had finished.
 
-        A token there is looked at again at once (the next look answers from what it said);
-        "nothing here" completes a rejection that was made without it.
+        A token or pair makes the address due at once (the next lookup answers from it) and
+        is reported to ``on_late_token``; "nothing here" completes a rejection made without
+        that network.
         """
         address = Address(Chain.ETHEREUM, value)
         partial = self._partial.get(address)
@@ -358,7 +378,7 @@ class ContractValidator:
             self._settle_partial(address, partial.kind)
 
     def record(self, name: str, error: BaseException | None) -> None:
-        """An answer (``error`` None) or a failure of endpoint ``name`` seen elsewhere.
+        """Record an answer (``error`` is None) or a failure of endpoint ``name`` seen elsewhere.
 
         The warm-up and the pending watch call every endpoint all the time, so an endpoint
         that dies between launches is noticed before the next address needs it.
@@ -370,13 +390,13 @@ class ContractValidator:
         else:
             health = self._evm.health
         if error is None:
-            health.answered(name)  # an outage ends: the next one is reported again
+            health.answered(name)
         else:
             health.failed(name, error)
         self._report_stuck_endpoints()
 
     def failing_endpoints(self, seconds: float = 0.0) -> list[FailingEndpoint]:
-        """Every endpoint failing for ``seconds`` or more right now."""
+        """Return every endpoint that has been failing for ``seconds`` or more."""
         return [
             *self._evm.health.failing(seconds),
             *self._solana.health.failing(seconds),
@@ -384,11 +404,11 @@ class ContractValidator:
         ]
 
     def _report_stuck_endpoints(self) -> None:
-        """One 🛑 per outage: when an endpoint joins those silent for minutes.
+        """Send one 🛑 report per outage, when an endpoint joins those silent for minutes.
 
-        The report lists every endpoint silent for minutes then; an endpoint that answers
-        again ends its outage, so its next one is reported too. Brief hiccups stay in the
-        log. The reporter sends in the background, so this costs a verdict nothing.
+        The report lists every endpoint silent that long. An endpoint that answers again ends
+        its outage, so its next one is reported too; brief hiccups stay in the log. The
+        reporter sends in the background, so this costs a verdict nothing.
         """
         if self._on_stuck is None:
             return
@@ -402,11 +422,16 @@ class ContractValidator:
             self._on_stuck(stuck, self._retry_delay)
 
     def _remember_pair(self, pair: Address, tokens: tuple[Address, ...]) -> None:
+        """Remember the tokens an LP pair holds; beyond ``_MAX_PAIRS`` the oldest pair goes."""
         if len(self._pairs) >= _MAX_PAIRS:
             del self._pairs[next(iter(self._pairs))]
         self._pairs[pair] = tokens
 
     async def _lookup(self, address: Address, networks: Collection[str] | None) -> ChainVerdict:
+        """Ask the validator of the address's chain and return its verdict.
+
+        Solana and Sui name a network only for a token; Sui tells only token or not a token.
+        """
         if address.chain is Chain.ETHEREUM:
             return await self._evm.find_network(address.value, networks)
         if address.chain is Chain.SOLANA:

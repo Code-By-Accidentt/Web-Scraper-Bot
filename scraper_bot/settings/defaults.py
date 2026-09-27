@@ -30,8 +30,7 @@ DEFAULT_IGNORED_ATTRIBUTES: tuple[str, ...] = (
 )
 
 DEFAULT_BLOCKED_RESOURCE_TYPES: tuple[str, ...] = ("image", "media", "font")
-# Without a GPU a 3D scene renders in software and starves the browser: flutch.fun took
-# 33-38 s per page with WebGL and 5.5 s without on a 4-core VPS.
+# No GPU means software WebGL: on a 4-core VPS a page took 33-38 s with it, 5.5 s without.
 DEFAULT_BROWSER_ARGS = "--disable-3d-apis --disable-webgl --disable-webgl2"
 
 
@@ -44,18 +43,17 @@ class ChangedDefault:
     current: str
 
 
-# .env.example spells out every default, so a .env copied from an older release pins the
-# old values. A key still set to a previous default is reported at start-up.
+# A .env copied from an older .env.example pins its old defaults; start-up reports them.
 CHANGED_DEFAULTS: tuple[ChangedDefault, ...] = (
-    # 2.1 ─ api.mainnet-beta answered 60 of 100 parallel getAccountInfo calls with HTTP 429
+    # 2.1: api.mainnet-beta answered 60 of 100 parallel calls with HTTP 429
     ChangedDefault("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", DEFAULT_SOLANA_RPC_URL),
     # a 10-minute pause after one failed check could hide a launch
     ChangedDefault("RPC_RETRY_DELAY", "600", "10"),
     # the pending watch checks a turbo site's addresses every second
     ChangedDefault("TURBO_RECHECK_INTERVAL", "5", "1"),
-    # scripts and JSON of wallet-connect apps carry dozens of infrastructure addresses
+    # wallet-connect scripts carry dozens of infrastructure addresses
     ChangedDefault("DEEP_SCAN", "true", "false"),
-    # 2.0 ─ measured on real sites before the 2.0 merge (docs/development.md)
+    # 2.0: measured on real sites (docs/development.md)
     ChangedDefault("POLL_INTERVAL_MIN", "5", "4"),
     ChangedDefault("POLL_INTERVAL_MAX", "15", "10"),
     ChangedDefault("MAX_CONCURRENT_PAGES", "6", "8"),

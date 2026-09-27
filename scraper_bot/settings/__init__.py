@@ -1,1 +1,1 @@
-"""Settings: from .env at start-up and changed live with /set."""
+"""Settings read from .env at start-up, and the ones /set can change while the bot runs."""

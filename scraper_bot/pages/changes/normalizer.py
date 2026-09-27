@@ -12,8 +12,7 @@ from lxml import html as lxml_html
 
 from scraper_bot.models.pages import Node, Signature
 
-# Subtrees that never carry user-visible content worth comparing. ``canvas`` is a
-# drawing surface whose size is set by JavaScript after load and differs per render.
+# Subtrees with nothing worth comparing; a canvas's size is set by JS and differs per render.
 DROP_TAGS = frozenset(
     {
         "script",
@@ -30,7 +29,6 @@ DROP_TAGS = frozenset(
         "embed",
     }
 )
-# Attributes whose values are URLs and may carry cache-busting or tracking parameters.
 URL_ATTRIBUTES = frozenset({"href", "src", "action", "poster", "data-src", "data-href"})
 TRACKING_PARAMS = frozenset(
     {
@@ -54,16 +52,17 @@ TRACKING_PARAMS = frozenset(
 )
 
 _WS_RE = re.compile(r"\s+")
+# Zero-width spaces and joiners, direction marks, the word joiner and the BOM.
 _INVISIBLE_RE = re.compile(r"[​-‏⁠﻿]")
 # Pages are parsed in worker threads; an lxml parser must not be shared between threads.
 _PARSERS = threading.local()
 
 
 def _parser() -> lxml_html.HTMLParser:
+    """Return this thread's HTML parser, creating it on first use."""
     parser = getattr(_PARSERS, "parser", None)
     if parser is None:
-        # huge_tree: without it libxml2 stops at a text node over 10 MB (an inline bundle)
-        # and silently drops the rest of the page.
+        # huge_tree: without it libxml2 silently drops everything after a text node over 10 MB.
         parser = lxml_html.HTMLParser(
             encoding="utf-8", remove_comments=True, remove_pis=True, huge_tree=True
         )
@@ -72,17 +71,22 @@ def _parser() -> lxml_html.HTMLParser:
 
 
 class HtmlNormalizer:
-    """Builds a :data:`Signature` (ordered nodes) out of raw HTML.
+    """Builds a :data:`Signature` (the page's nodes in order) out of raw HTML.
 
-    Each node holds an element's *own* text, not its descendants', so a leaf change
-    never inflates the diff through every ancestor. Elements with neither attributes
-    nor own text are skipped.
+    Each node holds an element's *own* text, not its descendants', so a leaf change never
+    inflates the diff through every ancestor. Elements with neither attributes nor own text
+    are skipped.
     """
 
     def __init__(self, ignored_attributes: Iterable[str] = ()) -> None:
+        """Leave the attributes named in ``ignored_attributes`` out of every node."""
         self._ignored = frozenset(name.lower() for name in ignored_attributes)
 
     def signature(self, html: str) -> Signature:
+        """Return the page's nodes in document order, or an empty tuple for unparsable HTML.
+
+        The subtrees in :data:`DROP_TAGS` (scripts, styles, frames, ...) are dropped first.
+        """
         root = self._parse(html)
         if root is None:
             return ()
@@ -100,6 +104,7 @@ class HtmlNormalizer:
 
     @staticmethod
     def _parse(html: str) -> lxml_html.HtmlElement | None:
+        """Return the document root, or None when the HTML is empty or cannot be parsed."""
         text = html.replace("\x00", "").strip()
         if not text:
             return None
@@ -109,6 +114,7 @@ class HtmlNormalizer:
             return None
 
     def _node(self, element: lxml_html.HtmlElement) -> Node | None:
+        """Return the node for one element, or None when it has no attributes and no own text."""
         attrs: list[tuple[str, str]] = []
         for name, value in element.attrib.items():
             key = name.lower()
@@ -123,17 +129,20 @@ class HtmlNormalizer:
 
     @classmethod
     def _own_text(cls, element: lxml_html.HtmlElement) -> str:
+        """Return the cleaned text that sits directly in the element, not in its children."""
         pieces = [element.text or ""]
         pieces.extend(child.tail or "" for child in element)
         return cls._clean_text(" ".join(pieces))
 
     @staticmethod
     def _clean_text(text: str) -> str:
+        """Return ``text`` without invisible characters and with whitespace collapsed."""
         text = _INVISIBLE_RE.sub("", text.replace("\xa0", " "))
         return _WS_RE.sub(" ", text).strip()
 
     @classmethod
     def _clean_attribute(cls, key: str, value: str) -> str:
+        """Return a cleaned attribute value: class names sorted, URLs without tracking."""
         value = cls._clean_text(value)
         if key == "class":
             return " ".join(sorted(value.split()))
@@ -143,6 +152,7 @@ class HtmlNormalizer:
 
     @staticmethod
     def _strip_tracking(url: str) -> str:
+        """Return ``url`` without ``utm_*`` and the other tracking or cache-busting parameters."""
         if "?" not in url:
             return url
         try:

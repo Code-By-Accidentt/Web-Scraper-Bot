@@ -1,4 +1,4 @@
-"""One-time Telegram notices about the environment: the browser sandbox and outdated .env values."""
+"""Notices the chat gets once: Chromium without its sandbox, and old defaults left in .env."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from scraper_bot.storage.files import atomic_write_text
 from scraper_bot.telegram.notifier import Notifier
 
 OUTDATED_NOTICE_FILE = "outdated_defaults.txt"  # the old .env values last reported
-SANDBOX_NOTICE_FILE = "no_sandbox_notice.txt"  # the chat heard that Chromium runs unsandboxed
+SANDBOX_NOTICE_FILE = "no_sandbox_notice.txt"  # kept while the chat knows the sandbox is off
 SANDBOX_HINT = (
     "Pages are then isolated only by the bot's own user account. The sandbox does not start "
     "as root or where user namespaces are off (containers, AppArmor on Ubuntu 23.10+): run "
@@ -22,24 +22,31 @@ SANDBOX_HINT = (
 
 
 class SandboxState(Protocol):
-    @property
-    def sandboxed(self) -> bool: ...
+    """What the sandbox notice needs to know about the browser."""
 
     @property
-    def sandbox_error(self) -> str | None: ...
+    def sandboxed(self) -> bool:
+        """True when Chromium runs with its sandbox."""
+        ...
+
+    @property
+    def sandbox_error(self) -> str | None:
+        """Why the sandbox had to be given up, or None if it was not."""
+        ...
 
 
 async def tell_about_sandbox(notifier: Notifier, browser: SandboxState, marker: Path) -> None:
-    """One 🛑 when Chromium had to start without its sandbox, again only after it worked.
+    """Tell the chat once that Chromium had to start without its sandbox.
 
-    ``marker`` notes that the chat heard it; a start with the sandbox removes it.
+    The ``marker`` file records that the chat was told, so restarts stay quiet. A start
+    with the sandbox deletes it, so a later failure is reported again.
     """
     if browser.sandboxed:
         with contextlib.suppress(OSError):
             marker.unlink(missing_ok=True)
         return
     if browser.sandbox_error is None or marker.is_file():
-        return  # switched off in BROWSER_ARGS on purpose, or already reported
+        return  # None: switched off in BROWSER_ARGS on purpose
     if await notifier.problem(
         "sandbox", "Chromium runs without its sandbox", browser.sandbox_error, hint=SANDBOX_HINT
     ):
@@ -48,10 +55,10 @@ async def tell_about_sandbox(notifier: Notifier, browser: SandboxState, marker: 
 
 
 def outdated_notice_due(path: Path, changes: Sequence[ChangedDefault]) -> bool:
-    """True when ``changes`` differ from the set last reported in Telegram.
+    """Return True when ``changes`` differ from the old values last reported in the chat.
 
-    The log warns on every start; the chat hears about one set of old values once, not on
-    every restart the supervisor makes (see :func:`remember_outdated_notice`).
+    The log warns on every start, but the chat hears about one set of old values only
+    once, not after every restart. With no changes the file is deleted and this is False.
     """
     if not changes:
         with contextlib.suppress(OSError):
@@ -64,10 +71,11 @@ def outdated_notice_due(path: Path, changes: Sequence[ChangedDefault]) -> bool:
 
 
 def remember_outdated_notice(path: Path, changes: Sequence[ChangedDefault]) -> None:
-    """Note ``changes`` as reported, once the message went out."""
+    """Record ``changes`` as reported; call it once the message went out."""
     with contextlib.suppress(OSError):
         atomic_write_text(path, _listed(changes))
 
 
 def _listed(changes: Sequence[ChangedDefault]) -> str:
+    """Return the changes as sorted ``KEY=old value`` lines, as the notice file keeps them."""
     return "\n".join(sorted(f"{c.key}={c.previous}" for c in changes)) + "\n"

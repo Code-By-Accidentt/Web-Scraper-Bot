@@ -11,11 +11,14 @@ from scraper_bot.models.pages import ChangeCounts
 
 @dataclass(slots=True)
 class LastChange:
+    """The last change seen on a site: when, on which page and how many elements."""
+
     at: float
     page_url: str
     counts: ChangeCounts
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the change as a plain dict for state.json."""
         return {
             "at": self.at,
             "page_url": self.page_url,
@@ -26,6 +29,7 @@ class LastChange:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LastChange:
+        """Build a change from its state.json dict; missing fields become zero or empty."""
         return cls(
             at=float(data.get("at", 0.0)),
             page_url=str(data.get("page_url", "")),
@@ -37,7 +41,10 @@ class LastChange:
 
 @dataclass(slots=True)
 class SiteState:
-    """Persistent, user-visible state of one monitored root URL."""
+    """The saved, user-visible state of one monitored site, keyed by its root URL.
+
+    ``announced_pages`` are the sub-pages the user has already been told about.
+    """
 
     url: str
     notifications_enabled: bool = True
@@ -52,6 +59,7 @@ class SiteState:
     captcha_pages: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        """Return the site as a plain dict for state.json, without the URL (that is the key)."""
         return {
             "notifications_enabled": self.notifications_enabled,
             "paused": self.paused,
@@ -65,6 +73,10 @@ class SiteState:
 
     @classmethod
     def from_dict(cls, url: str, data: dict[str, Any]) -> SiteState:
+        """Build a site from its state.json entry; missing fields get their defaults.
+
+        A malformed entry raises TypeError or ValueError.
+        """
         if not isinstance(data, dict):
             raise TypeError("a site entry must be an object")
         last = data.get("last_change")

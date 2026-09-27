@@ -9,6 +9,8 @@ import httpx
 
 @dataclass(frozen=True, slots=True)
 class ProbeResult:
+    """The answer to one probe: the HTTP status, or the error that stopped it."""
+
     url: str
     status: int | None
     error: str | None = None
@@ -17,8 +19,8 @@ class ProbeResult:
     def worth_rendering(self) -> bool:
         """False only when the page certainly does not exist.
 
-        DNS or connection failures and 404/410 answers are conclusive. Anything
-        else (403 from a bot shield, 405 for HEAD, 5xx) is left to the browser.
+        Network failures and 404/410 answers are conclusive. Anything else (403 from a bot
+        shield, 405 for HEAD, 5xx) is left to the browser.
         """
         if self.error is not None:
             return False
@@ -26,15 +28,21 @@ class ProbeResult:
 
 
 class HttpProber:
-    """Cheap existence check for derived sub-URLs before spending a browser tab."""
+    """Checks cheaply that a derived sub-URL exists before a browser tab is spent on it."""
 
     _RETRY_WITH_GET = frozenset({404, 405, 410, 501})
     _TIMEOUT = 10.0
 
     def __init__(self, http: httpx.AsyncClient) -> None:
+        """Send every probe through the shared ``http`` client."""
         self._http = http
 
     async def probe(self, url: str) -> ProbeResult:
+        """Ask for ``url`` with HEAD and return the answer.
+
+        Some servers get HEAD wrong, so a 404, 405, 410 or 501 is asked again with a GET whose
+        body is never read. Network errors come back in the result.
+        """
         try:
             response = await self._http.head(url, timeout=self._TIMEOUT, follow_redirects=True)
             status = response.status_code

@@ -1,4 +1,4 @@
-"""Minimal asynchronous Telegram Bot API client (only the calls the bot needs)."""
+"""A small asynchronous Telegram Bot API client with only the calls the bot needs."""
 
 from __future__ import annotations
 
@@ -17,13 +17,12 @@ log = logging.getLogger(__name__)
 
 _API_BASE = "https://api.telegram.org"
 _NO_PREVIEW = '{"is_disabled": true}'
-_SEND_ATTEMPTS = 3  # a rate-limited or unsent message is tried this often
-_MAX_RETRY_AFTER = 10.0  # a longer flood wait is not waited out (replies, most alerts)
-# Token alerts, documents and the auto-pause notice go out from the notifier's own tasks,
-# so they can wait longer: a lost token alert is never sent again (the token is known).
+_SEND_ATTEMPTS = 3
+_MAX_RETRY_AFTER = 10.0  # seconds; a message facing a longer flood wait is dropped
+# Patient sends (token alerts, documents) wait longer: a lost token alert is never resent.
 _PATIENT_ATTEMPTS = 8
 _PATIENT_MAX_RETRY_AFTER = 60.0
-_UNSENT_RETRY_PAUSE = 2.0  # seconds before a request that never reached Telegram is resent
+_UNSENT_RETRY_PAUSE = 2.0  # seconds before resending a request that never reached Telegram
 # A patient send doubles that pause up to this, so it rides out about two minutes offline.
 _PATIENT_MAX_UNSENT_PAUSE = 30.0
 # Transport errors that prove the request never left: sending it again cannot duplicate it.
@@ -37,18 +36,19 @@ class TelegramAuthError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class SentMessage:
-    """A delivered message, as needed to edit it later."""
+    """One delivered message, with what is needed to edit it later."""
 
     chat_id: int
     message_id: int
-    plain: bool = False  # Telegram rejected the HTML, so it went out (and is edited) plain
+    plain: bool = False  # Telegram rejected the HTML, so it went out plain and is edited plain
 
 
 class TelegramClient:
-    """Thin Bot API wrapper that never raises on delivery problems.
+    """Talks to the Bot API and never raises on delivery problems.
 
-    Messages go out as HTML (:mod:`scraper_bot.telegram.markup`); if Telegram rejects the markup
-    the text is re-sent plain, so a formatting slip never swallows an alert.
+    Messages go out as HTML; long ones are split without breaking tags, and flood limits
+    are waited out. If Telegram rejects the markup, the text goes out plain, so a
+    formatting slip never loses an alert.
     """
 
     MAX_MESSAGE_LENGTH = 4096
@@ -60,18 +60,18 @@ class TelegramClient:
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        """Call the API with ``token`` over ``http``; ``sleep`` can be swapped out in tests."""
         self._token = token
         self._base = f"{_API_BASE}/bot{token}"
         self._http = http
         self._sleep = sleep
         self._last_error: str | None = None
-        self.username: str | None = None  # the bot's own @name, once get_me() answered
+        self.username: str | None = None  # the bot's own @name; None until get_me() answers
 
-    # ── outgoing ────────────────────────────────────────────────────────────
     async def send_message(self, chat_id: int, text: str, *, patient: bool = False) -> bool:
-        """Send ``text`` (split into API-sized chunks); True when every chunk went out.
+        """Send ``text``, split into chunks if needed; return True when every chunk went out.
 
-        ``patient`` waits out longer flood limits and retries more (background alerts).
+        A ``patient`` send retries more and waits out longer flood limits (background alerts).
         """
         ok = True
         for chunk in self._chunks(text):
@@ -81,7 +81,11 @@ class TelegramClient:
     async def send_tracked(
         self, chat_id: int, text: str, *, patient: bool = False
     ) -> SentMessage | None:
-        """Send ``text`` and return it for a later edit (``None``: failed or too long to edit)."""
+        """Send ``text`` and return the message, so it can be edited later.
+
+        Return None when sending failed, or when the text needed several chunks: it is
+        still sent then, but cannot be edited.
+        """
         chunks = self._chunks(text)
         if len(chunks) > 1:
             await self.send_message(chat_id, text, patient=patient)
@@ -89,10 +93,10 @@ class TelegramClient:
         return await self._send_chunk(chat_id, chunks[0], patient=patient)
 
     async def edit_message_text(self, message: SentMessage, text: str) -> bool:
-        """Replace a sent message's text in the markup it was sent with.
+        """Replace the text of a sent message, in its markup; return True when done.
 
-        No retry on a rate limit; if Telegram rejects the HTML, one plain-text edit follows.
-        Telegram answers "message is not modified" when nothing changed: that counts as done.
+        There is no retry on a rate limit. If Telegram rejects the HTML, one plain edit
+        follows; "message is not modified" (nothing changed) counts as done.
         """
         data: dict[str, Any] = {
             "chat_id": message.chat_id,
@@ -114,7 +118,7 @@ class TelegramClient:
         return False
 
     async def broadcast(self, chat_ids: Iterable[int], text: str, *, patient: bool = False) -> bool:
-        """Send ``text`` to every chat; True when at least one of them received it."""
+        """Send ``text`` to every chat; return True when at least one of them received it."""
         sent = await asyncio.gather(
             *(self.send_message(cid, text, patient=patient) for cid in chat_ids)
         )
@@ -129,6 +133,10 @@ class TelegramClient:
         *,
         patient: bool = False,
     ) -> bool:
+        """Send ``content`` as a text file; return True when it went out.
+
+        The caption is cut to Telegram's limit of 1024 characters.
+        """
         result = await self._post(
             "sendDocument",
             data={"chat_id": chat_id, "caption": caption[:1024]},
@@ -146,6 +154,7 @@ class TelegramClient:
         *,
         patient: bool = False,
     ) -> None:
+        """Send the same text file to every chat at once."""
         await asyncio.gather(
             *(
                 self.send_document(cid, filename, content, caption, patient=patient)
@@ -153,9 +162,12 @@ class TelegramClient:
             )
         )
 
-    # ── incoming ────────────────────────────────────────────────────────────
     async def get_me(self) -> dict[str, Any] | None:
-        """Bot profile, ``None`` on a network problem; raises on a rejected token."""
+        """Return the bot's profile and remember its username.
+
+        Return None on a network problem or an odd answer; raise TelegramAuthError when
+        Telegram rejects the token.
+        """
         try:
             response = await self._http.get(f"{self._base}/getMe", timeout=15)
         except httpx.HTTPError as exc:
@@ -176,7 +188,10 @@ class TelegramClient:
         return result
 
     async def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]] | None:
-        """Long-poll for updates; ``None`` (not ``[]``) on failure so the caller can back off."""
+        """Long-poll for new updates and return them.
+
+        Return None (not an empty list) on any failure, so the caller can back off.
+        """
         params: dict[str, Any] = {"timeout": timeout, "allowed_updates": '["message"]'}
         if offset is not None:
             params["offset"] = offset
@@ -206,6 +221,10 @@ class TelegramClient:
     async def _send_chunk(
         self, chat_id: int, chunk: str, *, patient: bool = False
     ) -> SentMessage | None:
+        """Send one chunk and return the sent message, or None on failure.
+
+        If Telegram rejects the HTML, the chunk is sent again as plain text.
+        """
         data: dict[str, Any] = {
             "chat_id": chat_id,
             "text": chunk,
@@ -238,8 +257,12 @@ class TelegramClient:
         pause: float = _UNSENT_RETRY_PAUSE,
         max_pause: float = _UNSENT_RETRY_PAUSE,
     ) -> dict[str, Any] | None:
-        """One API call; ``pause`` doubles (up to ``max_pause``) between resends of a
-        request that never reached Telegram."""
+        """Call one API method and return its result, or None on failure.
+
+        A request that never reached Telegram is resent after ``pause`` seconds, doubling up
+        to ``max_pause``, and a flood wait up to ``max_wait`` seconds is waited out; each
+        retry uses up one of ``attempts``. The error text is left in ``_last_error``.
+        """
         self._last_error = None
         again = {"data": data, "files": files, "attempts": attempts - 1, "max_wait": max_wait}
         try:
@@ -288,11 +311,11 @@ class TelegramClient:
         return payload.get("result")
 
     def _chunks(self, text: str) -> list[str]:
-        """``text`` in messages Telegram accepts, cut at line breaks where possible.
+        """Split ``text`` into messages Telegram accepts, cut at line breaks where possible.
 
         A cut inside an element (a long ``<pre>`` of a change report) closes it at the end
-        of one chunk and opens it again at the start of the next: each chunk stays valid
-        HTML instead of being rejected and resent as plain text.
+        of one chunk and opens it again in the next. So each chunk stays valid HTML and is
+        not rejected and resent as plain text.
         """
         text = text.strip() or "(empty message)"
         limit = self.MAX_MESSAGE_LENGTH  # Telegram counts UTF-16 units: an emoji takes two
@@ -319,12 +342,12 @@ class TelegramClient:
         return chunks
 
     def _redact(self, value: object) -> str:
-        """Make sure the bot token never leaks into logs through error messages."""
+        """Return ``value`` as text with the bot token hidden, so it never leaks into logs."""
         return str(value).replace(self._token, "<token>")
 
 
 def _open_tags(html: str) -> list[tuple[str, str]]:
-    """(name, opening tag) of the elements still open at the end of ``html``."""
+    """Return (name, opening tag) for each element still open at the end of ``html``."""
     stack: list[tuple[str, str]] = []
     for match in _TAG_RE.finditer(html):
         name = match.group(2).lower()
@@ -339,9 +362,9 @@ def _open_tags(html: str) -> list[tuple[str, str]]:
 
 
 def _safe_cut(text: str, at: int) -> int:
-    """``at``, moved back so that the cut splits neither a tag nor an entity (``&amp;``).
+    """Return ``at``, moved back so the cut splits neither a tag nor an entity like ``&amp;``.
 
-    A tag longer than the whole room is cut through: the chunk then goes out as plain text.
+    A tag longer than the whole room is cut through; that chunk then goes out as plain text.
     """
     cut = at
     tag = text.rfind("<", 0, cut)
@@ -354,12 +377,12 @@ def _safe_cut(text: str, at: int) -> int:
 
 
 def _units(text: str) -> int:
-    """Length as Telegram counts it: in UTF-16 code units."""
+    """Return the length of ``text`` as Telegram counts it, in UTF-16 code units."""
     return len(text) if text.isascii() else len(text.encode("utf-16-le")) // 2
 
 
 def _policy(patient: bool) -> dict[str, Any]:
-    """Retry settings of a send: patient ones wait out longer flood limits."""
+    """Return the ``_post`` retry settings for a normal or a patient send."""
     if patient:
         return {
             "attempts": _PATIENT_ATTEMPTS,
@@ -370,6 +393,7 @@ def _policy(patient: bool) -> dict[str, Any]:
 
 
 def _retry_after(payload: Any) -> float:
+    """Return the flood wait Telegram asked for, in seconds; 3 when the answer lacks it."""
     parameters = payload.get("parameters") if isinstance(payload, dict) else None
     value = parameters.get("retry_after", 3) if isinstance(parameters, dict) else 3
     try:
@@ -379,5 +403,6 @@ def _retry_after(payload: Any) -> float:
 
 
 def _message_id(result: Any) -> int:
+    """Return the message id from a sendMessage result, or 0 when it is missing."""
     value = result.get("message_id") if isinstance(result, dict) else None
     return value if isinstance(value, int) else 0

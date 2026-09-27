@@ -1,8 +1,8 @@
 """Report-first, verify-later mode for one site (``/unverified <url> on``).
 
-Every new address is announced at once as *unverified*, then re-checked on-chain
-every ``unverified_recheck`` seconds for ``unverified_watch`` seconds, bypassing the
-negative cache. Confirmations get a message; alerts above the hourly cap go into one digest.
+Every new address is announced at once as unverified, then re-checked on-chain every
+``unverified_recheck`` seconds for ``unverified_watch`` seconds, bypassing the negative
+cache. Confirmations get a message; alerts above the hourly cap go into one digest.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)
 
-_MEMORY = 7 * 86_400  # how long an announced address is remembered, so it is not announced twice
+_MEMORY = 7 * 86_400  # seconds an announced address is remembered, so it is not announced twice
 _MAX_ENTRIES = 1000
 _DIGEST_PERIOD = 3600.0
 
@@ -41,6 +41,7 @@ class UnverifiedWatcher:
         registry: AlertRegistry | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Set up the watcher of ``site``; announced addresses are saved in ``site.unverified``."""
         self._site = site
         self._validator = validator
         self._cache = cache
@@ -57,6 +58,7 @@ class UnverifiedWatcher:
 
     @property
     def enabled(self) -> bool:
+        """True while the site's unverified mode is on."""
         return self._site.unverified_enabled
 
     async def observe(self, candidates: Sequence[Address], page_url: str) -> None:
@@ -90,7 +92,10 @@ class UnverifiedWatcher:
         await self._flush_digest(now)
 
     async def recheck(self) -> None:
-        """Validate the watched addresses that are due; announce confirmations."""
+        """Validate the watched addresses that are due and announce those that became tokens.
+
+        It also sends the overflow digest once its hour is up.
+        """
         if not self.enabled:
             return
         now = self._clock()
@@ -119,16 +124,18 @@ class UnverifiedWatcher:
                 self._forget(key)
                 changed = True
             elif result.status is ValidationStatus.ALREADY_KNOWN:
-                self._forget(key)  # confirmed and announced by the regular monitor meanwhile
+                self._forget(key)
                 changed = True
         if changed:
             self._persist()
 
     def _under_cap(self, now: float) -> bool:
+        """Return True while fewer than ``unverified_max_per_hour`` alerts went out this hour."""
         self._alert_times = [stamp for stamp in self._alert_times if now - stamp < 3600]
         return len(self._alert_times) < self._tuning.unverified_max_per_hour
 
     async def _flush_digest(self, now: float) -> None:
+        """Send one digest for the addresses over the hourly cap, at most once an hour."""
         if not self._digest_pending:
             return
         if self._digest_sent_at is None or now - self._digest_sent_at >= _DIGEST_PERIOD:
@@ -139,11 +146,13 @@ class UnverifiedWatcher:
             )
 
     def _forget(self, key: str) -> None:
+        """Stop watching an address and forget its page and last check."""
         self._site.unverified.pop(key, None)
         self._pages.pop(key, None)
         self._last_check.pop(key, None)
 
     def _prune(self, now: float) -> None:
+        """Forget addresses announced over a week ago, and the oldest beyond ``_MAX_ENTRIES``."""
         entries = self._site.unverified
         for key in [key for key, stamp in entries.items() if now - stamp > _MEMORY]:
             self._forget(key)

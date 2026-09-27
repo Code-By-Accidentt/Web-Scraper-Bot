@@ -19,16 +19,22 @@ SNAPSHOT_VERSION = 2
 
 
 class SnapshotStore:
-    """One JSON file per page holding the last accepted signature and noise memory."""
+    """Keeps one JSON file per page with its last accepted signature and noise memory."""
 
     def __init__(self, directory: Path) -> None:
+        """Keep the snapshots in ``directory``, creating it if needed."""
         self._dir = directory
         self._dir.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, url: str) -> Path:
+        """Return the snapshot file of a page."""
         return self._dir / f"{url_to_filename(url)}.json"
 
     def load(self, url: str) -> Snapshot | None:
+        """Return the saved snapshot of a page, or None when there is none or it is unreadable.
+
+        An unreadable file is logged; the next save replaces it.
+        """
         path = self.path_for(url)
         if not path.is_file():
             return None
@@ -55,6 +61,7 @@ class SnapshotStore:
             return None
 
     def save(self, url: str, snapshot: Snapshot) -> None:
+        """Write the snapshot of a page, replacing the old one."""
         payload = {
             "version": SNAPSHOT_VERSION,
             "url": url,
@@ -67,13 +74,16 @@ class SnapshotStore:
         atomic_write_text(self.path_for(url), json.dumps(payload, ensure_ascii=False))
 
     def delete(self, url: str) -> None:
+        """Remove the snapshot of a page, if there is one."""
         self.path_for(url).unlink(missing_ok=True)
 
     def delete_many(self, urls: Iterable[str]) -> None:
+        """Remove the snapshots of several pages."""
         for url in urls:
             self.delete(url)
 
     def prune(self, keep_urls: Iterable[str]) -> int:
+        """Remove every snapshot whose page is not in ``keep_urls``; return how many went."""
         keep = {self.path_for(url).name for url in keep_urls}
         removed = 0
         for path in self._dir.glob("*.json"):

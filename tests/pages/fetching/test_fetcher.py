@@ -1,4 +1,4 @@
-"""Offline tests for :mod:`scraper_bot.pages.fetcher`.
+"""Offline tests for :mod:`scraper_bot.pages.fetching`.
 
 The HTTP prober runs over an ``httpx.MockTransport``; the browser-free helpers of
 :class:`PlaywrightFetcher` are driven with duck-typed fakes. The real Chromium is

@@ -20,22 +20,28 @@ STATE_VERSION = 1
 
 
 class StateStore:
-    """Single JSON file holding every monitored site and its flags."""
+    """Keeps every monitored site and its flags in one JSON file."""
 
     def __init__(self, path: Path) -> None:
+        """Use the state file at ``path``; nothing is read until load()."""
         self._path = path
-        # Set when load() found the file damaged: (what was wrong, where it was moved).
+        # Set by load() on a damaged file: (what was wrong, where it was moved or None).
         self.broken: tuple[str, Path | None] | None = None
 
     def exists(self) -> bool:
+        """Return True when the state file exists."""
         return self._path.is_file()
 
     def broken_copies(self) -> list[Path]:
-        """Damaged files moved aside at earlier starts and not cleaned up yet."""
+        """Return the damaged files moved aside at earlier starts and not cleaned up yet."""
         return sorted(self._path.parent.glob(f"{self._path.name}.broken-*"))
 
     def load(self) -> dict[str, SiteState]:
-        """Every readable site; a damaged file is moved aside, never overwritten."""
+        """Return every readable site, or an empty dict when there is no file.
+
+        If the file or any site in it cannot be read, the file is moved aside and
+        ``broken`` says why; a damaged file is never overwritten.
+        """
         self.broken = None
         if not self._path.is_file():
             return {}
@@ -59,9 +65,9 @@ class StateStore:
         return sites
 
     def _set_aside(self, problem: str) -> None:
-        """Keep the damaged file for a person to repair; the next save starts a new one.
+        """Move the damaged file aside for a person to repair; the next save starts a new one.
 
-        When it can be neither moved nor copied, ``broken`` names no copy: the caller must
+        If it can be neither moved nor copied, ``broken`` names no copy, and the caller must
         then not save over it.
         """
         target: Path | None = self._path.with_name(
@@ -80,6 +86,7 @@ class StateStore:
         )
 
     def save(self, sites: Mapping[str, SiteState]) -> None:
+        """Write all sites to the state file, replacing it in one atomic step."""
         payload = {
             "version": STATE_VERSION,
             "sites": {url: site.to_dict() for url, site in sorted(sites.items())},

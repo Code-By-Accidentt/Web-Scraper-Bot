@@ -1,11 +1,12 @@
-"""Every network the bot checks: explorer and DEX links, and for the EVM networks their
-``.env`` key, RPC default, chain id and whether they are optional (the Solana and Sui RPC
-defaults live in :mod:`scraper_bot.config`).
+"""Every network the bot checks, with its explorer and DEX links.
 
-Adding an EVM network takes one :class:`EvmChain` entry here, its stablecoins and wrapped
-tokens in :mod:`scraper_bot.chains.stoplist` and its line in ``.env.example`` (a test
-requires it). The settings, the warm-up, the validators and the alert links all read this
-table.
+EVM networks also carry their ``.env`` key, default RPC URL, chain id and whether they are
+optional. The Solana and Sui RPC defaults live in :mod:`scraper_bot.settings.defaults`.
+
+To add an EVM network, add one :class:`EvmChain` entry here, its stablecoins and wrapped
+tokens in :mod:`scraper_bot.chains.addresses.stoplist` and its line in ``.env.example`` (a
+test checks that). The settings, the warm-up, the validators and the alert links all read
+this table.
 """
 
 from __future__ import annotations
@@ -18,8 +19,14 @@ from scraper_bot.models.addresses import Chain, ConfirmedContract
 
 @dataclass(frozen=True, slots=True)
 class NetworkLinks:
+    """Where to look up and trade a token on one network.
+
+    ``explorer`` and ``swap`` are URL templates with an ``{address}`` placeholder. ``swap``
+    is None when no swap page is known for the network.
+    """
+
     explorer_name: str
-    explorer: str  # token page, ``{address}`` placeholder
+    explorer: str
     dex_chain: str  # DexScreener chain id
     swap_name: str | None = None
     swap: str | None = None
@@ -27,19 +34,22 @@ class NetworkLinks:
 
 @dataclass(frozen=True, slots=True)
 class EvmChain:
-    """One EVM network on which 20-byte ``0x`` addresses are checked."""
+    """One EVM network on which 20-byte ``0x`` addresses are checked.
 
-    name: str  # shown in alerts, logs and /status; the key of every per-network table
+    When an optional network's endpoint fails, the other networks still give a verdict,
+    and the pending watch keeps asking it about addresses that have no code yet.
+    """
+
+    name: str  # shown to users; the key of every per-network table
     env_var: str  # the .env key of its RPC URL
     default_rpc: str
-    chain_id: int  # what eth_chainId answers; checked at start
+    chain_id: int  # what eth_chainId must answer; checked at start
     links: NetworkLinks
-    # When an optional network's endpoint fails, the answers of the others still give a
-    # verdict; the pending watch keeps asking it about addresses that have no code yet.
     optional: bool = False
 
 
 def _uniswap(chain: str) -> str:
+    """Return the Uniswap swap URL template for ``chain``, with an ``{address}`` placeholder."""
     return f"https://app.uniswap.org/swap?outputCurrency={{address}}&chain={chain}"
 
 
@@ -132,8 +142,8 @@ EVM_CHAINS: tuple[EvmChain, ...] = (
             _uniswap("avalanche"),
         ),
     ),
-    # Circle's chain (mainnet since 2026-09-16), USDC is its gas; flutch.fun launches here.
-    # The official rpc.mainnet.arc.io answered 403 to keyless calls.
+    # Circle's chain, USDC is its gas; flutch.fun launches here.
+    # Not the official rpc.mainnet.arc.io: it answered 403 to calls without a key.
     EvmChain(
         "Arc",
         "ARC_RPC_URL",
@@ -171,10 +181,11 @@ NETWORK_LINKS: dict[str, NetworkLinks] = {
 def token_links(
     contract: ConfirmedContract, identifier: str | None = None
 ) -> list[tuple[str, str]]:
-    """(label, url) pairs: explorer, DexScreener and, where known, a swap page.
+    """Return (label, url) pairs for a token: explorer, DexScreener and, if known, a swap page.
 
-    Every URL carries only the token's own identifier, never a pair address, so a bot
-    that parses the chat for addresses cannot pick up a second contract.
+    ``identifier`` (e.g. a Sui coin type) replaces the address in the URLs when given. An
+    unknown network gets an empty list and a bare Sui object id only a Suiscan link. The
+    URLs never hold a pair address, so a bot reading the chat cannot pick up a second contract.
     """
     links = NETWORK_LINKS.get(contract.network)
     if links is None:

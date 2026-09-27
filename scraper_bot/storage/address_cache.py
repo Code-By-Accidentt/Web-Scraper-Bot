@@ -16,14 +16,15 @@ from scraper_bot.storage.files import atomic_write_text
 log = logging.getLogger(__name__)
 
 
-_SWEEP_EVERY = 1000  # rejections added between two sweeps of the expired ones
+_SWEEP_EVERY = 1000
 
 
 class AddressCache:
-    """Confirmed contracts (kept forever) and rejected addresses (kept for a TTL).
+    """Remembers which addresses are tokens and which were rejected recently.
 
-    Both are tab-separated text files mirrored in memory and only appended to while
-    running, so lookups are free and a crash never loses more than the last line.
+    Tokens are kept forever, rejections only for a TTL. Both lists are tab-separated text
+    files mirrored in memory and only appended to while the bot runs, so lookups cost
+    nothing and a crash never loses more than the last line.
     """
 
     def __init__(
@@ -34,24 +35,36 @@ class AddressCache:
         rejected_ttl: float | Callable[[], float],
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Use the two files; nothing is read until load().
+
+        ``rejected_ttl`` is in seconds, or a function returning it so that a settings change
+        applies at once; 0 keeps rejections forever.
+        """
         self._known_path = known_path
         self._rejected_path = rejected_path
         self._ttl = rejected_ttl if callable(rejected_ttl) else (lambda: float(rejected_ttl))
         self._clock = clock
         self._known: dict[Address, str] = {}
         self._rejected: dict[Address, float] = {}
-        self._since_sweep = 0  # rejections added since expired ones were last swept out
+        self._since_sweep = 0
 
     @property
     def known_count(self) -> int:
+        """Number of addresses known to be tokens."""
         return len(self._known)
 
     @property
     def rejected_count(self) -> int:
+        """Number of rejections that have not expired yet."""
         now = self._clock()
         return sum(1 for at in self._rejected.values() if not self._expired(at, now))
 
     def load(self) -> None:
+        """Read both files into memory, leaving out expired rejections and unreadable lines.
+
+        The rejected file is then rewritten without them. A torn last line in the known file
+        is closed first, so the next append starts on a line of its own.
+        """
         self._end_line(self._known_path)
         self._known = {}
         for fields in self._read_rows(self._known_path):
@@ -74,13 +87,15 @@ class AddressCache:
         self._rewrite_rejected()
 
     def is_known(self, address: Address) -> bool:
+        """Return True when the address is a known token."""
         return address in self._known
 
     def known_network(self, address: Address) -> str | None:
-        """Network a confirmed contract was found on, ``None`` if it is not known."""
+        """Return the network a known token was found on, or None if it is not known."""
         return self._known.get(address)
 
     def is_rejected(self, address: Address) -> bool:
+        """Return True when the address was rejected and the rejection has not expired."""
         rejected_at = self._rejected.get(address)
         if rejected_at is None:
             return False
@@ -90,10 +105,11 @@ class AddressCache:
         return True
 
     def add_known(self, contract: ConfirmedContract) -> bool:
-        """Remember a confirmed contract; False when it was already known.
+        """Remember a confirmed token; return False if it was already known.
 
-        A failed write (disk full, a file locked by another program) is logged, not
-        raised: the token's alert matters more; after a restart it may come once more.
+        The line is synced to disk, so a power cut cannot make the bot announce the token
+        again. A failed write (disk full, a file locked by another program) is only logged:
+        the alert matters more, and after a restart the token may be announced once more.
         """
         if contract.address in self._known:
             return False
@@ -102,14 +118,16 @@ class AddressCache:
         stamp = datetime.now(UTC).isoformat(timespec="seconds")
         fields = (contract.address.chain.value, contract.address.value, contract.network, stamp)
         try:
-            # Synced: after a power cut an announced token must not be announced again.
             self._append(self._known_path, fields, sync=True)
         except OSError as exc:
             log.error("could not record %s in %s: %s", contract.address, self._known_path, exc)
         return True
 
     def forget_rejected(self, chain: Chain) -> int:
-        """Drop every rejection of ``chain``: they were made before a network was added."""
+        """Drop every rejection on ``chain`` and return how many there were.
+
+        Used after a network is added: those rejections were made without asking it.
+        """
         stale = [address for address in self._rejected if address.chain is chain]
         for address in stale:
             del self._rejected[address]
@@ -118,6 +136,11 @@ class AddressCache:
         return len(stale)
 
     def add_rejected(self, address: Address) -> None:
+        """Remember that the address is not a token, as of now.
+
+        A failed write is only logged. Every ``_SWEEP_EVERY`` new rejections the expired
+        ones are swept out.
+        """
         now = self._clock()
         self._rejected[address] = now
         try:
@@ -129,7 +152,7 @@ class AddressCache:
             self.sweep()
 
     def sweep(self) -> int:
-        """Forget expired rejections, in memory and in the file; returns how many went."""
+        """Forget expired rejections, in memory and in the file; return how many went."""
         now = self._clock()
         expired = [a for a, at in self._rejected.items() if self._expired(at, now)]
         for address in expired:
@@ -140,15 +163,24 @@ class AddressCache:
         return len(expired)
 
     def import_known(self, addresses: Iterable[Address]) -> int:
+        """Add the tokens found by bot version 1 as known and return how many were new."""
         return sum(
             1 for address in addresses if self.add_known(ConfirmedContract(address, "legacy"))
         )
 
     def _expired(self, rejected_at: float, now: float) -> bool:
+        """Return True when a rejection made at ``rejected_at`` is older than the TTL.
+
+        With a TTL of 0 nothing expires.
+        """
         ttl = self._ttl()
         return ttl > 0 and now - rejected_at >= ttl
 
     def _rewrite_rejected(self) -> None:
+        """Replace the rejected file with the rejections in memory.
+
+        With no rejections and no file yet, no empty file is created.
+        """
         lines = [
             f"{address.chain.value}\t{address.value}\t{rejected_at:.0f}"
             for address, rejected_at in self._rejected.items()
@@ -158,6 +190,10 @@ class AddressCache:
 
     @staticmethod
     def _read_rows(path: Path) -> list[list[str]]:
+        """Return the tab-separated rows of a file that have at least a chain and an address.
+
+        A missing file gives an empty list.
+        """
         if not path.is_file():
             return []
         rows: list[list[str]] = []
@@ -169,6 +205,7 @@ class AddressCache:
 
     @staticmethod
     def _parse_address(fields: list[str]) -> Address | None:
+        """Return the canonical address in a row, or None if its chain or address is invalid."""
         try:
             chain = Chain(fields[0])
         except ValueError:
@@ -177,7 +214,10 @@ class AddressCache:
 
     @staticmethod
     def _end_line(path: Path) -> None:
-        """A crash mid-append leaves a torn last line; the next append must not join it."""
+        """Add a newline at the end of the file if it does not end with one.
+
+        A crash mid-append leaves a torn last line, and the next append must not join it.
+        """
         try:
             with path.open("rb+") as handle:
                 if handle.seek(0, os.SEEK_END) == 0:
@@ -191,6 +231,7 @@ class AddressCache:
 
     @staticmethod
     def _append(path: Path, fields: tuple[str, ...], *, sync: bool = False) -> None:
+        """Append one tab-separated line to a file; with ``sync`` it goes to disk at once."""
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write("\t".join(fields) + "\n")

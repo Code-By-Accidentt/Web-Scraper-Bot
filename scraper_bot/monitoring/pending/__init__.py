@@ -1,1 +1,1 @@
-"""The pending watch for tokens published before deployment."""
+"""The pending watch: addresses a page shows before their token is deployed."""

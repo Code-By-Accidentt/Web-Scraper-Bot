@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 
 
 def configure_logging(settings: Settings) -> None:
+    """Send the log to stdout and, when LOG_FILE is set, to a rotating file as well.
+
+    Chatty libraries are limited to warnings.
+    """
     formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     handlers: list[logging.Handler] = []
     stream = sys.stdout
@@ -35,20 +39,22 @@ def configure_logging(settings: Settings) -> None:
         file_handler.setFormatter(formatter)
         handlers.append(file_handler)
     logging.basicConfig(level=settings.log_level, handlers=handlers, force=True)
-    # hpack logs every HTTP/2 header at DEBUG, the request path with the bot token included
+    # hpack logs every HTTP/2 header at DEBUG, and the request path holds the bot token.
     for noisy in ("httpx", "httpcore", "asyncio", "hpack", "h2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 async def _serve(app: Application) -> None:
-    """Run the bot; SIGTERM (systemd, rebooter.py) shuts it down the way Ctrl-C does.
+    """Run the bot; a SIGTERM (systemd, rebooter.py) shuts it down the way Ctrl-C does.
 
-    The shutdown sends the alerts already on their way. A second SIGTERM kills at once.
+    The shutdown still sends the alerts already on their way. A second SIGTERM kills the
+    process at once.
     """
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
 
     def stop() -> None:
+        """Cancel the bot's task and leave the next SIGTERM to its default action."""
         loop.remove_signal_handler(signal.SIGTERM)
         if task is not None:
             task.cancel()
@@ -59,6 +65,11 @@ async def _serve(app: Application) -> None:
 
 
 def main() -> int:
+    """Run the bot and return the exit code for the supervisor.
+
+    0 is a normal stop, 1 a crash, 2 a configuration error or a rejected token, and 3 a
+    browser that could not start; rebooter.py waits longer after 2 and 3.
+    """
     try:
         settings = Settings.from_env()
     except ConfigError as exc:

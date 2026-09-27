@@ -13,8 +13,7 @@ from scraper_bot.models.pages import BlockSignal
 from scraper_bot.pages.fetching.result import FetchResult
 
 _BLOCK_STATUSES = frozenset({401, 403, 407, 429, 503})
-# Phrases typical for WAF / anti-bot pages, searched in the first part of a block answer
-# to explain it when the protection itself is not recognised.
+# Added to a block's reason when the protection itself is not recognised.
 _CHALLENGE_MARKERS = (
     "just a moment",
     "attention required",
@@ -29,8 +28,7 @@ _CHALLENGE_MARKERS = (
     "cf-chl",
     "vercel security checkpoint",
 )
-# A 2xx answer is a challenge only when its <title> begins with one of these: a real page
-# may well mention a captcha ("CAPTCHA ($CAPTCHA) | fair launch"), it does not open with that.
+# Title starts that mark a 2xx page as a challenge; a real page may mention a captcha later.
 _CHALLENGE_TITLES = (
     "just a moment",
     "attention required",
@@ -46,9 +44,8 @@ _CHALLENGE_TITLES = (
     "pardon our interruption",
     "vercel security checkpoint",
 )
-# ...or has a part (between separators such as "|") that is nothing but a challenge phrase:
-# "Security Captcha", "site | Access Denied". "CAPTCHA ($CAPTCHA) | fair launch" is not.
-# A word alone ("Verification | Launchpad", "Challenge | Meme Arena") is not enough.
+# A whole title part that is a challenge phrase ("site | Access Denied"). A bare word is not
+# enough: "Verification | Launchpad" and "Challenge | Meme Arena" are real pages.
 _CHALLENGE_PART_RE = re.compile(
     r"(?:security|human|bot|browser) (?:check|captcha|challenge|verification)"
     r"|captcha (?:check|challenge|verification)"
@@ -58,13 +55,12 @@ _CHALLENGE_PART_RE = re.compile(
     r"|access denied|attention required!?|just a moment\.*|one more step|ddos protection"
 )
 _TITLE_SEPARATORS_RE = re.compile(r"\s+[|\-–—:·]\s+|\s*[|·]\s*")
-# Protections and how their answers give them away: headers ("name" is present, or
-# "name=value" where the value starts so) or phrases in the first part of the page. The
-# first match names the block; the bare CDNs come last, as they front normal pages too.
+# (name, header signs, page signs); a header sign is "header" or "header=value prefix".
+# The first match wins, so the bare CDNs come last: they front normal pages too.
 _PROTECTIONS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     (
-        # The interstitial's own markers: Cloudflare puts /cdn-cgi/challenge-platform
-        # scripts and cf-chl-widget ids (Turnstile) on normal pages too.
+        # Interstitial-only markers: challenge-platform scripts and cf-chl-widget ids sit
+        # on normal pages too.
         "Cloudflare challenge",
         ("cf-mitigated=challenge",),
         ("_cf_chl_opt", "orchestrate/chl_page", "orchestrate/managed", "challenge-error-text"),
@@ -82,11 +78,8 @@ _PROTECTIONS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("Akamai", ("server=akamaighost",), ()),
     ("Cloudflare", ("cf-ray", "server=cloudflare"), ("| cloudflare</title>", "cf-error-details")),
 )
-# Captcha widgets a person has to tick or solve, as rendered frames. The invisible kinds
-# (reCAPTCHA v3 and invisible v2: size=invisible; invisible hCaptcha: checkbox-invisible)
-# only watch in the background and are left out.
-# Each with a substring that must be there first, and bounded runs: a hostile page of
-# endless attribute soup costs a scan, not a quadratic search.
+# Widgets a person must solve: (name, substring checked first, pattern). Invisible ones
+# (size=invisible, checkbox-invisible) are left out; bounded runs keep hostile HTML cheap.
 _CAPTCHA_WIDGETS = (
     (
         "reCAPTCHA",
@@ -128,8 +121,13 @@ class BlockDetector:
     """Turns a :class:`FetchResult` into a :class:`BlockSignal` when it smells like a block."""
 
     def inspect(self, result: FetchResult) -> BlockSignal | None:
+        """Return a block signal when the answer looks like a refusal, or None.
+
+        Block statuses, connection resets and challenge pages count; firewall headers from
+        Cloudflare, Vercel and AWS WAF mark a challenge even on a 2xx answer. Other fetch
+        errors mean the site is down, not refusing, and return None.
+        """
         headers = {key.lower(): value.lower() for key, value in result.headers.items()}
-        # Cloudflare, Vercel and AWS WAF mark the answers of their firewalls, even a 2xx one.
         mitigated = (
             headers.get("cf-mitigated") == "challenge"
             or headers.get("x-vercel-mitigated") in {"challenge", "deny"}
@@ -148,9 +146,9 @@ class BlockDetector:
 
     @staticmethod
     def captcha(html: str) -> str | None:
-        """Name of a captcha widget a person would have to solve on this page, if any."""
+        """Return the name of a captcha widget a person would have to solve here, or None."""
         if "captcha" not in html and "turnstile" not in html:
-            return None  # the usual page: skip the searches below
+            return None
         return next(
             (
                 name
@@ -167,6 +165,10 @@ class BlockDetector:
         headers: dict[str, str],
         retry_after: float | None = None,
     ) -> BlockSignal:
+        """Build the signal for ``answer``, naming the protection when the answer shows it.
+
+        Without a known protection, a challenge phrase from the page is added to the reason.
+        """
         page = result.html[:_PAGE].lower()
         protection = self._protection(headers, page)
         if protection is None:
@@ -177,6 +179,7 @@ class BlockDetector:
 
     @staticmethod
     def _protection(headers: dict[str, str], page: str) -> str | None:
+        """Return the first protection whose header or page signs match, or None."""
         for name, header_signs, page_signs in _PROTECTIONS:
             for sign in header_signs:
                 header, _, prefix = sign.partition("=")
@@ -189,11 +192,13 @@ class BlockDetector:
 
     @staticmethod
     def _marker(page: str) -> str | None:
+        """Return the first challenge phrase near the top of the page, or None."""
         head = page[:_HEAD]
         return next((marker for marker in _CHALLENGE_MARKERS if marker in head), None)
 
     @staticmethod
     def _challenge_title(html: str) -> bool:
+        """True when the page's title starts with a challenge phrase or has a part that is one."""
         title = _TITLE_RE.search(html[:_HEAD])
         if title is None:
             return False

@@ -11,6 +11,11 @@ Caution = Callable[[Any], str | None]
 
 @dataclass(frozen=True, slots=True)
 class PreferenceSpec:
+    """One setting /set can change: its names, type, limits and help text.
+
+    The user types values in ``unit``; ``scale`` turns them into the base unit Settings uses.
+    """
+
     key: str  # user-facing name, e.g. rejected_ttl_hours
     attr: str  # Settings attribute holding the base-unit value, e.g. rejected_ttl
     section: str
@@ -21,10 +26,10 @@ class PreferenceSpec:
     maximum: float | None = None
     unit: str = ""
     scale: float = 1.0  # base value = user value * scale (hours -> seconds = 3600)
-    caution: Caution | None = None  # returns a warning for a risky value
+    caution: Caution | None = None  # returns a warning for a risky value, else None
 
     def format(self, value: Any) -> str:
-        """``value`` (in the user's unit) as people read it: ``on``, ``4 s``, ``24 h``."""
+        """Return ``value``, given in the user's unit, as people read it: ``on``, ``4 s``."""
         if self.kind == "bool":
             return "on" if value else "off"
         text = f"{value:g}" if self.kind == "float" else str(value)
@@ -40,14 +45,17 @@ SECTIONS: dict[str, str] = {
 
 
 def _below(limit: float, text: str) -> Caution:
+    """Return a caution that warns with ``text`` when the value is below ``limit``."""
     return lambda value: text if value < limit else None
 
 
 def _above(limit: float, text: str) -> Caution:
+    """Return a caution that warns with ``text`` when the value is above ``limit``."""
     return lambda value: text if value > limit else None
 
 
 def _when(flag: bool | float, text: str) -> Caution:
+    """Return a caution that warns with ``text`` when the value equals ``flag``."""
     return lambda value: text if value == flag else None
 
 
@@ -388,7 +396,7 @@ BY_KEY: dict[str, PreferenceSpec] = {spec.key: spec for spec in PREFERENCES}
 BY_ATTR: dict[str, PreferenceSpec] = {spec.attr: spec for spec in PREFERENCES}
 
 
-# Related settings whose order matters: the first must never exceed the second.
+# In each pair the first setting must never exceed the second.
 ORDERED_PAIRS: tuple[tuple[str, str], ...] = (
     ("poll_interval_min", "poll_interval_max"),
     ("turbo_default_minutes", "turbo_max_minutes"),

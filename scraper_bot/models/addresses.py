@@ -7,6 +7,8 @@ from enum import Enum, StrEnum
 
 
 class Chain(StrEnum):
+    """The blockchain families the bot understands."""
+
     ETHEREUM = "Ethereum"
     SOLANA = "Solana"
     SUI = "Sui"
@@ -20,6 +22,7 @@ class Address:
     value: str
 
     def __str__(self) -> str:
+        """Return the bare address, without the chain."""
         return self.value
 
 
@@ -32,20 +35,25 @@ class ConfirmedContract:
 
 
 class ValidationStatus(Enum):
+    """The outcome of checking one address.
+
+    The ALREADY_* statuses come from the bot's memory, without a new RPC call. UNAVAILABLE
+    means no verdict: an endpoint failed (for EVM a required network, or every network, and
+    none found a token), and nothing was cached.
+    """
+
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     ALREADY_KNOWN = "already_known"
     ALREADY_REJECTED = "already_rejected"
-    # no verdict: an endpoint failed (EVM: a required network, or every network, and none
-    # found a token); nothing was cached
     UNAVAILABLE = "unavailable"
 
 
 class AddressKind(Enum):
-    """What the chain says an address is (beyond "a token or not")."""
+    """What the chain says an address is, in more detail than "a token or not"."""
 
     TOKEN = "token"  # ERC-20, SPL / Token-2022 mint or Sui coin: the only kind announced
-    NO_CODE = "no_code"  # EVM: no bytecode on the networks that answered: a wallet or not yet
+    NO_CODE = "no_code"  # EVM: no code on the networks that answered; a wallet or not deployed yet
     WALLET = "wallet"  # EVM: an EIP-7702 delegated wallet (its "code" is 0xef0100 + address)
     PAIR = "pair"  # an LP pair or pool; the tokens it holds are in ``resolved``
     VAULT = "vault"  # ERC-4626 vault shares: a token, but never a launch
@@ -56,12 +64,14 @@ class AddressKind(Enum):
     UNKNOWN = "unknown"  # a cached verdict or no verdict at all
 
 
-# Kinds that may still turn into a token later: the address is worth watching.
+# Kinds that may still become a token later, so the address is worth watching.
 MAY_APPEAR = frozenset({AddressKind.NO_CODE, AddressKind.MISSING, AddressKind.NOT_YET_MINTED})
 
 
 @dataclass(frozen=True, slots=True)
 class ValidationResult:
+    """The verdict on one address: its status, the network and what kind of address it is."""
+
     address: Address
     status: ValidationStatus
     network: str | None = None
@@ -71,6 +81,7 @@ class ValidationResult:
 
     @property
     def contract(self) -> ConfirmedContract | None:
+        """The confirmed contract, or None unless the status is CONFIRMED with a network."""
         if self.status is ValidationStatus.CONFIRMED and self.network:
             return ConfirmedContract(self.address, self.network)
         return None
@@ -80,17 +91,25 @@ LABEL_LIMIT = 64  # characters kept of a token name or symbol
 
 
 def clean_label(text: str) -> str | None:
-    """A token name or symbol fit to show: NULs and runs of spaces gone, cut to 64 chars."""
+    """Return a token name or symbol fit to show, or None when nothing is left.
+
+    NUL characters and runs of whitespace become single spaces, and the text is cut to 64
+    characters.
+    """
     cleaned = " ".join(text.replace("\x00", " ").split())
     return cleaned[:LABEL_LIMIT] or None
 
 
 def address_key(address: Address) -> str:
-    """``Chain:value``, how addresses are keyed in state.json and pending.json."""
+    """Return the ``Chain:value`` key used for an address in state.json and pending.json."""
     return f"{address.chain.value}:{address.value}"
 
 
 def parse_address_key(key: str) -> Address | None:
+    """Turn a ``Chain:value`` key back into an address, or None when the key is malformed.
+
+    Only the chain name is checked; the value is taken as it is.
+    """
     chain, _, value = key.partition(":")
     try:
         return Address(Chain(chain), value) if value else None
@@ -105,9 +124,10 @@ class ChainVerdict:
     kind: AddressKind
     network: str | None = None  # where the token (or the LP pair) lives
     sides: tuple[str, ...] = ()  # PAIR: the tokens it holds, stop-listed ones left out
-    # optional networks that did not answer (failed, too slow, resting): it may change there
+    # optional networks that did not answer (failed, slow, resting): the verdict may change
     missing: frozenset[str] = frozenset()
 
     @property
     def partial(self) -> bool:
+        """True when some optional networks did not answer, so the verdict is not final."""
         return bool(self.missing)

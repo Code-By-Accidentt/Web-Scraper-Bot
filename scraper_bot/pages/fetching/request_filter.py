@@ -1,4 +1,8 @@
-"""Requests a rendered page makes that the bot never needs."""
+"""Requests a rendered page makes that the bot never needs.
+
+Next.js prefetches the pages its links point to (ten per load on some sites), and analytics
+beacons report every render to the site owner as a visit. Neither changes what the page shows.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,6 @@ from urllib.parse import urlsplit
 
 from playwright import async_api as pw
 
-# Requests a page makes that the bot never needs. Next.js prefetches the pages its links
-# point to (harvestco.ai: ten per load), and analytics beacons report every render to the
-# site owner as a visit. Neither changes what the page shows. A prefetch is an ?_rsc= fetch
-# with a prefetch header, or any ?_rsc= fetch of another page: links with prefetch={true}
-# send no header (heaven.xyz). The page's own ?_rsc= fetch (router.refresh() revealing a
-# CA) passes. Vercel's own checkpoint (/.well-known/vercel/) is always let through.
 _ANALYTICS_HOSTS = (
     "google-analytics.com",
     "analytics.google.com",
@@ -51,10 +49,15 @@ def _same_page(path: str, request: pw.Request) -> bool:
 
 
 def is_unwanted(request: pw.Request, blocked: frozenset[str]) -> bool:
-    """Blocked resource types, Next.js prefetches and analytics beacons."""
+    """Return True for blocked resource types, Next.js prefetches and analytics beacons.
+
+    Any ``?_rsc=`` fetch of another page is a prefetch, header or not: links with
+    ``prefetch={true}`` send none. The page's own ``?_rsc=`` fetch must pass, as
+    ``router.refresh()`` may be what reveals a CA. Vercel's checkpoint always passes.
+    """
     url = request.url
     if _ALWAYS_ALLOWED in url:
-        return False  # the checkpoint's own images and fonts included
+        return False  # before the type check, so the checkpoint's images and fonts load too
     if request.resource_type in blocked:
         return True
     headers = request.headers

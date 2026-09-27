@@ -19,27 +19,35 @@ log = logging.getLogger(__name__)
 
 
 class TurboError(Exception):
+    """Base of the turbo errors that a command turns into a reply."""
+
     def __init__(self, url: str) -> None:
+        """Keep the URL of the site the error is about."""
         super().__init__(url)
         self.url = url
 
 
 class TurboAlreadyRunning(TurboError):
-    pass
+    """Turbo mode is already on, launching or scheduled for this site."""
 
 
 class TurboNotRunning(TurboError):
-    pass
+    """No turbo session runs for this site, or its launch was called off."""
 
 
 class TurboLimitReached(TurboError):
+    """As many turbo sessions as ``max_sites`` allows are already running or scheduled."""
+
     def __init__(self, url: str, limit: int) -> None:
+        """Keep the site URL and the session limit that was reached."""
         super().__init__(url)
         self.limit = limit
 
 
 @dataclass(frozen=True, slots=True)
 class ScheduledTurbo:
+    """A turbo session that starts at ``start_at`` (epoch seconds) and lasts ``minutes``."""
+
     url: str
     start_at: float
     minutes: float
@@ -62,6 +70,7 @@ class TurboManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         notifier: Notifier | None = None,
     ) -> None:
+        """Set up the manager; ``session_factory`` builds each session when it starts."""
         self._tuning = tuning
         self._deriver = deriver
         self._prober = prober
@@ -73,7 +82,7 @@ class TurboManager:
         self._tasks: dict[str, asyncio.Task[TurboStats]] = {}
         self._scheduled: dict[str, tuple[ScheduledTurbo, asyncio.Task[None]]] = {}
         self._launching: set[str] = set()
-        self._closing = False  # shutting down: no session starts any more
+        self._closing = False
         self._called_off: set[str] = set()  # launches stopped while probing their pages
 
     @property
@@ -90,6 +99,7 @@ class TurboManager:
         )
 
     def active(self) -> list[TurboSession]:
+        """Return the sessions that are running now."""
         return [
             session
             for url, session in self._sessions.items()
@@ -97,11 +107,17 @@ class TurboManager:
         ]
 
     def scheduled(self) -> list[ScheduledTurbo]:
+        """Return the sessions planned for later."""
         return [plan for plan, _ in self._scheduled.values()]
 
     async def start(
         self, raw_url: str, minutes: float | None = None, start_at: float | None = None
     ) -> TurboSession | ScheduledTurbo:
+        """Start turbo for a site now, or schedule it when ``start_at`` is in the future.
+
+        Return the running session or the plan. The length is kept between one minute and
+        ``max_minutes``; raises TurboAlreadyRunning or TurboLimitReached when it cannot start.
+        """
         url = normalize_url(raw_url)
         if self._is_busy(url):
             raise TurboAlreadyRunning(url)
@@ -120,6 +136,11 @@ class TurboManager:
         return await self._launch(url, minutes * 60)
 
     async def stop(self, raw_url: str) -> str:
+        """Stop the site's session, plan or launch and return the site key.
+
+        A running session gets up to 15 seconds to finish; raises TurboNotRunning when there
+        is nothing to stop.
+        """
         url = normalize_url(raw_url)
         scheduled = self._scheduled.pop(url, None)
         if scheduled is not None:
@@ -132,12 +153,12 @@ class TurboManager:
         if session is None or task is None or task.done():
             raise TurboNotRunning(url)
         session.request_stop()
-        # asyncio.wait never raises for the session's own outcome, and it lets a
-        # cancellation of the caller (Ctrl-C during /turbo stop) through.
+        # asyncio.wait ignores the session's own outcome but lets our cancellation through.
         await asyncio.wait({task}, timeout=15)
         return url
 
     async def shutdown(self) -> None:
+        """Cancel every session and plan, wait for them to end, and start nothing more."""
         self._closing = True
         tasks = [task for _, task in self._scheduled.values()] + list(self._tasks.values())
         for task in tasks:
@@ -146,6 +167,7 @@ class TurboManager:
         self._scheduled.clear()
 
     def _is_busy(self, url: str) -> bool:
+        """Return True when the site has a plan, a launch or a running session."""
         task = self._tasks.get(url)
         return (
             url in self._scheduled
@@ -154,13 +176,19 @@ class TurboManager:
         )
 
     def _reserved_count(self) -> int:
-        """Everything that holds a ``max_sites`` slot (a scheduled one that is launching once)."""
+        """Return how many sites hold a ``max_sites`` slot: running, scheduled or launching.
+
+        A scheduled session that is launching counts once.
+        """
         running = {session.url for session in self.active()}
         return len(running | set(self._scheduled) | self._launching)
 
     async def _start_later(self, plan: ScheduledTurbo) -> None:
-        # The plan stays in _scheduled until its session runs, so /turbo stop can still
-        # cancel it while the sub-pages are probed (the cancellation ends _launch).
+        """Wait until the plan's start time, then launch its session.
+
+        The plan stays listed until the session runs, so /turbo stop can still cancel it
+        while the sub-pages are probed.
+        """
         try:
             await self._sleep(max(plan.start_at - self._clock(), 0.0))
             if not self._closing:
@@ -171,15 +199,18 @@ class TurboManager:
                 del self._scheduled[plan.url]
 
     async def _launch(self, url: str, duration: float) -> TurboSession:
-        # Probing the sub-pages takes a moment; keep the URL reserved meanwhile so a
-        # concurrent /turbo can neither duplicate it nor take its slot.
+        """Probe the site's pages, then create and start its session.
+
+        The URL stays reserved while probing, so a concurrent /turbo can neither start it
+        twice nor take its slot. Raises TurboNotRunning if a stop or shutdown came meanwhile.
+        """
         self._launching.add(url)
         try:
             limits = self.limits
             pages = await self._pick_pages(url, limits.max_pages)
             if self._closing or url in self._called_off:
                 self._called_off.discard(url)
-                raise TurboNotRunning(url)  # the bot is shutting down, or /turbo stop came
+                raise TurboNotRunning(url)
             session = self._factory(url, pages, duration, lambda: self.limits)
             task = asyncio.create_task(session.run(), name=f"turbo:{url}")
             task.add_done_callback(lambda done, u=url: self._on_done(u, done))
@@ -190,9 +221,11 @@ class TurboManager:
             self._launching.discard(url)
 
     async def _pick_pages(self, url: str, max_pages: int) -> list[str]:
+        """Return the live pages of the site, at most ``max_pages`` of them."""
         return (await live_pages(self._prober, self._deriver, url))[:max_pages]
 
     def _on_done(self, url: str, task: asyncio.Task[TurboStats]) -> None:
+        """Forget a finished session, and tell the user if it crashed."""
         if self._tasks.get(url) is task:
             del self._tasks[url]
             self._sessions.pop(url, None)

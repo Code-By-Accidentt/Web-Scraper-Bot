@@ -1,4 +1,4 @@
-"""Formatting and delivering Telegram alerts (HTML markup, see :mod:`markup`)."""
+"""Formats and delivers the alerts and notices the bot sends on its own (Telegram HTML)."""
 
 from __future__ import annotations
 
@@ -30,7 +30,12 @@ log = logging.getLogger(__name__)
 
 
 class Notifier:
-    """Everything the bot says on its own initiative goes through here."""
+    """Sends everything the bot says on its own initiative.
+
+    Token alerts go out at once and get their details edited in later. Notices that follow
+    alerts (a turbo summary, an auto-pause) wait until those alerts have left, so a summary
+    never arrives before the alerts it follows.
+    """
 
     def __init__(
         self,
@@ -42,6 +47,11 @@ class Notifier:
         enricher: TokenEnricher | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Send to ``chat_ids``; the optional ``enricher`` adds token details to alerts.
+
+        ``max_examples`` (examples per change report) is a number or a function that returns
+        the live value. A problem is reported once per ``problem_cooldown`` seconds per key.
+        """
         self._telegram = telegram
         self._chat_ids = tuple(chat_ids)
         self._max_examples = max_examples if callable(max_examples) else (lambda: max_examples)
@@ -53,15 +63,15 @@ class Notifier:
         # Token alerts and documents that have not left yet: a summary must not overtake them.
         self._unsent: set[asyncio.Future[Any]] = set()
 
-    # ── lifecycle and failures ──────────────────────────────────────────────
     async def started(self, version: str, total_sites: int, running: int) -> None:
+        """Announce that the bot started and how many sites are running."""
         await self._send(
             f"🤖 Bot started (v{escape(version)}): {running}/{total_sites} site(s) running. "
             f"Send {code('/status')} for details."
         )
 
     async def outdated_defaults(self, changes: Sequence[ChangedDefault]) -> bool:
-        """Name the .env lines that pin an old default; True when some chat received it."""
+        """List the .env lines that pin an old default; return True when a chat received it."""
         listed = "\n".join(
             f"• {code(f'{c.key}={c.previous}')} → the default is now {code(c.current)}"
             for c in changes
@@ -77,21 +87,28 @@ class Notifier:
         return any(sent)
 
     async def problem(self, key: str, title: str, detail: str, hint: str | None = None) -> bool:
-        """Report a failure at most once per cooldown per ``key``; True when a chat got it."""
+        """Report a failure; return True when a chat received it.
+
+        The same ``key`` is reported at most once per cooldown.
+        """
         if not self._problem_due(key):
             return False
         return await self._send(_problem_text(title, detail, hint))
 
     def report_later(self, key: str, title: str, detail: str, hint: str | None = None) -> None:
-        """:meth:`problem` for synchronous code (a task done-callback); sent in the background."""
+        """Like :meth:`problem`, for synchronous code such as a task done-callback.
+
+        The message is sent in the background.
+        """
         if self._problem_due(key):
             self._spawn(self._send(_problem_text(title, detail, hint)))
 
     def rpc_endpoints_stuck(self, endpoints: Sequence[FailingEndpoint], retry_delay: float) -> None:
-        """RPC endpoints that have not answered for minutes: one 🛑 per outage.
+        """Report RPC endpoints that have not answered for minutes, once per outage.
 
-        The validators call it when an endpoint joins the ones failing for minutes, not
-        while an outage lasts, so a long Arc outage is one message, not one per cooldown.
+        The validators call it when an endpoint starts failing for minutes, not again while
+        the outage lasts, so a long outage is one message. Since it is said only once, it
+        goes out patiently in the background.
         """
         required = any(not endpoint.optional for endpoint in endpoints)
         detail = "\n".join(
@@ -112,10 +129,10 @@ class Notifier:
             "Replace the endpoint in .env (an empty EVM URL skips that network) and restart."
         )
         text = _problem_text("On-chain checks keep failing", detail, " ".join(hints))
-        self._spawn(self._send(text, patient=True))  # said once per outage: it must arrive
+        self._spawn(self._send(text, patient=True))
 
     def _problem_due(self, key: str) -> bool:
-        """True (and the cooldown starts) unless ``key`` was reported within the cooldown."""
+        """Return True and restart the cooldown, unless ``key`` was reported within it."""
         now = self._clock()
         last = self._problems.get(key)
         if last is not None and now - last < self._problem_cooldown:
@@ -124,21 +141,23 @@ class Notifier:
         return True
 
     async def drain(self, timeout: float = 10.0) -> None:
-        """Wait (a bounded time) for alerts still being delivered, e.g. before shutting down."""
+        """Wait up to ``timeout`` seconds for alerts still being delivered, e.g. at shutdown."""
         pending = set(self._background)
         if pending:
             await asyncio.wait(pending, timeout=timeout)
 
-    # ── monitoring ──────────────────────────────────────────────────────────
     async def page_discovered(self, page_url: str) -> None:
+        """Announce a new sub-page that is monitored from now on."""
         await self._send(f"🔍 Sub-page found: {escape(page_url)}\nMonitoring started.")
 
     async def page_changed(self, report: ChangeReport) -> None:
+        """Send the change report of a page."""
         await self._send(self.format_report(report, self._max_examples()))
 
     async def page_timing_out(
         self, page_url: str, streak: int, reason: str, timeout: float
     ) -> None:
+        """Warn that a page keeps failing to render and now has a longer load timeout."""
         await self._send(
             f"🐢 {escape(page_url)} has not rendered {streak} times in a row ({escape(reason)}).\n"
             f"Load timeout for this page raised to {timeout:.0f}s; "
@@ -146,11 +165,13 @@ class Notifier:
         )
 
     async def page_renders_again(self, page_url: str, timeout: float) -> None:
+        """Say that a page renders again and its load timeout is back to normal."""
         await self._send(
             f"✅ {escape(page_url)} renders again; load timeout back to {timeout:.0f}s."
         )
 
     async def captcha_shown(self, page_url: str, widget: str) -> None:
+        """Warn that a page shows a captcha widget, which the bot does not solve."""
         await self._send(
             f"🧩 Captcha on {escape(page_url)}: the page shows a {escape(widget)} widget.\n"
             "The bot keeps watching the page, but it does not solve captchas: whatever "
@@ -168,9 +189,9 @@ class Notifier:
     ) -> None:
         """Announce a token right away; its details follow as an edit of the same message.
 
-        Delivery runs in a task the notifier owns: a cancelled round must not lose an alert
-        whose token is already in the known cache, and a Telegram rate limit must not hold
-        up the page check.
+        Delivery runs in a task the notifier owns, so a cancelled round cannot lose an alert
+        whose token is already in the known cache, and a rate limit does not hold up the
+        page check.
         """
         head = [
             f"🔔 Contract found on {escape(page_url)}",
@@ -184,7 +205,7 @@ class Notifier:
     ) -> None:
         """Send many addresses as one text document instead of a burst of messages.
 
-        Like a token alert it is delivered from a task the notifier owns: the tokens are
+        Like a token alert, it is delivered from a task the notifier owns: the tokens are
         already marked as announced, so a cancelled round must not lose the document.
         """
         lines = sorted(f"{c.address.value}\t{c.network}" for c in contracts)
@@ -210,10 +231,11 @@ class Notifier:
         pages: Sequence[str],
         first_check: bool = False,
     ) -> None:
-        """``first_check``: the page's first round since its monitor (re)started.
+        """Say that a site was paused because a page showed ``count`` tokens at once.
 
-        Sent from a task of its own after the document with the tokens: the caller (the
-        site's monitor, already paused) is not held up by a Telegram flood limit.
+        ``first_check`` means it was the page's first round since its monitor (re)started.
+        The message goes out from its own task after the document with the tokens, so a
+        flood limit does not hold up the caller (the site's monitor, already paused).
         """
         listed = "\n".join(f"• {escape(page)}" for page in pages)
         why = (
@@ -231,9 +253,8 @@ class Notifier:
             f"Send {code(f'/resume {site_url}')} to continue; these tokens will not be "
             "announced again."
         )
-        self._spawn(self._after_alerts(text, patient=True))  # the document goes first
+        self._spawn(self._after_alerts(text, patient=True))
 
-    # ── unverified addresses (/unverified mode) ─────────────────────────────
     async def unverified_address(
         self,
         address: Address,
@@ -241,6 +262,10 @@ class Notifier:
         recheck_seconds: float,
         watch_seconds: float | None = None,
     ) -> None:
+        """Announce an address that is not a confirmed token yet and is re-checked on-chain.
+
+        ``watch_seconds``, when given, is how long it stays watched.
+        """
         window = f" for {format_duration(watch_seconds)}" if watch_seconds else ""
         await self._send(
             f"⚠️ Unverified address on {escape(page_url)}\n"
@@ -251,6 +276,7 @@ class Notifier:
         )
 
     async def address_confirmed(self, contract: ConfirmedContract, page_url: str) -> None:
+        """Announce that an unverified address became a token; details follow as an edit."""
         head = [
             f"✅ Confirmed: {code(contract.address.value)} is a token on "
             f"{escape(contract.network)}",
@@ -259,16 +285,17 @@ class Notifier:
         self._spawn_alert(contract, head, None, None)
 
     async def unverified_digest(self, site_url: str, count: int, watch_seconds: float) -> None:
+        """Say how many more unverified addresses appeared after the hourly alert cap."""
         await self._send(
             f"📨 {count} more unverified address(es) appeared on {escape(site_url)} in the last "
             f"hour (alert cap reached). They are watched for {format_duration(watch_seconds)}; "
             f"any that becomes a contract will be announced."
         )
 
-    # ── turbo mode ──────────────────────────────────────────────────────────
     async def turbo_started(
         self, site_url: str, pages: int, interval: float, minutes: float, stop_after: int
     ) -> None:
+        """Announce a turbo session: how many pages, how often, and when it stops."""
         ending = (
             f"after {stop_after} confirmed contract(s) or in {minutes:.0f} min"
             if stop_after
@@ -288,18 +315,19 @@ class Notifier:
         seconds: float,
         renders: int,
     ) -> None:
+        """Send the turbo summary once the token alerts it lists have gone out."""
         found = "\n".join(f"• {code(c.address.value)} ({escape(c.network)})" for c in contracts)
         text = (
             f"🎯 Turbo finished on {escape(site_url)}: {escape(reason)}\n"
             f"Duration {seconds:.0f}s, {renders} renders, {len(contracts)} confirmed contract(s)."
             + (f"\n{found}" if found else "")
         )
-        self._spawn(self._after_alerts(text))  # the tokens listed here are announced first
+        self._spawn(self._after_alerts(text))
 
-    # ── blocking ────────────────────────────────────────────────────────────
     async def site_blocked(
         self, site_url: str, page_url: str, signal: BlockSignal, next_delay: float
     ) -> None:
+        """Warn that a site seems to block the bot and that its checks slow down."""
         lines = [
             f"🚫 Possible IP block on {escape(site_url)}",
             f"Page: {escape(page_url)}",
@@ -317,14 +345,15 @@ class Notifier:
         await self._send("\n".join(lines))
 
     async def site_recovered(self, site_url: str, blocked_for: float | None = None) -> None:
+        """Say that a site answers normally again and how long the block lasted, if known."""
         after = f" after {format_duration(blocked_for)}" if blocked_for is not None else ""
         await self._send(
             f"✅ {escape(site_url)} answers normally again{after}; normal interval restored."
         )
 
-    # ── formatting ──────────────────────────────────────────────────────────
     @staticmethod
     def format_report(report: ChangeReport, max_examples: int) -> str:
+        """Return a change report as text, with at most ``max_examples`` lines per section."""
         counts = report.counts
         lines = [
             f"‼️ Changes on {escape(report.url)}",
@@ -348,7 +377,6 @@ class Notifier:
         lines.append(f"\n➡️ {escape(report.url)}")
         return "\n".join(lines)
 
-    # ── token alerts ────────────────────────────────────────────────────────
     async def _deliver_token(
         self,
         contract: ConfirmedContract,
@@ -357,7 +385,11 @@ class Notifier:
         timeline: Timeline | None,
         out: asyncio.Future[None],
     ) -> None:
-        """Send the alert, then edit the token's details into it (never before sending)."""
+        """Send the token alert first, then edit the token's details into it.
+
+        ``out`` is resolved once the send is over, which lets waiting notices go. Details
+        never cost the alert: if they fail or add nothing, the first text stays.
+        """
         middle: list[str] = []
         found = found_line(contract, sighting)
         if found:
@@ -374,15 +406,16 @@ class Notifier:
         try:
             info = await self._enricher.enrich(contract)
             details = describe_token(info, self._clock())
-        except Exception:  # details must never cost the alert
+        except Exception:
             log.warning("token details failed for %s", contract.address.value, exc_info=True)
             return
         if not [line for line in details if line != NO_PAIR_YET] and not info.coin_type:
-            return  # nothing worth an edit
+            return
         text = "\n".join([*head, *details, *middle, *link_lines(contract, info.coin_type)])
         await asyncio.gather(*(self._telegram.edit_message_text(m, text) for m in sent))
 
     async def _send_tracked(self, text: str) -> list[SentMessage]:
+        """Send ``text`` patiently to every alert chat; return the messages that went out."""
         if not self._chat_ids:
             log.warning("no TELEGRAM_CHAT_IDS configured; dropping alert: %s", text.splitlines()[0])
             return []
@@ -398,6 +431,10 @@ class Notifier:
         sighting: Sighting | None,
         timeline: Timeline | None,
     ) -> None:
+        """Start delivering a token alert in the background.
+
+        Until its first send is over it counts as unsent, so later notices wait for it.
+        """
         out: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._unsent.add(out)
         out.add_done_callback(self._unsent.discard)
@@ -406,35 +443,38 @@ class Notifier:
     async def _after_alerts(self, text: str, *, patient: bool = False) -> None:
         """Send ``text`` once the token alerts and documents under way have left.
 
-        They wait out flood limits themselves (a few minutes at most); the bound only keeps
-        a stuck delivery from holding this message forever.
+        The alerts wait out flood limits themselves (a few minutes at most); the time limit
+        here only keeps a stuck delivery from holding this message forever.
         """
         if self._unsent:
             await asyncio.wait(set(self._unsent), timeout=_ALERTS_OUT_WAIT)
         await self._send(text, patient=patient)
 
     def _spawn(self, work: Coroutine[Any, Any, Any]) -> asyncio.Future[Any]:
+        """Run ``work`` as a background task the notifier keeps track of; return the task."""
         task = asyncio.ensure_future(work)
         self._background.add(task)
         task.add_done_callback(self._finished)
         return task
 
     def _finished(self, task: asyncio.Future[Any]) -> None:
+        """Forget a finished background task and log its error, if it failed."""
         self._background.discard(task)
         if not task.cancelled() and task.exception() is not None:
             log.error("delivering an alert failed", exc_info=task.exception())
 
     async def _send(self, text: str, *, patient: bool = False) -> bool:
-        """Send to every alert chat; True when at least one of them received it."""
+        """Send ``text`` to every alert chat; return True when at least one received it."""
         if not self._chat_ids:
             log.warning("no TELEGRAM_CHAT_IDS configured; dropping alert: %s", text.splitlines()[0])
             return False
         return await self._telegram.broadcast(self._chat_ids, text, patient=patient)
 
 
-_ALERTS_OUT_WAIT = 300.0  # longest wait of a follow-up notice for the alerts it follows
+_ALERTS_OUT_WAIT = 300.0  # seconds a follow-up notice waits at most for the alerts before it
 
 
 def _problem_text(title: str, detail: str, hint: str | None) -> str:
+    """Return the text of a problem message; the detail is cut to 1500 characters."""
     text = f"🛑 {escape(title)}\n{pre(str(detail)[:1500])}"
     return f"{text}\n{escape(hint)}" if hint else text
