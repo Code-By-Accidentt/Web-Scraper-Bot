@@ -7,26 +7,19 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
-from scraper_bot.chains.address_extractor import AddressExtractor
-from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.models import (
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SightingSource,
-    Signature,
-    Snapshot,
-    ValidationResult,
-)
-from scraper_bot.pages.blocking import BlockDetector
-from scraper_bot.pages.change_detector import ChangeDetector
-from scraper_bot.pages.fetcher import FetchResult, PageFetcher
-from scraper_bot.pages.html_normalizer import HtmlNormalizer
-from scraper_bot.pages.noise_filter import NoiseFilter
+from scraper_bot.chains.addresses.extractor import AddressExtractor
+from scraper_bot.chains.validator import ContractValidator
+from scraper_bot.models.addresses import ValidationResult
+from scraper_bot.models.pages import PageCheckOutcome, PageStatus, Signature, Snapshot
+from scraper_bot.models.sightings import Observation, Sighting, SightingSource
+from scraper_bot.pages.changes.detector import ChangeDetector
+from scraper_bot.pages.changes.noise import NoiseFilter
+from scraper_bot.pages.changes.normalizer import HtmlNormalizer
+from scraper_bot.pages.fetching.blocking import BlockDetector
+from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
-from scraper_bot.preferences import Tuning
-from scraper_bot.storage import SnapshotStore
+from scraper_bot.settings.live import Tuning
+from scraper_bot.storage.snapshots import SnapshotStore
 
 log = logging.getLogger(__name__)
 
@@ -36,12 +29,11 @@ Observer = Callable[[Observation], Awaitable[None]]
 def _without_old_deep(
     sightings: tuple[Sighting, ...], deep_seen: frozenset[str] | None, *, recording: bool
 ) -> tuple[tuple[Sighting, ...], frozenset[str] | None]:
-    """Leave out the addresses a page's scripts and JSON carried when deep scan first saw it.
+    """Drop the script-only addresses a page already carried when deep scan first saw it.
 
-    Wallet kits and price widgets ship dozens of token addresses in their bundles; none
-    of them is a launch. While ``recording`` (the page's first round with deep scan) every
-    address found only there is remembered and left out; afterwards only new ones get
-    through. An address that also shows in the page itself is never left out.
+    Wallet kits and price widgets ship dozens of token addresses in their bundles. On the
+    page's first deep-scan round (``recording``) all of them are remembered and left out;
+    later only new ones get through. Return the kept sightings and the remembered set.
     """
     deep = frozenset(s.address.value for s in sightings if s.source is SightingSource.SCRIPT)
     if recording:
@@ -58,14 +50,11 @@ def _without_old_deep(
 
 
 class PageChecker:
-    """Runs the per-page pipeline; keeps no per-page state.
+    """Runs the full check of one page and keeps no per-page state itself.
 
-    A change counts only when it survives a second render taken ``confirm_delay``
-    seconds later: whatever differs between the two renders is volatile, elements
-    that keep changing across rounds are silenced by :class:`NoiseFilter`, and the
-    snapshot advances to the second render without the volatile nodes it did not have,
-    so noise never accumulates and a change that landed between the renders is
-    reported by the next round.
+    A change counts only if a second render ``confirm_delay`` seconds later still shows it;
+    what differs between the two renders is volatile and stays out of the report and the
+    snapshot. Elements that keep changing across rounds are silenced by :class:`NoiseFilter`.
     """
 
     def __init__(
@@ -82,6 +71,7 @@ class PageChecker:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.time,
     ) -> None:
+        """Keep the parts the check uses; ``sleep`` and ``clock`` can be swapped in tests."""
         self._fetcher = fetcher
         self._normalizer = normalizer
         self._detector = detector
@@ -100,20 +90,19 @@ class PageChecker:
         load_timeout: float | None = None,
         on_observation: Observer | None = None,
     ) -> PageCheckOutcome:
-        """Check one page; ``load_timeout`` replaces the configured load timeout (seconds).
+        """Check one page and return the outcome; ``load_timeout`` (seconds) overrides the default.
 
-        ``on_observation`` gets the first render's addresses and verdicts as soon as they are
-        known, before the comparison and any second render, so a token alert never waits for
-        change detection. Later calls carry only the addresses the confirming render adds.
+        ``on_observation`` gets the first render's addresses and verdicts at once, before any
+        comparison, so a token alert never waits for change detection. Later calls carry only
+        the addresses the second render adds.
         """
         started = self._clock()
         first = await self._fetcher.fetch(page_url, timeout=load_timeout)
         seen_at = self._clock()
         if first.started_at is not None:
-            started = first.started_at  # after the wait for a free tab
+            started = first.started_at
         block = self._blocks.inspect(first)
         if not first.ok:
-            # A challenge or ban page must never be diffed against the real snapshot.
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNAVAILABLE,
@@ -131,11 +120,10 @@ class PageChecker:
             recording = deep_seen is None and bool(first.extra_texts)
             sightings, deep_seen = _without_old_deep(found, deep_seen, recording=recording)
         else:
-            # A 2xx answer that looks like a challenge may be the real page with an unlucky
-            # title: what it shows is read (a CA must not wait), not its source or scripts.
+            # A 2xx "challenge" may be the real page with an unlucky title: read what it shows.
             sightings = tuple(shown_on_a_challenge(found))
         if recording and snapshot is not None:
-            # A page stored before deep scan was on: its deep sources are known from now on.
+            # Stored before deep scan was on: remember its script addresses from now on.
             snapshot.deep_seen = deep_seen
             self._snapshots.save(page_url, snapshot)
         results = await self._validate(sightings)
@@ -154,8 +142,8 @@ class PageChecker:
                 candidates=candidates,
             )
         captcha = await asyncio.to_thread(self._blocks.captcha, first.html)
+        # A blank 200 (deploy in progress, empty shell) is not a page to compare.
         if not current:
-            # A blank 200 (deploy in progress, empty shell) is not a page to compare.
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNAVAILABLE,
@@ -172,7 +160,6 @@ class PageChecker:
                 page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
             )
 
-        # Something differs: render again to separate real edits from volatile parts.
         await self._sleep(self._tuning.confirm_delay)
         started_again = self._clock()
         second = await self._fetcher.fetch(page_url, timeout=load_timeout)
@@ -181,7 +168,6 @@ class PageChecker:
             started_again = second.started_at
         block = self._blocks.inspect(second)
         if block is not None and second.ok:
-            # Like the first render: what a 2xx challenge-looking page shows is read.
             signature = await asyncio.to_thread(self._normalizer.signature, second.html)
             shown = shown_on_a_challenge(await self._sightings(signature, second))
             new = tuple(s for s in shown if s.address not in set(candidates))
@@ -231,11 +217,8 @@ class PageChecker:
                 candidates=candidates,
                 captcha=captcha,
             )
-        # The diffs are pure CPU work that can take seconds on pages with thousands of
-        # look-alike nodes; a worker thread keeps the other monitors and Telegram alive.
+        # The diffs can take seconds of CPU on big pages; a thread keeps the event loop free.
         volatile = await asyncio.to_thread(self._detector.volatile_nodes, current, confirmed)
-        # The snapshot keeps only confirmed content: a change that landed between the two
-        # renders (volatile now) is reported by the next round, if it lasts.
         report, accepted = await asyncio.to_thread(
             self._detector.diff, snapshot.signature, confirmed, page_url, ignore=volatile
         )
@@ -262,6 +245,7 @@ class PageChecker:
         )
 
     async def _sightings(self, signature: Signature, result: FetchResult) -> tuple[Sighting, ...]:
+        """Return one sighting per address found in a render, searched in a worker thread."""
         found = await asyncio.to_thread(
             find_sightings,
             self._extractor,
@@ -273,13 +257,17 @@ class PageChecker:
         return tuple(found)
 
     async def _validate(self, sightings: tuple[Sighting, ...]) -> tuple[ValidationResult, ...]:
+        """Check the sighted addresses and return one verdict each, in the same order."""
         if not sightings:
             return ()
         return tuple(await self._validator.validate_many(s.address for s in sightings))
 
     @staticmethod
     async def _observe(observer: Observer | None, observation: Observation) -> None:
-        """Tell the observer; its failure must not cost the change detection."""
+        """Pass the observation to the observer, if there is one.
+
+        A failing observer is only logged, so it never stops the change detection.
+        """
         if observer is None:
             return
         try:

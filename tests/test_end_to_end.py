@@ -17,14 +17,14 @@ from typing import Any
 
 import httpx
 
-from scraper_bot.app import Runtime, build_runtime
+from scraper_bot.app.runtime import Runtime, build_runtime
 from scraper_bot.chains.enrichment import TokenEnricher
-from scraper_bot.chains.evm import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
+from scraper_bot.chains.evm.abi import ERC20_DECIMALS, ERC20_NAME, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
 from scraper_bot.chains.networks import EVM_CHAINS
-from scraper_bot.config import Settings
-from scraper_bot.pages.fetcher import FetchResult
-from scraper_bot.preferences import Preferences
-from scraper_bot.telegram.commands import parse_command
+from scraper_bot.pages.fetching.result import FetchResult
+from scraper_bot.settings.env import Settings
+from scraper_bot.settings.live import Preferences
+from scraper_bot.telegram.commands.parsing import parse_command
 from scraper_bot.telegram.notifier import Notifier
 from tests.conftest import FakeFetcher, FakeTelegram, make_settings
 

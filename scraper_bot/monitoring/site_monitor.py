@@ -10,25 +10,18 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from itertools import islice
 
-from scraper_bot.models import (
-    Address,
-    ConfirmedContract,
-    LastChange,
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SiteState,
-    Timeline,
-)
+from scraper_bot.models.addresses import Address, ConfirmedContract
+from scraper_bot.models.pages import PageCheckOutcome, PageStatus
+from scraper_bot.models.sightings import Observation, Sighting, Timeline
+from scraper_bot.models.sites import LastChange, SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
-from scraper_bot.monitoring.pending import PendingWatch
+from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
-from scraper_bot.pages.fetcher import HttpProber
+from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.pages.urls import SubUrlDeriver
-from scraper_bot.preferences import Tuning
+from scraper_bot.settings.live import Tuning
 from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)
@@ -39,31 +32,31 @@ AutoPauseCallback = Callable[[str, str], Awaitable[None]]
 
 @dataclass(slots=True)
 class MonitorStats:
-    """Runtime counters of one monitor, shown by /status (not persisted)."""
+    """Live counters of one monitor, shown by /status and never saved."""
 
     rounds: int = 0
     last_round_at: float | None = None
     last_round_seconds: float = 0.0
     last_pages: int = 0
-    # Suspected block: every round with a block signal doubles the pause (cap: block_max_backoff).
-    block_level: int = 0
+    block_level: int = 0  # each level doubles the pause between rounds (up to block_max_backoff)
     block_reason: str | None = None
     blocked_since: float | None = None
     retry_after: float | None = None
-    timing_out: int = 0  # pages flagged for repeated load timeouts (see render_failure_threshold)
+    timing_out: int = 0  # pages the user was warned about for repeated load timeouts
 
     @property
     def blocked(self) -> bool:
+        """True while the site seems to block the bot."""
         return self.block_level > 0
 
 
 @dataclass(slots=True)
 class _PageHealth:
-    """Consecutive load timeouts of one page and the timeout stretch they earned."""
+    """Load timeouts in a row of one page, and how far its load timeout was stretched."""
 
     timeouts: int = 0
-    factor: int = 1  # multiplier on page_load_timeout, grows to _MAX_TIMEOUT_FACTOR
-    warned: bool = False  # the user heard about this streak
+    factor: int = 1  # page_load_timeout is multiplied by this, up to _MAX_TIMEOUT_FACTOR
+    warned: bool = False
 
 
 _MAX_BLOCK_LEVEL = 8
@@ -74,12 +67,8 @@ _FIRST_SEEN_MEMORY = 20_000  # (page, address) pairs remembered for "on page sin
 class SiteMonitor:
     """Runs rounds of checks for one site until asked to stop.
 
-    A round probes the sub-pages and checks the live ones concurrently. Tokens are
-    announced as soon as a render's addresses are validated (``on_observation``); other
-    addresses that may still become a token go to the pending watch. New pages and
-    changes are announced after the comparison, and the unverified watcher is fed. The
-    site auto-pauses when one page yields ``contract_pause_threshold`` newly announced
-    tokens in one round. Tuning is re-read every round, so /set changes apply at once.
+    Each round checks the live pages concurrently and announces tokens as soon as a render
+    shows them. Tuning is re-read every round, so /set changes apply at once.
     """
 
     def __init__(
@@ -100,6 +89,10 @@ class SiteMonitor:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         page_load_timeout: float = 30.0,
     ) -> None:
+        """Set up the monitor of ``site``; nothing runs until :meth:`run`.
+
+        ``sleep`` replaces the stop-aware wait between rounds (tests pass an instant one).
+        """
         self._site = site
         self._checker = checker
         self._prober = prober
@@ -112,7 +105,7 @@ class SiteMonitor:
         self._registry = registry or AlertRegistry()
         self._pending = pending
         self._rng = rng or random.Random()
-        self._sleep = sleep  # tests replace the stop-aware wait with an instant one
+        self._sleep = sleep
         self._page_load_timeout = page_load_timeout
         self._stop = asyncio.Event()
         self._stats = MonitorStats()
@@ -124,16 +117,20 @@ class SiteMonitor:
 
     @property
     def stats(self) -> MonitorStats:
+        """The live counters of this monitor."""
         return self._stats
 
     @property
     def stopped(self) -> bool:
+        """True once a stop was requested."""
         return self._stop.is_set()
 
     def request_stop(self) -> None:
+        """Ask the monitor to stop; a round in progress still finishes."""
         self._stop.set()
 
     async def run(self) -> None:
+        """Run rounds, with a pause between them, until a stop is requested."""
         log.info("monitor started for %s", self._site.url)
         try:
             while not self._stop.is_set():
@@ -145,7 +142,11 @@ class SiteMonitor:
             log.info("monitor stopped for %s", self._site.url)
 
     async def run_once(self) -> list[PageCheckOutcome]:
-        """One round over every live page; each outcome is handled as soon as it arrives."""
+        """Check every live page once and return the outcomes.
+
+        Each outcome is handled as soon as its check ends. A failed check is reported to the
+        user and left out of the result.
+        """
         started = time.perf_counter()
         self._round_tokens = {}
         pages = await live_pages(self._prober, self._deriver, self._site.url)
@@ -176,13 +177,17 @@ class SiteMonitor:
         self._stats.last_round_seconds = time.perf_counter() - started
         self._stats.last_pages = len(pages)
         for url in [url for url in self._health if url not in pages]:
-            del self._health[url]  # the page is gone (probe says so); its streak with it
+            del self._health[url]
         self._stats.timing_out = sum(1 for health in self._health.values() if health.warned)
         await self._update_block_state(outcomes)
         return outcomes
 
     def next_delay(self) -> float:
-        """Seconds until the next round: the random interval, doubled per block level."""
+        """Return the seconds until the next round.
+
+        That is a random interval doubled per block level (up to ``block_max_backoff``), and
+        never shorter than a Retry-After the site asked for.
+        """
         base = self._rng.uniform(self._tuning.poll_interval_min, self._tuning.poll_interval_max)
         cap = max(self._tuning.block_max_backoff, base)
         delay = min(base * (2**self._stats.block_level), cap)
@@ -191,6 +196,10 @@ class SiteMonitor:
         return delay
 
     async def _check_and_handle(self, page_url: str) -> PageCheckOutcome:
+        """Check one page, handle the outcome and track its load timeouts.
+
+        A page with a timeout streak gets a longer load timeout.
+        """
         health = self._health.get(page_url)
         stretched = None
         if health is not None and health.factor > 1:
@@ -203,15 +212,16 @@ class SiteMonitor:
         return outcome
 
     async def _observed(self, observation: Observation) -> None:
-        """Announce the tokens a render showed, before the page is even compared."""
+        """Announce the tokens a render showed, before the page is even compared.
+
+        Addresses that may still become a token go to the pending watch.
+        """
         page, seen_at = observation.page_url, observation.seen_at
         missing_at = self._last_read.get(page)
-        # A sub-page first seen after the first round went live meanwhile (app.<domain> at a
-        # launch): what it shows is news, although the monitor never read it before.
+        # A sub-page first seen after the first round went live meanwhile: what it shows is news.
         site = self._site
         new_page = page != site.url and page not in site.announced_pages and self._stats.rounds > 0
-        # A render shows the page as it was at some moment between its start and end, so
-        # the next appearance window opens at the render's start and always contains it.
+        # A render shows the page as of some moment after its start: the next window opens there.
         started = observation.started_at
         if observation.read:  # a challenge or a blank render did not show the page
             self._last_read[page] = started if started is not None else seen_at
@@ -230,7 +240,7 @@ class SiteMonitor:
             sighting = sightings.get(spot)
             contract = result.contract
             if contract is None:
-                if self._pending is not None:  # it may still become a token: watch it
+                if self._pending is not None:
                     self._pending.offer(self._site.url, page, sighting, result)
                 continue
             first = self._first_seen.get((page, spot), seen_at)
@@ -259,9 +269,7 @@ class SiteMonitor:
             return
         if self._pending is not None:
             for contract, _, timeline in new:
-                # A turbo session on this site counts a token that appeared between two
-                # renders or on a page that went live; one already there at the page's first
-                # check is old news to it.
+                # Turbo counts a token only if it appeared since the last read or on a new page.
                 if timeline.missing_at is not None or new_page:
                     self._pending.announced(self._site.url, contract.address)
         count = self._round_tokens.get(page_url, 0) + len(new)
@@ -284,11 +292,15 @@ class SiteMonitor:
             page_url,
             count,
             self._deriver.pages(site.url),
-            first_check=self._stats.rounds == 0,  # most likely tokens the page already listed
+            first_check=self._stats.rounds == 0,
         )
 
     async def _track_timeouts(self, outcome: PageCheckOutcome) -> None:
-        """Count load timeouts in a row per page; stretch its timeout and tell the user once."""
+        """Count a page's load timeouts in a row and stretch its load timeout as they grow.
+
+        The timeout grows every ``render_failure_threshold`` timeouts. The user is told once
+        per streak, and again when the page loads normally.
+        """
         threshold = self._tuning.render_failure_threshold
         health = self._health.get(outcome.url)
         if outcome.timed_out:
@@ -320,6 +332,11 @@ class SiteMonitor:
             await self._notifier.page_renders_again(outcome.url, self._page_load_timeout)
 
     async def _handle(self, outcome: PageCheckOutcome) -> None:
+        """Log a page's outcome and announce a new page, a captcha or a change.
+
+        It also feeds the unverified watcher. Tokens were already announced by
+        :meth:`_observed` as soon as the renders showed them.
+        """
         site = self._site
         if outcome.status is PageStatus.UNAVAILABLE:
             log.info("[%s] %s unavailable: %s", site.url, outcome.url, outcome.error)
@@ -329,7 +346,6 @@ class SiteMonitor:
             if outcome.captcha is not None:
                 await self._announce_captcha(outcome.url, outcome.captcha)
 
-        # Tokens were announced by _observed as soon as the renders showed them.
         if self._watcher is not None and outcome.candidates:
             await self._watcher.observe(outcome.candidates, outcome.url)
 
@@ -346,6 +362,7 @@ class SiteMonitor:
             log.warning("[%s] %s skipped: %s", site.url, outcome.url, outcome.error)
 
     async def _announce_if_new(self, page_url: str) -> None:
+        """Tell the user about a sub-page the first time it answers."""
         site = self._site
         if page_url == site.url or page_url in site.announced_pages:
             return
@@ -365,7 +382,10 @@ class SiteMonitor:
         await self._notifier.captcha_shown(page_url, widget)
 
     async def _update_block_state(self, outcomes: Sequence[PageCheckOutcome]) -> None:
-        """Slow down on block signals; restore the pace (and tell the user) on recovery."""
+        """Raise the block level on a block signal, or reset it once the root page answers.
+
+        The user is told when a block starts and when the site recovers.
+        """
         site, stats = self._site, self._stats
         signals = [(o.url, o.block) for o in outcomes if o.block is not None]
         if signals:
@@ -402,6 +422,7 @@ class SiteMonitor:
             )
 
     async def _sleep_between_rounds(self) -> None:
+        """Wait the planned delay (or a new one) before the next round, less if stopped."""
         delay = self._planned_delay if self._planned_delay is not None else self.next_delay()
         self._planned_delay = None
         if self._sleep is not None:

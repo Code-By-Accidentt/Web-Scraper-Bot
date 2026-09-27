@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from scraper_bot.models import Address, Chain, ConfirmedContract
+from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
 from scraper_bot.monitoring.alerts import AlertRegistry
-from scraper_bot.storage import AddressCache
+from scraper_bot.storage.address_cache import AddressCache
 
 MINT = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"
 SUI_PKG = "0x" + "ab" * 32

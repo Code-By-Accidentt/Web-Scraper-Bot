@@ -28,14 +28,14 @@ dev = [
 ]
 
 [project.scripts]
-scraper-bot = "scraper_bot.app:main"
+scraper-bot = "scraper_bot.app.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["scraper_bot", "scraper_bot.chains", "scraper_bot.pages", "scraper_bot.monitoring", "scraper_bot.telegram"]
+[tool.setuptools.packages.find]
+include = ["scraper_bot*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

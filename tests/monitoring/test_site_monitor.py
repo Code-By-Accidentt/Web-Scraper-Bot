@@ -6,24 +6,23 @@ from typing import Any
 
 import pytest
 
-from scraper_bot.models import (
+from scraper_bot.models.addresses import (
     Address,
     AddressKind,
-    BlockSignal,
     Chain,
-    ChangeCounts,
-    ChangeReport,
     ConfirmedContract,
-    Observation,
-    PageCheckOutcome,
-    PageStatus,
-    Sighting,
-    SightingSource,
-    SiteState,
-    Timeline,
     ValidationResult,
     ValidationStatus,
 )
+from scraper_bot.models.pages import (
+    BlockSignal,
+    ChangeCounts,
+    ChangeReport,
+    PageCheckOutcome,
+    PageStatus,
+)
+from scraper_bot.models.sightings import Observation, Sighting, SightingSource, Timeline
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.site_monitor import _MAX_BLOCK_LEVEL, SiteMonitor
 from scraper_bot.pages.urls import SubUrlDeriver
 from tests.conftest import FakeChecker, FakeNotifier, FakeProber, FakeTuning, node

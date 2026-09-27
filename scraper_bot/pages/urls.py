@@ -17,10 +17,10 @@ class InvalidUrlError(ValueError):
 
 
 def normalize_url(raw: str) -> str:
-    """Canonical form of ``raw``, or :class:`InvalidUrlError`.
+    """Return the canonical form of ``raw``; raise InvalidUrlError if it is not an http(s) URL.
 
-    https is assumed, scheme and host are lower-cased, a default port, the fragment and
-    a bare ``/`` path are dropped, so ``Example.com`` and ``https://example.com:443/``
+    https is assumed, the scheme and host are lower-cased, and a default port, the fragment
+    and a bare ``/`` path are dropped, so ``Example.com`` and ``https://example.com:443/``
     share one key. A fragment that is a route of a single-page app (``#/presale``,
     ``#!/presale``) names another view and is kept.
     """
@@ -53,7 +53,7 @@ def normalize_url(raw: str) -> str:
 
 
 def registrable_domain(url: str) -> str:
-    """Host of ``url`` without a leading ``www.``."""
+    """Return the host of ``url`` without a leading ``www.``."""
     host = (urlsplit(url).hostname or "").lower()
     return host[4:] if host.startswith("www.") else host
 
@@ -62,10 +62,14 @@ class SubUrlDeriver:
     """Expands a root URL into the well-known sub-pages worth watching."""
 
     def __init__(self, patterns: Iterable[str]) -> None:
+        """Keep the patterns: URL templates with a ``{domain}`` placeholder."""
         self._patterns = tuple(patterns)
 
     def derive(self, root_url: str) -> list[str]:
-        """Sub-pages for ``root_url`` in pattern order, without the root itself."""
+        """Return the sub-pages of ``root_url`` in pattern order, without the root itself.
+
+        Patterns that do not give a valid URL are skipped, and so are duplicates.
+        """
         domain = registrable_domain(root_url)
         seen: set[str] = {root_url}
         result: list[str] = []
@@ -80,11 +84,15 @@ class SubUrlDeriver:
         return result
 
     def pages(self, root_url: str) -> list[str]:
+        """Return the root URL followed by its sub-pages."""
         return [root_url, *self.derive(root_url)]
 
 
 def url_to_filename(url: str) -> str:
-    """Readable, collision-free file stem for ``url``."""
+    """Return a readable, collision-free file name for ``url``, without an extension.
+
+    The readable part is cut to 80 characters; a short hash of the full URL keeps names apart.
+    """
     parts = urlsplit(url)
     readable = _UNSAFE_RE.sub("_", f"{parts.netloc}{parts.path}").strip("_")[:80] or "page"
     digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]

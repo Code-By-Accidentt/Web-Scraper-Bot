@@ -12,11 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from scraper_bot.chains.contract_validators import ContractValidator
-from scraper_bot.config import Settings
-from scraper_bot.pages.fetcher import HttpProber, PlaywrightFetcher
+from scraper_bot.chains.validator import ContractValidator
+from scraper_bot.pages.fetching.chromium import PlaywrightFetcher
+from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
-from scraper_bot.preferences import Preferences, Tuning
+from scraper_bot.settings.env import Settings
+from scraper_bot.settings.live import Preferences, Tuning
 from scraper_bot.telegram.client import TelegramClient
 from scraper_bot.telegram.notifier import Notifier
 from tests.conftest import (

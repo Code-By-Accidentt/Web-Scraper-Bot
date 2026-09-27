@@ -3,17 +3,18 @@ from pathlib import Path
 import pytest
 
 import scraper_bot.monitoring.unverified as unverified_module
-from scraper_bot.models import (
+from scraper_bot.models.addresses import (
     Address,
     Chain,
     ConfirmedContract,
-    SiteState,
     address_key,
     parse_address_key,
 )
+from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
-from scraper_bot.storage import AddressCache, StateStore
+from scraper_bot.storage.address_cache import AddressCache
+from scraper_bot.storage.state import StateStore
 from tests.conftest import FakeNotifier, FakeTuning, FakeValidator
 
 ROOT = "https://example.com"

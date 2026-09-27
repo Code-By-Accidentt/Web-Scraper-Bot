@@ -136,9 +136,9 @@ bot token never appears in logs. Useful lines:
 scraper_bot.monitoring.site_monitor: [https://x.io] https://x.io/app: unchanged
 scraper_bot.monitoring.site_monitor: [https://x.io] https://x.io unavailable: timeout after 20s
 scraper_bot.monitoring.site_monitor: [https://x.io] possible block on https://x.io (Cloudflare challenge (HTTP 403)); next round in 16s
-scraper_bot.pages.fetcher: Chromium could not start with its sandbox (No usable sandbox! …); running without it
-scraper_bot.chains.contract_validators: Ethereum 0x1f9a… confirmed as a token on Base
-scraper_bot.chains.contract_validators: RPC endpoint Fantom is failing: eth_getCode via rpcapi.fantom.network: HTTP 502
+scraper_bot.pages.fetching.chromium: Chromium could not start with its sandbox (No usable sandbox! …); running without it
+scraper_bot.chains.validator: Ethereum 0x1f9a… confirmed as a token on Base
+scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via rpcapi.fantom.network: HTTP 502
 ```
 
 ## Alerts and what they mean

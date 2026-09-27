@@ -1,9 +1,11 @@
 import pytest
 
-from scraper_bot.chains.address_extractor import AddressExtractor, to_checksum_address
-from scraper_bot.chains.stoplist import StopList
-from scraper_bot.models import Address, Chain, Sighting, SightingSource
-from scraper_bot.pages.html_normalizer import HtmlNormalizer
+from scraper_bot.chains.addresses.extractor import AddressExtractor
+from scraper_bot.chains.addresses.formats import to_checksum_address
+from scraper_bot.chains.addresses.stoplist import StopList
+from scraper_bot.models.addresses import Address, Chain
+from scraper_bot.models.sightings import Sighting, SightingSource
+from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.sightings import CONTEXT_CHARS, find_sightings, hint_score
 
 TOKEN = "0x6982508145454Ce325dDbE47a25d4ec3d2311933"
@@ -118,7 +120,7 @@ def test_a_sui_coin_type_in_a_link_query_stays_a_link() -> None:
 
 
 def test_captcha_response_tokens_are_never_addresses() -> None:
-    from scraper_bot.pages.html_normalizer import HtmlNormalizer
+    from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 
     token = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"  # shaped like a mint
     html = (

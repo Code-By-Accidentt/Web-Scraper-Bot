@@ -12,7 +12,7 @@ playwright install chromium              # only for the opt-in browser tests
 ```bash
 pytest -q                                # ~940 tests, offline, about 12 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
-SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/test_fetcher_browser.py   # real Chromium
+SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/fetching/test_fetcher_browser.py   # real Chromium
 ```
 
 Tests never touch the network, the real `.env` or `data/`: settings are built with
@@ -30,7 +30,7 @@ a turbo session with a token deployed after its address was shown, unverified mo
 restart with restored state, a 403 block with recovery and a timeout streak. It runs in
 well under a second.
 
-Coverage sits at about 97% of lines. The browser path of `pages/fetcher.py` and
+Coverage sits at about 97% of lines. The browser path of `pages/fetching/chromium.py` and
 `Application.run()` itself are covered only by the opt-in browser tests and real runs.
 `pytest-cov` is not a dependency; install it locally if you want the numbers.
 
@@ -67,32 +67,32 @@ These numbers set the defaults in `.env.example`; re-measure before changing the
 
 ## How to add things
 
-**A live setting.** Add the field to `Settings` and `from_env()` in `config.py`, the line
+**A live setting.** Add the field to `Settings` and `from_env()` in `settings/env.py`, the line
 in `.env.example` (a test checks that keys and values match the code), the row in
-`docs/configuration.md`, a `PreferenceSpec` in `preferences.py` (key, `Settings`
+`docs/configuration.md`, a `PreferenceSpec` in `settings/catalog.py` (key, `Settings`
 attribute, section, kind, label, description, range, unit, scale, optional caution), the
 attribute in the `Tuning` protocol, the field in `tests.conftest.FakeTuning`. Read it
 from the tuning object at use time, never cache it.
 
 **An EVM network.** One `EvmChain` entry in `chains/networks.py` (name, `.env` key,
 default RPC, chain id, explorer and DexScreener links, `optional` for a young chain whose
-public nodes may fail), its stablecoins and wrapped tokens in `chains/stoplist.py`
+public nodes may fail), its stablecoins and wrapped tokens in `chains/addresses/stoplist.py`
 (check each `symbol()` on-chain), the line in `.env.example` and the row in
 `docs/configuration.md`. Settings, warm-up, chain-id check, validation, pending watch and
 alert links pick it up from the table; `tests/chains/test_networks.py` keeps the table
 consistent.
 
-**A chain family.** Add the pattern and canonical form in `chains/address_extractor.py`
-and a `Chain` member in `models.py`; a validator class in `chains/contract_validators.py`
-and a branch in `ContractValidator._lookup`; links in `chains/networks.py` and metadata
-lookups in `chains/enrichment.py`; helpers in a new `chains/<chain>.py` if the RPC surface
-is big; tests next to the existing ones with `httpx.MockTransport` responders;
+**A chain family.** Add the canonical form in `chains/addresses/formats.py`, the pattern
+in `chains/addresses/extractor.py` and a `Chain` member in `models/addresses.py`; a new
+package `chains/<chain>/` with a `validator.py` (and helpers next to it when the RPC
+surface is big), plus a branch in `ContractValidator._lookup` (`chains/validator.py`);
+links in `chains/networks.py` and metadata lookups in `chains/enrichment.py`; tests next to the existing ones with `httpx.MockTransport` responders;
 `.env.example` and the docs for the new RPC URL.
 
 **An alert.** A method on `telegram/notifier.py` (escape everything, monospace what
 people copy), the same method on `tests.conftest.FakeNotifier` recording the call, a
 row in `docs/operations.md`.
 
-**A command.** A handler in `telegram/commands.py` registered in `BotCommands._handlers`,
-a line in `COMMAND_HELP`, tests in `tests/telegram/test_commands.py`, a row in
+**A command.** A handler in `telegram/commands/handlers.py` registered in
+`BotCommands._handlers`, a line in `COMMAND_HELP` (`telegram/commands/help.py`), tests in `tests/telegram/commands/test_commands.py`, a row in
 `docs/commands.md`. Replies are HTML; use `usage()` for missing arguments.
