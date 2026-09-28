@@ -10,10 +10,14 @@ playwright install chromium              # only for the opt-in browser tests
 ## Checks
 
 ```bash
-pytest -q                                # ~960 tests, offline, about 14 s
+pytest -q                                # ~970 tests, offline, about 14 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
 SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/fetching/test_fetcher_browser.py   # real Chromium
 ```
+
+The browser tests use the browser `BROWSER_CHANNEL` names in the environment (Playwright's
+Chromium when it is unset); on Ubuntu 20.04, which has no Playwright Chromium, run them with
+`BROWSER_CHANNEL=chrome`.
 
 Tests never touch the network, the real `.env` or `data/`: settings are built with
 `tests.conftest.make_settings(tmp_path, ...)`, HTTP goes through `httpx.MockTransport`,
@@ -33,7 +37,8 @@ well under a second.
 Coverage sits at about 97% of lines. The browser path of `pages/fetching/chromium.py` and
 `Application.run()` itself are covered only by the opt-in browser tests (local pages in a
 real Chromium: the deep scan, a load timeout, a page that stops answering, tabs a page
-opens, a killed Playwright driver, the scheduled restart) and real runs.
+opens, a killed Playwright driver, the scheduled restart, addresses heard while a page
+loads, the hidden automation marks and cookies kept across a restart) and real runs.
 `pytest-cov` is not a dependency; install it locally if you want the numbers.
 
 ## Conventions
@@ -66,6 +71,8 @@ opens, a killed Playwright driver, the scheduled restart) and real runs.
 | Token details for an alert | 50–300 ms, all fields |
 | CPU per changed page | 800 nodes 17 ms, 8 000 nodes 0.13 s, 20 000 nodes 0.34 s (runs in a thread) |
 | Address extraction | 1 MB of JS 112 ms, 5 MB 0.57 s |
+| Address reported while the page loads (2.1.3, local page, 20 loads, instant validator) | 17 ms p50 / 21 ms p95 after the document was sent (the full read: 0.8 s); 23 / 29 ms after a script showed it on a page that keeps polling (the full read: 2.2 s); the same in Chromium and Chrome |
+| Timer fast path (2.1.3) | 2 ms on 900 nodes, 13–28 ms on 12 000 nodes, in a thread |
 
 These numbers set the defaults in `.env.example`; re-measure before changing them.
 

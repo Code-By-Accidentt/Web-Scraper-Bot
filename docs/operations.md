@@ -152,7 +152,7 @@ scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via r
 | `⚙️ .env still sets defaults of an earlier release:` + keys | Your `.env` pins values that were the default in an earlier release (it was copied whole from an older `.env.example`). Sent once per set of such values; the log repeats it at every start. | Delete those lines to get the new defaults, or keep them on purpose; restart. |
 | `🔍 Sub-page found: …` | A derived sub-page answered for the first time; it is monitored from now on. | – |
 | `‼️ Changes on …` + counts + `- / + / ~` examples | A confirmed change of the page: removed, added, attribute-changed elements. | Look at the page. Mute a noisy site with `/nonotifi`. |
-| `🔔 Contract found on …` + network, address, `Found in …: «…»`, `⏱ …`, links | A token appeared on the page: an ERC-20 (not an LP pair or vault), an SPL / Token-2022 mint or a Sui coin. It is sent the moment a render shows it, before the page is compared. In the chat's queue only command replies overtake it; it waits out any Telegram flood limit, and a send that failed before reaching Telegram or got a 5xx answer is tried again with growing pauses (about ten minutes in all); one that may have reached Telegram (the answer timed out) is not sent twice. Until every chat got it, it is kept in `outbox.json`: an alert cut off by a stop or crash is sent at the next start. `Found in` says where (page text, link, page source, loaded script, or via an LP pair) and quotes the text in front of the address, other addresses masked. `⏱` says between which two checks it appeared and when the alert was sent (the first attempt). A second or so later (in a burst, after the other queued alerts) the same message is edited to add the token's name and supply, Solana authorities and risky Token-2022 extensions (⚠️), its age (🆕 = a Solana mint created within the hour, or an EVM contract deployed within the last ~90 blocks; «more than …» is a lower bound: Solana nodes keep days of history, EVM nodes about 100 blocks of state), other networks with the same address and the DEX pair. | Read the quoted text: `CA:` next to it is the launch, `Partner`/`Treasury`/a comment is not. ⚠️ lines mean the issuer can still mint, freeze, tax or move holders' tokens. Tap the monospace address to copy. |
+| `🔔 Contract found on …` + network, address, `Found in …: «…»`, `⏱ …`, links | A token appeared on the page: an ERC-20 (not an LP pair or vault, nor a copy of a stablecoin or wrapped coin by its symbol), an SPL / Token-2022 mint or a Sui coin. It is sent the moment the page shows it, usually while the page still loads, before the page is compared. In the chat's queue only command replies overtake it; it waits out any Telegram flood limit, and a send that failed before reaching Telegram or got a 5xx answer is tried again with growing pauses (about ten minutes in all); one that may have reached Telegram (the answer timed out) is not sent twice. Until every chat got it, it is kept in `outbox.json`: an alert cut off by a stop or crash is sent at the next start. `Found in` says where (page text, link, page source, loaded script, or via an LP pair) and quotes the text in front of the address, other addresses masked. `⏱` says between which two checks it appeared and when the alert was sent (the first attempt). A second or so later (in a burst, after the other queued alerts) the same message is edited to add the token's name and supply, Solana authorities and risky Token-2022 extensions (⚠️), its age (🆕 = a Solana mint created within the hour, or an EVM contract deployed within the last ~90 blocks; «more than …» is a lower bound: Solana nodes keep days of history, EVM nodes about 100 blocks of state), the other networks where the same address is a token too, with its symbol there (`Also on: BSC (LIMP), Sonic (USDC.e)`), and the DEX pair. | Read the quoted text: `CA:` next to it is the launch, `Partner`/`Treasury`/a comment is not. ⚠️ lines mean the issuer can still mint, freeze, tax or move holders' tokens. Tap the monospace address to copy. |
 | a `.txt` document + `⏸️ Monitoring paused: N confirmed contracts found on …` | `contract_pause_threshold` or more new contracts on one page in one round: the site is paused and the tokens of the render that crossed the threshold come as a file (those of an earlier render of the same round went out as single alerts; N counts them all). The site is paused before either message goes out, and the pause message follows the document. When it says "This was the first check of the page since monitoring started or resumed", the page most likely lists tokens that existed before (after an update that adds a network, for example); they are known now and will not be announced again. | Look at the file, then `/resume <url>`. |
 | a `.txt` document `📄 N more contract(s) that were already on … at the first check (confirmed late)` | Tokens that such a first check showed but could confirm only later (Arc or Robinhood Chain answered late, or no network answered), usually after `/resume`. They are old news like those of the first document: one file per burst, sent once 10 s pass without another, no alert of their own. | Look at the file. |
 | `⚠️ Unverified address on …` | Only with `/unverified <url> on`: a new address on that site, not a token yet; it is re-checked on-chain. | Wait for `✅ Confirmed` or treat as a hint. |
@@ -174,6 +174,8 @@ scraper_bot.chains.rpc.health: RPC endpoint Fantom is failing: eth_getCode via r
 | `state.json` | no (you lose the site list) | Back it up; it is the whole configuration you made from Telegram. A damaged one is moved aside at start (`state.json.broken-<time>`, with a 🛑) instead of being overwritten. |
 | `state.json.broken-<time>` | yes, once repaired or not needed | A damaged `state.json`: repair it and put it back as `state.json` while the bot is stopped. |
 | `snapshots/*.json` | yes | The next round stores a fresh baseline; no alert is sent for the rebuild. Delete one file to reset one page. |
+| `browser_state.json` | yes | The browser's cookies and local storage (with `HIDE_AUTOMATION`); without it the next browser starts with none, and sites may ask their checks again. It holds the monitored sites' cookies: keep it private. |
+| `browser_state.json.bad` | yes | A state file the browser could not use, moved aside at launch. |
 | `known_contracts.txt` | yes | Every contract will be announced again when seen. The file is only appended to: lines it cannot read (another encoding, torn by a crash) are skipped and reported at every start until you fix or delete them. |
 | `rejected_addresses.txt` | yes | Every wallet on the pages is checked again once. Expired entries leave at start and every 1 000 new ones; unreadable lines are reported once, and the file is saved again without them. If the file cannot be read at all, that is reported and it is not rewritten at start. |
 | `evm_networks.txt` | yes | The EVM networks the caches were built with. Without it the next start counts every network as new: cached EVM rejections are forgotten and watched EVM addresses become old news (see Upgrading). |
@@ -196,7 +198,7 @@ a damaged `state.json`: their sites may come back with the repaired file.
 | Exit code 2, `Configuration error: …` | A wrong `.env` value; the message names the variable. | Fix the value. |
 | Exit code 2, `Telegram rejected TELEGRAM_BOT_TOKEN` | Wrong or revoked token. | New token from @BotFather. |
 | Exit code 3, `browser could not start: … Install it with: playwright install chromium` | Chromium missing or an incompatible Playwright. | `playwright install chromium`; on Ubuntu 20.04 install Google Chrome and set `BROWSER_CHANNEL=chrome`. |
-| `🚫 Possible IP block …` with `Protection: Vercel Security Checkpoint` or `Cloudflare challenge` | The site's bot protection wants a browser check the headless browser does not pass. | Poll that site less often; the bot only slows down. |
+| `🚫 Possible IP block …` with `Protection: Vercel Security Checkpoint` or `Cloudflare challenge` | The site's bot protection wants a check the browser does not pass (from a data-centre IP a check may stay even with `HIDE_AUTOMATION`). While it lasts, each round sends one light request and renders only when the site lets it in. | Poll that site less often; the bot only slows down. Check that `HIDE_AUTOMATION` is not `false`. |
 | `🛑 The site list (state.json) was damaged` | A crash of the disk or a hand edit left `state.json` unreadable. It was moved to `state.json.broken-<time>` and the bot started without those sites; their snapshots are kept. | Stop the bot, repair the file (a JSON validator names the line), put it back as `data/state.json`, start again. Or `/add` the sites again. |
 | `🛑 Some lines of known_contracts.txt were unreadable and skipped` (or of `rejected_addresses.txt`) | A line in another encoding (the file was edited and saved as ANSI instead of UTF-8) or torn by a crash; the message lists the line numbers. The rest of the file was loaded. | `known_contracts.txt` is only appended to, so every start reports the lines until you fix them (UTF-8, tab-separated) or delete them while the bot is stopped. `rejected_addresses.txt` was saved again without them: nothing to do. |
 | `🛑 Saving to known_contracts.txt fails` or `🛑 known_contracts.txt could not be read` (the same for `rejected_addresses.txt`) | The file or `data/` is read-only or owned by another user (for example after one run with `sudo`), open in another program, or the disk is full. The bot goes on with the lists in memory, but without what it could not read, and what it cannot save is lost at the next restart: a known token may be announced again. | Give the files back to the bot's user (`sudo chown -R scraper:scraper /home/scraper/bot/data`), close the other program or free disk space. After a read error, restart. |
@@ -223,8 +225,12 @@ a damaged `state.json`: their sites may come back with the repaired file.
 - **Deep scan** (off by default) ignores what a page's scripts carried on its first deep
   round; a bundle cut off by `DEEP_SCAN_MAX_MB` on that round can still yield an old
   address later. A single response body over 3 MB is not scanned.
-- **Headless browser.** Sites see `HeadlessChrome` and `navigator.webdriver`; a strict
-  bot shield blocks the bot, which then only slows down. No proxies, no captcha solving.
+- **Bot shields.** With `HIDE_AUTOMATION` sites no longer see `HeadlessChrome` or
+  `navigator.webdriver`, but a data-centre IP and the HTTP clients' own TLS fingerprint
+  stay visible; a strict bot shield may still block the bot, which then only slows down.
+  No proxies, no captcha solving.
+- **A stopped timer.** A page whose timer or clock the bot learned to skip reports that
+  element's stop (with nothing else changing) up to a day late.
 - **EVM age on fast chains.** "🆕 Deployed within the last …" looks 90 blocks back, as far
   as public nodes keep state. Measured on 2026-09-27 that is 31 min on Fantom, 18 min on
   Ethereum, 4 min on Sonic, 3 min on Base and Optimism, 2 min on Avalanche, 45 s on Arc,
@@ -252,6 +258,27 @@ Chrome, `sudo apt install --only-upgrade google-chrome-stable` instead), then `p
 and restart. Missing
 keys in `.env` use the defaults; `⚙️ .env still sets defaults of an earlier release`
 at start names the lines that pin an old default.
+
+To 2.1.3 from 2.1.2:
+
+- Nothing to do: no new dependency. Two new keys with defaults, `HIDE_AUTOMATION=true`
+  and `SKIP_STABLE_COPIES=true` (live), need no `.env` line. Snapshots gain a `volatile`
+  key (older files load; a timer page renders twice once to learn its timer), and
+  `data/browser_state.json` is new. 2.1.2 ignores both, so a rollback needs nothing.
+- Faster alerts: an address is reported the moment the loading page shows it (measured
+  locally: 17-24 ms after the document or the script that shows it, instead of 0.8 s,
+  or the whole `NETWORK_IDLE_TIMEOUT` on a page that keeps polling), then checked
+  on-chain as before. A page with a ticking timer or clock needs one render per check
+  instead of two.
+- The browser reads like a person's (`HIDE_AUTOMATION`): no "Headless" in the
+  User-Agent, which the HTTP clients now send too, `navigator.webdriver` false, `en-US`,
+  and cookies kept across restarts. While a site blocks, rounds send one light request
+  and render only when it lets the bot in (every fourth blocked round renders anyway).
+- Fewer false tokens: EURC, rETH, weETH and RLUSD on Ethereum, wstETH on Arbitrum and
+  Optimism, USDe on Base and Arbitrum, sAVAX, stS and slisBNB are on the stop-list, and
+  copies of stablecoins and wrapped coins are known by their symbol, per network
+  (`SKIP_STABLE_COPIES`). "Also on" in the details lists only networks where the address
+  is a token, with its symbol there.
 
 To 2.1.2 from 2.1.1:
 

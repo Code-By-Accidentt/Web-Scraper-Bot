@@ -52,18 +52,35 @@ class NoiseEntry:
 NoiseMemory = dict[str, NoiseEntry]
 
 
+@dataclass(frozen=True, slots=True)
+class VolatileEntry:
+    """One shape of element seen ticking between two renders, like a timer.
+
+    ``count`` is how many elements of that shape the confirming render showed, ``positions``
+    which of them (counted in page order) ticked, ``last_seen`` when the shape last ticked.
+    """
+
+    count: int
+    last_seen: float
+    positions: frozenset[int]
+
+
+VolatileMemory = dict[str, VolatileEntry]
+
+
 @dataclass(slots=True)
 class Snapshot:
     """What is saved for one page: its last accepted signature and its noise memory.
 
     ``deep_seen`` holds the addresses the page's scripts and JSON already carried when the
-    page was first deep-scanned (None: not recorded yet). Such an address is ignored while
-    it is only there.
+    page was first deep-scanned (None: not recorded yet); such an address is ignored while
+    it is only there. ``volatile`` remembers the shapes of elements seen ticking.
     """
 
     signature: Signature
     noise: NoiseMemory = field(default_factory=dict)
     deep_seen: frozenset[str] | None = None
+    volatile: VolatileMemory = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

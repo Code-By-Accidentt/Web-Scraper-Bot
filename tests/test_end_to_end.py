@@ -302,10 +302,11 @@ async def test_bot_lifecycle_through_telegram(tmp_path: Path) -> None:
         # Five load timeouts in a row: one 🐢 alert and a stretched timeout, then recovery.
         stuck = FetchResult(ROOT, None, error="timeout after 20s", timed_out=True)
         healthy = FetchResult(ROOT, 200, page("Launch is live", TOKEN_A, TOKEN_B, TOKEN_C, LAUNCH))
-        fetcher.script(ROOT, *[stuck] * 5, healthy)
+        fetcher.script(ROOT, *[stuck] * 5)  # the last one repeats until /status was read
         slow = await again.alert("🐢")
         assert "5 times in a row" in slow and "raised to 40s" in slow  # 2 x PAGE_LOAD_TIMEOUT
         assert "1 page(s) timing out" in await again.command("/status")
+        fetcher.script(ROOT, healthy)
         await again.alert("renders again")
         assert 40.0 in fetcher.timeouts
     finally:

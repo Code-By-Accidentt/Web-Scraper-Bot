@@ -459,8 +459,11 @@ def test_risk_age_and_network_lines() -> None:
         "Authorities: mint and freeze revoked ✅",
         "Active token: 1000+ transactions",
     ]
-    evm = TokenInfo(deployed_within=170.0, also_on=("Base", "BSC"))
-    assert describe_token(evm, T0) == ["🆕 Deployed within the last 2m 50s", "Also on: Base, BSC"]
+    evm = TokenInfo(deployed_within=170.0, also_on=(("Base", None), ("BSC", "LIMP")))
+    assert describe_token(evm, T0) == [
+        "🆕 Deployed within the last 2m 50s",
+        "Also on: Base, BSC (LIMP)",
+    ]
     assert describe_token(TokenInfo(deployed_before=1_080.0), T0) == [
         "Deployed more than 18m 0s ago"
     ]

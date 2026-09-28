@@ -38,17 +38,23 @@ scraper_bot/
 
   pages/            rendering a page and telling real changes from noise
     fetching/
-      result.py         FetchResult and the PageFetcher protocol
-      chromium.py       PlaywrightFetcher: one browser, a tab per fetch, deep scan
+      result.py         FetchResult, EarlyText and the PageFetcher protocol
+      chromium.py       PlaywrightFetcher: one browser, a tab per fetch, deep scan; reads
+                        like a person's browser and keeps its cookies (HIDE_AUTOMATION)
+      observer.py       the script in every tab that reports address-like text while the
+                        page still loads
       request_filter.py requests never needed: prefetches, analytics beacons
-      prober.py         HttpProber: does a sub-page exist at all?
+      prober.py         HttpProber: does a sub-page exist at all? does a blocking site
+                        still refuse?
       blocking.py       recognises blocks (401/403/407/429/503, challenge pages, connection
                         resets) and names the protection; spots captcha widgets
     changes/
       normalizer.py     rendered HTML -> ordered list of Node(tag, attrs, own text)
       detector.py       ordered diff of two node lists (bounded work), volatile-node exclusion
+      volatile.py       memory of elements that tick (timers, clocks): no second render
       noise.py          memory of elements that keep changing (flapping)
     page_checker.py     the per-page pipeline: render -> addresses -> diff -> snapshot
+    early.py            EarlyReader: addresses a page shows while it loads, checked at once
     sightings.py        where on a page each address stands and the words in front of it
     urls.py             URL normalisation, sub-page derivation, snapshot file names
 
@@ -58,7 +64,8 @@ scraper_bot/
     addresses/
       formats.py        syntactic validation and canonical forms (EIP-55, base58, Sui types)
       extractor.py      finding addresses in text
-      stoplist.py       stablecoins, wrapped natives, system addresses: never candidates
+      stoplist.py       stablecoins, wrapped natives, system addresses: never candidates;
+                        the symbols that mark a copy of one (STABLE_SYMBOLS)
     rpc/
       client.py         JSON-RPC client: quick retries, HTTP 429 cool-down, batches
       health.py         which endpoints are failing, since when, and resting ones
@@ -122,17 +129,22 @@ own asyncio task, then sleeps for a random `poll_interval_min`..`poll_interval_m
 ```text
 SiteMonitor.run_once
  │
+ ├─ while blocked: HttpProber.peek(root)  one GET; still refused -> the round renders
+ │                                     nothing (every 4th blocked round renders anyway)
+ │
  ├─ HttpProber.probe(sub-page) x7      HEAD (GET after 404/405/410/501); 404/410 or any
  │                                     transport error (DNS, connection, TLS, 10 s timeout)
  │                                     means "does not exist"
  │
  ├─ PageChecker.check(page)  for the root and every live sub-page, concurrently
  │   ├─ PlaywrightFetcher.fetch        tab from the shared browser (max MAX_CONCURRENT_PAGES),
- │   │                                 domcontentloaded -> network idle (capped) -> settle;
- │   │                                 prefetches and analytics beacons are dropped; deep scan
- │   │                                 (off by default) collects frames, shadow roots, script/JSON;
- │   │                                 every step has a time limit (opening the tab, reading the
- │   │                                 page and the deep scan: the load timeout; closing it: 5 s)
+ │   │   │                             domcontentloaded -> network idle (capped) -> settle;
+ │   │   │                             prefetches and analytics beacons are dropped; deep scan
+ │   │   │                             (off by default) collects frames, shadow roots, script/JSON;
+ │   │   │                             every step has a time limit (opening the tab, reading the
+ │   │   │                             page and the deep scan: the load timeout; closing it: 5 s)
+ │   │   └─ while it loads: the observer reports address-like text -> EarlyReader checks
+ │   │                                 it and calls on_observation at once (read=False)
  │   ├─ BlockDetector.inspect          a challenge or ban page is never diffed (a 2xx one
  │   │                                 is still read for the addresses it shows)
  │   ├─ HtmlNormalizer.signature       ordered nodes with own text and cleaned attributes
@@ -145,12 +157,13 @@ SiteMonitor.run_once
  │   ├─ on_observation  ─────────────► SiteMonitor announces the tokens NOW (AlertRegistry:
  │   │                                 one alert per token), before any comparison
  │   ├─ snapshot missing?  -> BASELINE (store it)
- │   ├─ identical?         -> UNCHANGED
+ │   ├─ identical, or only elements known to tick differ (VolatileShapes)?  -> UNCHANGED
  │   └─ differs:  sleep confirm_delay, render again
  │        ├─ new addresses of the second render -> on_observation again
  │        ├─ ChangeDetector.volatile_nodes(first, second)   what moved between two renders
  │        ├─ ChangeDetector.compare(snapshot, second, ignore=volatile)
  │        ├─ NoiseFilter.apply           drop elements that already alerted flap_threshold times
+ │        ├─ VolatileShapes.learn        remember the elements that ticked between the renders
  │        └─ store the second render, without the volatile nodes the old snapshot did not
  │           have, as the new snapshot  -> CHANGED or UNCHANGED
  │
@@ -161,8 +174,10 @@ SiteMonitor.run_once
  └─ update block state (backoff) and /status counters
 ```
 
-A token alert goes out from a task the `Notifier` owns, the moment a render shows the
-token. Claiming it in the `AlertRegistry` is what writes the token into the known cache,
+A token alert goes out from a task the `Notifier` owns, the moment the page shows the
+token: usually while the page still loads (see "Addresses are read while the page loads"
+below), else when its render is read. Claiming it in the `AlertRegistry` is what writes
+the token into the known cache,
 so a round cancelled during the check (or a restart) cannot hide a token that was never
 announced, and neither a later cancellation nor a stop can lose the alert: it is kept in
 `data/outbox.json` until every chat got it (see the rules below). In each chat's Telegram
@@ -170,8 +185,8 @@ queue only command replies overtake it, and it waits out flood limits and outage
 to about ten minutes (see Concurrency and resources), so a rate limit never holds up the
 page. The ⏸️ pause notice and the turbo summary follow the alerts they belong to from
 tasks of their own; the monitor pauses the site first. The token's details
-(name, supply, Solana authorities and Token-2022 flags, age, other networks, DEX pair)
-follow as an edit of the same message. When one page reaches `contract_pause_threshold`
+(name, supply, Solana authorities and Token-2022 flags, age, the other networks where the
+address is a token too, with their symbols, DEX pair) follow as an edit of the same message. When one page reaches `contract_pause_threshold`
 tokens in one round (both renders), the render that crosses it sends its tokens as a
 `.txt` document and the site pauses (tokens of an earlier render of that round went out
 one by one); when that happens on the monitor's first round, the pause message says the
@@ -213,6 +228,21 @@ the stored snapshot's nodes (a loading skeleton, a half-loaded list); the third 
 in a row is compared as usual, since the page then really changed. Tokens are looked for
 in those renders all the same.
 
+**A timer costs one render.** On a page with a ticking timer or a live clock every render
+differs from the snapshot, which would cost a second render on every check. So a round
+remembers in the snapshot (`volatile`) the elements that ticked between its two renders:
+their shape (tag, attributes and text with numbers masked), how many elements of that
+shape the page shows and which of them ticked (their position among those elements). A
+later render that differs from the snapshot only in those elements, in the same order,
+with the same count, is UNCHANGED without a second render and without rewriting the
+snapshot. Anything else gets the second render as before: another shape ("Launch in
+00:05:30" turning into "CA: 0x…"), a new row shaped like a ticking one, a still element
+shaped like a ticking one that changes, a reorder. An element seen ticking is remembered
+for a day (at most 200 shapes per page); a shape does not count as ticking when what went
+between the renders was in the stored snapshot (that is a change landing between the
+renders). A timer that stops, with nothing else changing, is therefore reported up to a
+day late; its page then renders twice once a day to learn its elements again.
+
 **Slow noise has a memory.** Content that changes slower than the confirm delay would
 pass the two-render check every time. `NoiseFilter` counts alerts per element (tag,
 attributes and the element's position among look-alikes; attribute-less elements by
@@ -227,7 +257,14 @@ stablecoins, wrapped natives, bridged BTC/ETH, liquid-staking tokens (stETH, cbE
 jitoSOL, mSOL, ...) and a few chain tokens (ARB) on every configured chain (each one
 checked on-chain), the OP-stack predeploys, every EVM address below `0x10000`, the burn
 address and the native-coin placeholder, plus the operator's own `data/ignore.txt`. The
-extractor drops them, so wallet-connect bundles cannot flood a first round. A Solana
+extractor drops them, so wallet-connect bundles cannot flood a first round. Copies of
+such tokens at other addresses (bridged, plumbing or scams) are known by their symbol
+instead: with `skip_stable_copies`, a token whose `symbol()` (Solana: Metaplex or
+Token-2022 metadata; Sui: coin metadata) reads as one of `STABLE_SYMBOLS` (USDC, USDT,
+USDC.e, EURC, DAI, WETH, WBTC, stETH, ... 50 in all) is a copy on that network, not a
+launch. Only the whole symbol counts, after folding case, styled and fullwidth letters,
+invisible characters, Cyrillic and Greek look-alikes and Tether's ₮ (`USDС` with a Cyrillic
+С matches, `USDCAT` does not); a symbol that cannot be read counts as none. A Solana
 candidate must also look like a key: a base58 run of 32 to 44 characters not glued to
 other letters or digits, with both upper- and lower-case letters (base32 ids of IPFS or
 Arweave are single-case), outside inline `data:` files, whose base64 is full of
@@ -241,9 +278,14 @@ Concurrent checks of the same address share one lookup. Every verdict carries a
 `kind`: an EVM address is a token when a network returns bytecode and, with
 `require_erc20`, answers `totalSupply()` and `decimals()` without being an LP pair
 (`token0`/`token1`, whose non-quote tokens are checked instead) or an ERC-4626 vault
-(`asset()`); `0xef0100…` code is an EIP-7702 wallet. A Solana address counts only as an
-SPL / Token-2022 mint read at `confirmed` commitment (a node's default, `finalized`,
-trails by about 13 s). A transport failure or rate limit on any network means "no
+(`asset()`); `0xef0100…` code is an EIP-7702 wallet. `symbol()` travels in the same batch
+and only tells a copy of a stablecoin or wrapped coin (`STABLE_COPY`), per network: the
+check keeps waiting for the other networks, so an address that is a copy on one network
+and a real token on another (`0xF181…`: "USDC.e" on Sonic, LIMP on Ethereum) is announced
+on the network where it is a token; a copy everywhere is rejected like any non-token. A
+Solana address counts only as an SPL / Token-2022 mint read at `confirmed` commitment (a
+node's default, `finalized`, trails by about 13 s), fetched in one `getMultipleAccounts`
+call together with its Metaplex metadata account. A transport failure or rate limit on any network means "no
 verdict" rather than a cached rejection, because a wrong rejection would hide a real
 launch for hours. The exception are the optional networks, Arc and Robinhood Chain (young
 chains with few public nodes): an EVM check waits for them only half a second
@@ -318,7 +360,41 @@ is nothing but a challenge phrase ("Security Captcha", "site | Access Denied", n
 random tokens), but it is not compared, and its render does not count as a read of the
 page for the ⏱ line. A captcha widget on a page that loads normally (a reCAPTCHA
 checkbox, hCaptcha, Turnstile; not the invisible kinds) is reported once per page and
-widget. There is no proxy rotation and no captcha solving by design.
+widget. While a site blocks, each round first asks its root page with one plain GET (the
+first 64 KB): if that is still refused, the round renders nothing and counts as blocked,
+so the bot does not prolong a ban with full page loads; every fourth blocked round
+renders anyway, since the browser may pass where the HTTP client does not, and anything
+but a refusal (the page, a 404, a network error) lets the round render. There is no
+proxy rotation and no captcha solving by design.
+
+**The browser reads like a person's.** With `HIDE_AUTOMATION` (on by default) Chromium
+starts with the `AutomationControlled` blink feature disabled (`navigator.webdriver` is
+false), its context sends the browser's own User-Agent with "HeadlessChrome" read as
+"Chrome" (version and platform stay the browser's), speaks `en-US` (`Accept-Language:
+en-US,en;q=0.9`), and both HTTP clients send the same User-Agent and language once the
+browser has started. Cookies and local storage live in the one shared context and are
+saved to `data/browser_state.json` every 5 minutes, before the hourly Playwright restart
+and at shutdown, and restored at every launch: a Cloudflare or Vercel check that the
+browser passed on its own is not asked again after a restart (a state over 2 MB keeps
+only its cookies; an unreadable file is moved aside as `browser_state.json.bad`). This
+makes nothing pass that a person's browser would not: no captcha solving, no proxies,
+and a data-centre IP stays one. The client hints (`Sec-CH-UA`) name Chrome or Chromium
+in the `chrome` and `chromium` channels; the old headless shell (`BROWSER_CHANNEL=bundled`)
+still names HeadlessChrome there.
+
+**Addresses are read while the page loads.** Every tab runs a small observer before the
+page's own scripts (`pages/fetching/observer.py`): a `MutationObserver` on the document
+that reports each new visible text or attribute value that may hold an address (script
+and style texts aside, at most 400 pieces per document, frames left to deep scan) through
+a Playwright binding. `EarlyReader` extracts the addresses with the usual rules, keeps
+what a person sees (text, and links that name a token, as on a challenge page), checks
+them and reports them to the monitor at once (`read=False`, so no ⏱ window closes yet).
+An address the HTML carries is therefore announced a few milliseconds after the document
+arrives, and one a script shows as soon as it is in the DOM, instead of after network
+idle and the settle delay (0.8 s on a quiet page, the whole network-idle cap on a page
+that keeps polling). The render then goes on as before for the comparison; the tokens
+already claimed are not announced twice. Each fetch opens a fresh tab, so the observer
+never sees an older document.
 
 **Pages that keep timing out get more time, once.** After `render_failure_threshold`
 load timeouts in a row on one page you get one 🐢 alert and the page's load timeout is
@@ -342,7 +418,8 @@ cannot be saved, the bot logs the error and sends a 🛑, and the alerts go out 
 | File | Written by | Content |
 | --- | --- | --- |
 | `data/state.json` | `StateStore` | every site: url, paused, notifications flag, announced sub-pages, last change, unverified mode and its memory, captcha widgets reported per page; a damaged file is moved aside as `state.json.broken-<time>` |
-| `data/snapshots/<host_path>-<hash>.json` | `SnapshotStore` | one per page: the last accepted node list, the noise memory and, once deep scan has seen the page, the addresses its scripts carried then (`deep_seen`) |
+| `data/snapshots/<host_path>-<hash>.json` | `SnapshotStore` | one per page: the last accepted node list, the noise memory, the elements seen ticking (`volatile`, for a day) and, once deep scan has seen the page, the addresses its scripts carried then (`deep_seen`) |
+| `data/browser_state.json` | `PlaywrightFetcher` | with `HIDE_AUTOMATION`: the browser's cookies and local storage, restored at every launch; an unreadable one is moved aside as `browser_state.json.bad` |
 | `data/known_contracts.txt` | `AddressCache` | confirmed contracts, tab separated, append-only |
 | `data/rejected_addresses.txt` | `AddressCache` | rejected addresses with a timestamp, compacted on start |
 | `data/preferences.json` | `Preferences` | live overrides made with `/set` |
@@ -354,7 +431,7 @@ cannot be saved, the bot logs the error and sends a 🛑, and the alerts go out 
 | `data/no_sandbox_notice.txt` | `Application` | written once a chat received the 🛑 that Chromium runs without its sandbox; removed by a start with the sandbox |
 | `data/heartbeat` | `Heartbeat` | epoch seconds, every `HEARTBEAT_INTERVAL`, read by `rebooter.py` |
 
-State, snapshots, preferences, the pending watch and the outbox are written through
+State, snapshots, preferences, the pending watch, the outbox and the browser state are written through
 `atomic_write_text` (write to a temp file, then replace), so a crash never leaves a
 half-written file; the address caches are appended to line by line, and
 `rejected_addresses.txt` is rewritten through it when compacted.
@@ -368,7 +445,9 @@ half-written file; the address caches are appended to line by line, and
   again and the fetch is tried once more. Between renders, after an hour or 10 000
   renders, whichever comes first, Playwright and the browser start afresh, because
   Playwright keeps a little memory for every call (6 to 14 KB per render, measured): the
-  renders in flight get up to 30 s to finish, and cookies and cache start empty. A tab
+  renders in flight get up to 30 s to finish, the cache starts empty, and the cookies
+  carry over through `browser_state.json` (with `HIDE_AUTOMATION`; without, they start
+  empty too). A tab
   per fetch, at most `MAX_CONCURRENT_PAGES` renders at once; a tab that a page opens itself
   (`window.open`, `target=_blank`) is closed at once, downloads are refused, and closing a
   tab, the browser or the driver gets 5 s.
@@ -379,8 +458,9 @@ half-written file; the address caches are appended to line by line, and
 - Two httpx clients: one for RPC, Telegram and DexScreener (HTTP/2, idle connections kept
   60 s, `ConnectionWarmer` calls every RPC endpoint (EVM, Solana, Sui) every 30 s and
   checks each EVM endpoint's
-  chain id at start), one plain HTTP/1.1 client for the sub-page probes, so an HTTP/2
-  protocol error can never make a live page look absent.
+  chain id at start), one plain HTTP/1.1 client for the sub-page probes and the light
+  request of a blocked site, so an HTTP/2 protocol error can never make a live page look
+  absent. With `HIDE_AUTOMATION` both send the browser's User-Agent and language.
 - `JsonRpcClient` retries quick failures (HTTP 429 with `Retry-After`, 500/502/503/504,
   refused or reset connections, HTTP/2 protocol errors, rate-limit errors inside a 200,
   also inside a batch answer) within `RPC_TIMEOUT`, a hard deadline; after a 429 every

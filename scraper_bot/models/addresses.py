@@ -57,6 +57,7 @@ class AddressKind(Enum):
     WALLET = "wallet"  # EVM: an EIP-7702 delegated wallet (its "code" is 0xef0100 + address)
     PAIR = "pair"  # an LP pair or pool; the tokens it holds are in ``resolved``
     VAULT = "vault"  # ERC-4626 vault shares: a token, but never a launch
+    STABLE_COPY = "stable_copy"  # a token with a stablecoin's or wrapped coin's symbol: a copy
     NOT_TOKEN = "not_token"  # a contract, program or account that is not a token
     MISSING = "missing"  # Solana: no account at this address yet
     NOT_YET_MINTED = "not_yet_minted"  # Solana: a decimals-0 mint with nothing minted yet
@@ -122,10 +123,11 @@ class ChainVerdict:
     """What one chain says about an address."""
 
     kind: AddressKind
-    network: str | None = None  # where the token (or the LP pair) lives
+    network: str | None = None  # where the token, LP pair or other contract was found
     sides: tuple[str, ...] = ()  # PAIR: the tokens it holds, stop-listed ones left out
     # optional networks that did not answer (failed, slow, resting): the verdict may change
     missing: frozenset[str] = frozenset()
+    symbol: str | None = None  # STABLE_COPY: the symbol it copies, e.g. "USDC.e"
 
     @property
     def partial(self) -> bool:

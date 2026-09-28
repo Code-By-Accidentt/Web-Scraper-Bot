@@ -11,6 +11,7 @@ import pytest
 from scraper_bot.chains.addresses.stoplist import StopList
 from scraper_bot.chains.evm.abi import (
     ERC20_DECIMALS,
+    ERC20_SYMBOL,
     ERC20_TOTAL_SUPPLY,
     PAIR_TOKEN0,
     PAIR_TOKEN1,
@@ -20,7 +21,12 @@ from scraper_bot.chains.evm.abi import (
 from scraper_bot.chains.evm.validator import EvmContractValidator
 from scraper_bot.chains.rpc.client import NO_RETRY, RpcError
 from scraper_bot.chains.rpc.health import FailingEndpoint, RpcUnavailable
-from scraper_bot.chains.solana.accounts import TOKEN_2022_PROGRAM, TOKEN_PROGRAM
+from scraper_bot.chains.solana.accounts import (
+    METAPLEX_METADATA_PROGRAM,
+    TOKEN_2022_PROGRAM,
+    TOKEN_PROGRAM,
+    metadata_address,
+)
 from scraper_bot.chains.solana.validator import SolanaContractValidator
 from scraper_bot.chains.sui.validator import SuiCoinValidator
 from scraper_bot.chains.validator import ContractValidator
@@ -34,6 +40,8 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.settings.env import EvmNetwork
 from scraper_bot.storage.address_cache import AddressCache
+from tests.chains.evm.test_abi import abi_string
+from tests.chains.solana.test_accounts import METAPLEX, MINT
 from tests.conftest import FakeTuning
 
 USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
@@ -156,24 +164,24 @@ def mint_data(supply: int = 10**15, decimals: int = 6, extra: bytes = b"") -> by
 
 
 def solana_account(
-    *, executable: bool = False, owner: str = "Sysvar", data: bytes = b""
+    *, executable: bool = False, owner: str = "Sysvar", data: bytes = b"", metadata: bytes = b""
 ) -> Responder:
-    encoded = base64.b64encode(data).decode()
+    """getMultipleAccounts: this account for the mint, ``metadata`` (if any) for its metadata."""
 
-    def responder(_method: str, _params: list[Any]) -> Any:
-        value = {
-            "executable": executable,
-            "owner": owner,
-            "data": [encoded, "base64"],
-            "lamports": 1,
-        }
+    def account(program: str, raw: bytes) -> dict[str, Any]:
+        encoded = base64.b64encode(raw).decode()
+        return {"executable": executable, "owner": program, "data": [encoded, "base64"]}
+
+    def responder(_method: str, params: list[Any]) -> Any:
+        extra = account(METAPLEX_METADATA_PROGRAM, metadata) if metadata else None
+        value = [account(owner, data), *[extra] * (len(params[0]) - 1)]
         return {"context": {"slot": 1}, "value": value}
 
     return responder
 
 
-def solana_missing(_method: str, _params: list[Any]) -> Any:
-    return {"context": {"slot": 1}, "value": None}
+def solana_missing(_method: str, params: list[Any]) -> Any:
+    return {"context": {"slot": 1}, "value": [None] * len(params[0])}
 
 
 class FakeClock:
@@ -185,13 +193,16 @@ class FakeClock:
 
 
 def evm(http: httpx.AsyncClient, *, require_erc20: bool = True, **kwargs: Any):
-    tuning = FakeTuning(require_erc20=require_erc20)
+    tuning = kwargs.pop("tuning", FakeTuning(require_erc20=require_erc20))
     kwargs.setdefault("retry", NO_RETRY)
     return EvmContractValidator(http, NETWORKS, timeout=5, tuning=tuning, **kwargs)
 
 
 def solana(http: httpx.AsyncClient, **kwargs: Any) -> SolanaContractValidator:
-    return SolanaContractValidator(http, "https://sol.rpc", timeout=5, retry=NO_RETRY, **kwargs)
+    tuning = kwargs.pop("tuning", FakeTuning())
+    return SolanaContractValidator(
+        http, "https://sol.rpc", timeout=5, tuning=tuning, retry=NO_RETRY, **kwargs
+    )
 
 
 def sui(http: httpx.AsyncClient, **kwargs: Any) -> SuiCoinValidator:
@@ -311,6 +322,31 @@ async def test_vault_shares_are_not_a_launch() -> None:
     rpc.route("beta.rpc", no_contract)
     async with rpc.client() as http:
         assert (await evm(http).find_network(USDC_ETH)).kind is AddressKind.VAULT
+
+
+async def test_a_copy_of_a_stablecoin_is_no_token_on_its_network(tmp_path: Path) -> None:
+    def token(symbol: str) -> Responder:
+        supply, decimals = word(10**12), word(6)
+        return evm_node(
+            {ERC20_TOTAL_SUPPLY: supply, ERC20_DECIMALS: decimals, ERC20_SYMBOL: abi_string(symbol)}
+        )
+
+    rpc = FakeRpc()
+    rpc.route("alpha.rpc", token("USDС.e"))  # with a Cyrillic С, like a bridged USDC.e
+    rpc.route("beta.rpc", token("USDCAT"))  # only starts like one: a real token
+    async with rpc.client() as http:
+        assert await evm(http).find_network(USDC_ETH) == ChainVerdict(AddressKind.TOKEN, "Beta")
+        rpc.route("beta.rpc", no_contract)
+        facade = build(rpc, http, tmp_path, FakeClock())
+        copy = await facade.validate(ETH)
+        lenient = evm(http, tuning=FakeTuning(skip_stable_copies=False))
+        assert (await lenient.find_network(USDC_ETH)).kind is AddressKind.TOKEN
+    assert (copy.status, copy.kind, copy.network) == (
+        ValidationStatus.REJECTED,
+        AddressKind.STABLE_COPY,
+        "Alpha",
+    )
+    assert facade._cache.is_rejected(ETH)  # cached like any contract, never watched
 
 
 @pytest.mark.parametrize("responder", [throttled_contract, throttled_by_json_error])
@@ -447,7 +483,7 @@ async def test_solana_verdicts(responder: Responder, expected: AddressKind) -> N
     rpc.route("sol.rpc", responder)
     async with rpc.client() as http:
         validator = solana(http)
-        assert await validator.inspect(USDC_SOL) is expected
+        assert (await validator.inspect(USDC_SOL)).kind is expected
 
 
 async def test_solana_is_read_at_confirmed_commitment() -> None:
@@ -456,7 +492,7 @@ async def test_solana_is_read_at_confirmed_commitment() -> None:
     async with rpc.client() as http:
         await solana(http).inspect(USDC_SOL)
     [(_, method, params)] = rpc.params
-    assert method == "getAccountInfo" and params[1]["commitment"] == "confirmed"
+    assert method == "getMultipleAccounts" and params[1]["commitment"] == "confirmed"
 
 
 async def test_solana_transport_error_is_unavailable() -> None:
@@ -470,13 +506,26 @@ async def test_solana_transport_error_is_unavailable() -> None:
 async def test_solana_bad_base64_is_not_a_mint() -> None:
     def responder(_method: str, _params: list[Any]) -> Any:
         value = {"executable": False, "owner": TOKEN_PROGRAM, "data": ["not*base64!", "base64"]}
-        return {"context": {"slot": 1}, "value": value}
+        return {"context": {"slot": 1}, "value": [value, None]}
 
     rpc = FakeRpc()
     rpc.route("sol.rpc", responder)
     async with rpc.client() as http:
         validator = solana(http)
-        assert await validator.inspect(USDC_SOL) is AddressKind.NOT_TOKEN
+        assert (await validator.inspect(USDC_SOL)).kind is AddressKind.NOT_TOKEN
+
+
+async def test_a_mint_named_like_a_stablecoin_is_a_copy_found_in_the_same_call() -> None:
+    mint = "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"
+    rpc = FakeRpc()
+    rpc.route("sol.rpc", solana_account(owner=TOKEN_PROGRAM, data=MINT, metadata=METAPLEX))
+    async with rpc.client() as http:
+        copy = await solana(http).inspect(mint)  # its Metaplex metadata says USDC
+        lenient = solana(http, tuning=FakeTuning(skip_stable_copies=False))
+        token = await lenient.inspect(mint)
+    assert copy == ChainVerdict(AddressKind.STABLE_COPY, "Solana", symbol="USDC")
+    assert token == ChainVerdict(AddressKind.TOKEN, "Solana")
+    assert rpc.params[0][2][0] == [mint, metadata_address(mint)]  # one call reads both
 
 
 # ── ContractValidator (facade) ──────────────────────────────────────────────
@@ -608,7 +657,7 @@ async def test_concurrent_checks_of_one_address_share_a_single_lookup(tmp_path: 
         validator = build(rpc, http, tmp_path, FakeClock())
         results = await asyncio.gather(*(validator.validate(ETH) for _ in range(3)))
     assert [r.status for r in results] == [ValidationStatus.CONFIRMED] * 3
-    assert rpc.count("alpha.rpc", "eth_call") == 5  # one probe batch for three callers
+    assert rpc.count("alpha.rpc", "eth_call") == len(TOKEN_PROBE)  # one batch for three callers
 
 
 async def test_turbo_checks_bypass_and_do_not_write_the_negative_cache(tmp_path: Path) -> None:
@@ -828,19 +877,22 @@ async def test_sui_coin_types_and_packages() -> None:
         ),
     )
     async with rpc.client() as http:
-        strict = sui(http, tuning=FakeTuning(require_erc20=True))
-        assert await strict.is_coin_or_package(SUI_COIN)
-        assert await strict.is_coin_or_package(SUI_PKG)  # the package defines a coin
-        assert not await strict.is_coin_or_package(SUI_STRUCT)  # a type, not a coin
-        assert not await strict.is_coin_or_package(SUI_WALLET)
-        assert not await strict.is_coin_or_package(SUI_OBJECT)
+        strict = sui(http, tuning=FakeTuning(require_erc20=True, skip_stable_copies=False))
+        token, not_token = ChainVerdict(AddressKind.TOKEN, "Sui"), AddressKind.NOT_TOKEN
+        assert await strict.inspect(SUI_COIN) == token
+        assert await strict.inspect(SUI_PKG) == token  # the package defines a coin
+        assert (await strict.inspect(SUI_STRUCT)).kind is not_token  # a type, not a coin
+        assert (await strict.inspect(SUI_WALLET)).kind is not_token
+        assert (await strict.inspect(SUI_OBJECT)).kind is not_token
+        copy = await sui(http).inspect(SUI_PKG)  # its coin says USDC, off the stop-list
+        assert (copy.kind, copy.symbol) == (AddressKind.STABLE_COPY, "USDC")
         lenient = sui(http, tuning=FakeTuning(require_erc20=False))
-        assert await lenient.is_coin_or_package(SUI_STRUCT)  # any type of a real package
-        assert not await lenient.is_coin_or_package(SUI_WALLET)
+        assert await lenient.inspect(SUI_STRUCT) == token  # any type of a real package
+        assert (await lenient.inspect(SUI_WALLET)).kind is not_token
 
         rpc.route("sui.rpc", sui_node(coins={}, packages={SUI_PKG: {"helpers": ["Config"]}}))
-        assert not await strict.is_coin_or_package(SUI_PKG)  # no coin inside
-        assert await lenient.is_coin_or_package(SUI_PKG)
+        assert (await strict.inspect(SUI_PKG)).kind is not_token  # no coin inside
+        assert await lenient.inspect(SUI_PKG) == token
 
 
 async def test_sui_transport_error_is_unavailable() -> None:
@@ -848,9 +900,9 @@ async def test_sui_transport_error_is_unavailable() -> None:
     async with rpc.client() as http:
         validator = sui(http)
         with pytest.raises(RpcUnavailable):
-            await validator.is_coin_or_package(SUI_COIN)
+            await validator.inspect(SUI_COIN)
         with pytest.raises(RpcUnavailable):
-            await validator.is_coin_or_package(SUI_PKG)
+            await validator.inspect(SUI_PKG)
 
 
 async def test_facade_routes_sui_addresses(tmp_path: Path) -> None:
@@ -888,7 +940,7 @@ async def test_packages_with_many_structs_are_searched_completely() -> None:
     rpc.route("sui.rpc", sui_node(coins={coin: {"decimals": 9}}, packages={SUI_PKG: helpers}))
     async with rpc.client() as http:
         strict = sui(http)
-        assert await strict.is_coin_or_package(SUI_PKG)
+        assert (await strict.inspect(SUI_PKG)).kind is AddressKind.TOKEN
     assert rpc.count("sui.rpc", "suix_getCoinMetadata") == 21
 
 
@@ -1124,7 +1176,9 @@ def test_a_long_outage_is_reported_once_and_again_after_recovery() -> None:
     reports: list[tuple[str, ...]] = []
     validator = ContractValidator(
         EvmContractValidator(http, networks, timeout=1, tuning=FakeTuning(), clock=clock),
-        SolanaContractValidator(http, "https://sol.rpc", timeout=1, clock=clock),
+        SolanaContractValidator(
+            http, "https://sol.rpc", timeout=1, tuning=FakeTuning(), clock=clock
+        ),
         AddressCache(Path("unused-k.tsv"), Path("unused-r.tsv"), rejected_ttl=0),
         sui=SuiCoinValidator(http, "https://sui.rpc", timeout=1, tuning=FakeTuning(), clock=clock),
         max_concurrent=4,

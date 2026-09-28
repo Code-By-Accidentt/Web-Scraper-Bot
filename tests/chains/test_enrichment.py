@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from scraper_bot.chains.enrichment import TokenEnricher, TokenInfo
+from scraper_bot.chains.evm.abi import ERC20_DECIMALS, ERC20_SYMBOL, ERC20_TOTAL_SUPPLY
 from scraper_bot.chains.networks import token_links
 from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
 from scraper_bot.settings.env import EvmNetwork
@@ -365,7 +366,49 @@ async def test_evm_age_and_other_networks() -> None:
         sui_rpc_url="https://sui.rpc",
     )
     backend.fresh = False
-    assert (await enricher.enrich(ETH_CONTRACT)).also_on == ("Base",)
+    assert (await enricher.enrich(ETH_CONTRACT)).also_on == (("Base", "USDC"),)
+
+
+async def test_also_on_names_only_the_networks_where_the_address_is_a_token() -> None:
+    token = {ERC20_TOTAL_SUPPLY: abi_uint(1), ERC20_DECIMALS: abi_uint(9)}
+    nodes = {  # host: bytecode and the eth_call answers by selector; the others revert
+        "base.rpc": ("0x6080", {**token, ERC20_SYMBOL: abi_string("LIMP")}),
+        "bsc.rpc": ("0x6080", token),  # a token whose symbol cannot be read
+        "arb.rpc": ("0x6080", {ERC20_SYMBOL: abi_string("LIMP")}),  # a contract, no token
+        "op.rpc": ("0x", {}),
+        "slow.rpc": ("0x6080", {**token, ERC20_SYMBOL: abi_string("SLOW")}),  # after the budget
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "slow.rpc":
+            await asyncio.sleep(5)
+        code, calls = nodes[request.url.host]  # never Ethereum, the token's own network
+        answers = []
+        for item in json.loads(request.content):
+            data = item["params"][0]["data"] if item["method"] == "eth_call" else None
+            if data is None:
+                answer: dict[str, Any] = {"result": code}
+            elif data in calls:
+                answer = {"result": calls[data]}
+            else:
+                answer = {"error": {"code": 3, "message": "execution reverted"}}
+            answers.append({"jsonrpc": "2.0", "id": item["id"], **answer})
+        return httpx.Response(200, json=answers)
+
+    hosts = {"Ethereum": "eth", "Base": "base", "BSC": "bsc", "Arbitrum": "arb", "Optimism": "op"}
+    networks = tuple(EvmNetwork(name, f"https://{host}.rpc") for name, host in hosts.items())
+    networks += (EvmNetwork("Sonic", "https://slow.rpc"),)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        enricher = TokenEnricher(
+            http,
+            networks,
+            "https://sol.rpc",
+            timeout=10,
+            tuning=FakeTuning(),
+            sui_rpc_url="https://sui.rpc",
+        )
+        found = await enricher._also_on(ETH_CONTRACT, 0.5)  # Sonic answers too late
+    assert found == {"also_on": (("Base", "LIMP"), ("BSC", None))}
 
 
 async def test_a_slow_other_network_does_not_cost_the_age_line() -> None:

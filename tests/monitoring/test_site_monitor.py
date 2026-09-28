@@ -237,6 +237,25 @@ async def test_block_signal_doubles_the_interval_and_warns_once() -> None:
     assert h.notifier.recovered == [ROOT]
 
 
+async def test_a_blocked_site_is_rendered_again_only_when_a_light_request_passes() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 403", block=BlockSignal("HTTP 403"))
+    await h.monitor.run_once()  # the block starts with a render
+    h.prober.peek_status = 403  # the site still refuses a plain GET
+    renders = len(h.checker.calls)
+    for _ in range(3):
+        await h.monitor.run_once()
+    assert len(h.checker.calls) == renders and h.prober.peeks == [ROOT] * 3
+    assert h.monitor.stats.block_level == 4 and len(h.notifier.blocked) == 1
+    await h.monitor.run_once()  # the fourth blocked round renders anyway
+    assert len(h.checker.calls) > renders
+
+    h.prober.peek_status = 200
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()  # the light request passes: the round renders and recovers
+    assert not h.monitor.stats.blocked and h.notifier.recovered == [ROOT]
+
+
 async def test_retry_after_and_max_backoff_bound_the_delay() -> None:
     h = Harness(statuses={APP: 404, DOCS: 404})
     h.outcome(ROOT, PageStatus.UNAVAILABLE, block=BlockSignal("HTTP 429", retry_after=5.0))

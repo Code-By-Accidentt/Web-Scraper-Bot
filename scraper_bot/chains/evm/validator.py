@@ -11,13 +11,14 @@ from collections.abc import Callable, Collection, Sequence
 import httpx
 
 from scraper_bot.chains.addresses.formats import to_checksum_address
-from scraper_bot.chains.addresses.stoplist import StopList
+from scraper_bot.chains.addresses.stoplist import StopList, is_stable_symbol
 from scraper_bot.chains.evm.abi import (
     TOKEN_PROBE,
+    decode_abi_string,
     has_code,
     is_delegated_wallet,
+    looks_like_token,
     word_address,
-    word_uint,
 )
 from scraper_bot.chains.rpc.client import JsonRpcClient, RetryPolicy, RpcCallError, RpcError
 from scraper_bot.chains.rpc.health import EndpointHealth, RpcUnavailable
@@ -29,19 +30,27 @@ log = logging.getLogger(__name__)
 
 
 _REVERT_MARKERS = ("revert", "invalid opcode", "out of gas", "vm execution")
-_MAX_DECIMALS = 255  # decimals() is a uint8
 # Above this many background requests a lookup waits for all its networks instead.
 _MAX_BACKGROUND = 64
 # Seconds the optional networks get once the required ones answered (healthy: about 50 ms).
 OPTIONAL_GRACE = 0.5
 _MAX_LATE = 1000  # late tokens and pairs kept for the next lookup
+# When no network found a token or pair, the first of these kinds seen is the verdict.
+_REJECTIONS = (
+    AddressKind.WALLET,
+    AddressKind.VAULT,
+    AddressKind.STABLE_COPY,
+    AddressKind.NOT_TOKEN,
+)
 
 
 class EvmContractValidator:
     """Looks for bytecode on every configured network at once and classifies it.
 
     With ``require_erc20`` a contract counts only when it is a plain token: it answers
-    totalSupply() and decimals(), and is neither an LP pair nor an ERC-4626 vault.
+    totalSupply() and decimals(), and is neither an LP pair nor an ERC-4626 vault. With
+    ``skip_stable_copies`` as well, a token whose symbol is a stablecoin's or wrapped
+    coin's (USDC, WETH, ...) is only a copy on that network.
     """
 
     def __init__(
@@ -79,8 +88,9 @@ class EvmContractValidator:
 
         The first network that finds a token or pair answers at once and the slower ones
         finish in the background (while fewer than ``_MAX_BACKGROUND`` requests run there).
-        Any other verdict needs every required network, else :class:`RpcUnavailable` is
-        raised: a rejection based on partial answers would be cached for hours.
+        Any other verdict, a copy of a stablecoin included, needs every required network,
+        else :class:`RpcUnavailable` is raised: a rejection based on partial answers would
+        be cached for hours.
 
         Optional networks get ``OPTIONAL_GRACE`` more seconds; one that failed or is still
         silent is left out and listed in ``missing`` (no answer at all raises as well).
@@ -148,10 +158,10 @@ class EvmContractValidator:
         if any(name not in self._optional for name in failed) or (failed and not verdicts):
             raise RpcUnavailable(f"no answer from {', '.join(failed)}")
         missing = frozenset(failed)
-        kinds = {verdict.kind for _, verdict in verdicts}
-        for kind in (AddressKind.WALLET, AddressKind.VAULT, AddressKind.NOT_TOKEN):
-            if kind in kinds:
-                return ChainVerdict(kind, missing=missing)
+        for wanted in _REJECTIONS:
+            for name, verdict in verdicts:
+                if verdict.kind is wanted:
+                    return dataclasses.replace(verdict, network=name, missing=missing)
         return ChainVerdict(AddressKind.NO_CODE, missing=missing)
 
     async def aclose(self) -> None:
@@ -248,11 +258,12 @@ class EvmContractValidator:
         return await self._classify(client, address)
 
     async def _classify(self, client: JsonRpcClient, address: str) -> ChainVerdict:
-        """Tell a token, LP pair, vault or other contract apart with five read-only calls.
+        """Tell a token, LP pair, vault, copy or other contract apart with six read-only calls.
 
         Empty results and EVM reverts are answers ("no such function"). A rate limit or
         timeout is raised instead, so the network counts as failed rather than a real token
-        being rejected and cached for hours.
+        being rejected and cached for hours. symbol() only tells a copy of a stablecoin or
+        wrapped coin, so a symbol that fails or cannot be read never stops a token.
 
         eth_getCode is asked again in the same batch, so every answer comes from one node
         (or one block number when the node takes no batches). Behind a load balancer the
@@ -269,10 +280,10 @@ class EvmContractValidator:
             ],
             same_block=True,
         )
-        for answer in answers:
+        code, supply, decimals, token0, token1, asset, symbol = answers
+        for answer in (code, supply, decimals, token0, token1, asset):
             if isinstance(answer, BaseException) and not _is_revert(answer):
                 raise answer
-        code, supply, decimals, token0, token1, asset = answers
         if not has_code(code):
             return ChainVerdict(AddressKind.NO_CODE)  # that node is behind: watch it, never reject
         first, second = word_address(token0), word_address(token1)
@@ -284,10 +295,12 @@ class EvmContractValidator:
             return ChainVerdict(AddressKind.PAIR, sides=sides)
         if word_address(asset):
             return ChainVerdict(AddressKind.VAULT)
-        places = word_uint(decimals)
-        if word_uint(supply) is not None and places is not None and places <= _MAX_DECIMALS:
-            return ChainVerdict(AddressKind.TOKEN)
-        return ChainVerdict(AddressKind.NOT_TOKEN)
+        if not looks_like_token(supply, decimals):
+            return ChainVerdict(AddressKind.NOT_TOKEN)
+        label = decode_abi_string(symbol)
+        if self._tuning.skip_stable_copies and is_stable_symbol(label):
+            return ChainVerdict(AddressKind.STABLE_COPY, symbol=label)
+        return ChainVerdict(AddressKind.TOKEN)
 
     def _quote(self, address: str) -> bool:
         """Return True for a stop-listed pair side (WETH, USDC, ...), which is never the launch."""

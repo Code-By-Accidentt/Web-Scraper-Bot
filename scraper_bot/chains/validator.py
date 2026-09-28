@@ -255,6 +255,7 @@ class ContractValidator:
                 address, ValidationStatus.CONFIRMED, verdict.network, kind=AddressKind.TOKEN
             )
         resolved = tuple(Address(address.chain, side) for side in verdict.sides)
+        unanswered = " (an optional network did not answer)" if verdict.partial else ""
         if verdict.kind is AddressKind.PAIR:
             self._remember_pair(address, resolved)
             log.info(
@@ -264,8 +265,16 @@ class ContractValidator:
                 verdict.network,
                 ", ".join(map(str, resolved)) or "only well-known tokens",
             )
+        elif verdict.kind is AddressKind.STABLE_COPY:
+            log.info(
+                "%s %s is not a token: a copy of a stablecoin or wrapped coin (symbol %s) on %s%s",
+                chain,
+                address,
+                verdict.symbol,
+                verdict.network,
+                unanswered,
+            )
         else:
-            unanswered = " (an optional network did not answer)" if verdict.partial else ""
             log.info("%s %s is not a token (%s)%s", chain, address, verdict.kind.value, unanswered)
         # A decimals-0 mint with nothing minted may still become a token: never cache it.
         if negative_cache and verdict.kind is not AddressKind.NOT_YET_MINTED:
@@ -430,13 +439,10 @@ class ContractValidator:
     async def _lookup(self, address: Address, networks: Collection[str] | None) -> ChainVerdict:
         """Ask the validator of the address's chain and return its verdict.
 
-        Solana and Sui name a network only for a token; Sui tells only token or not a token.
+        Solana and Sui name their network only for a token or a copy of a stablecoin.
         """
         if address.chain is Chain.ETHEREUM:
             return await self._evm.find_network(address.value, networks)
         if address.chain is Chain.SOLANA:
-            kind = await self._solana.inspect(address.value)
-            return ChainVerdict(kind, "Solana" if kind is AddressKind.TOKEN else None)
-        if await self._sui.is_coin_or_package(address.value):
-            return ChainVerdict(AddressKind.TOKEN, "Sui")
-        return ChainVerdict(AddressKind.NOT_TOKEN)
+            return await self._solana.inspect(address.value)
+        return await self._sui.inspect(address.value)

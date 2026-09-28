@@ -6,7 +6,7 @@ from scraper_bot.models.pages import PageCheckOutcome, PageStatus
 from scraper_bot.models.sightings import Observation
 from scraper_bot.pages.changes.detector import ChangeDetector
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
-from scraper_bot.pages.fetching.result import FetchResult
+from scraper_bot.pages.fetching.result import EarlyText, FetchResult
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.storage.snapshots import SnapshotStore
 from tests.conftest import FakeFetcher, FakeTuning, FakeValidator, node
@@ -109,6 +109,35 @@ async def test_volatile_content_is_not_a_change_and_stays_out_of_the_snapshot(
     h.fetcher.scripts[URL].clear()
     h.fetcher.html(URL, TIMER.format("10:15"), TIMER.format("10:20"))
     assert (await h.checker.check(URL)).status is PageStatus.UNCHANGED
+
+
+async def test_a_known_timer_needs_one_render_but_a_real_change_gets_two(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, TIMER.format("10:00"), TIMER.format("10:05"), TIMER.format("10:10"))
+    await h.checker.check(URL)
+    await h.checker.check(URL)  # two renders: the timer ticks, its shape is learned
+    h.fetcher.scripts[URL].clear()
+    h.fetcher.calls.clear()
+    h.fetcher.html(URL, TIMER.format("10:15"))
+    assert (await h.checker.check(URL)).status is PageStatus.UNCHANGED
+    assert h.fetcher.calls == [URL] and h.sleeps == [2.0]
+    h.fetcher.scripts[URL].clear()
+    h.fetcher.html(URL, TIMER.format(f"CA: {WETH}"))
+    assert (await h.checker.check(URL)).status is PageStatus.CHANGED
+    assert h.fetcher.calls == [URL, URL, URL] and h.sleeps == [2.0, 2.0]
+
+
+async def test_a_still_cell_shaped_like_a_timer_is_not_taken_for_it(tmp_path: Path) -> None:
+    cells = "<html><body><h1>Title</h1><span class='t'>{}</span><span class='t'>99:99</span>"
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, *(cells.format(time) for time in ("10:00", "10:05", "10:10")))
+    await h.checker.check(URL)
+    await h.checker.check(URL)  # the first cell ticks and is learned; the second stands still
+    h.fetcher.scripts[URL].clear()
+    h.fetcher.calls.clear()
+    h.fetcher.html(URL, cells.format("10:15").replace("99:99", "99:98"))
+    assert (await h.checker.check(URL)).status is PageStatus.CHANGED
+    assert h.fetcher.calls == [URL, URL]
 
 
 NEWS = (
@@ -395,9 +424,9 @@ async def test_addresses_are_reported_before_the_confirming_render(tmp_path: Pat
     events: list[str] = []
     original = h.fetcher.fetch
 
-    async def fetch(url: str, *, timeout: float | None = None) -> FetchResult:
+    async def fetch(url: str, *, timeout: float | None = None, on_text=None) -> FetchResult:
         events.append("fetch")
-        return await original(url, timeout=timeout)
+        return await original(url, timeout=timeout, on_text=on_text)
 
     async def observe(observation: Observation) -> None:
         events.append("observe")
@@ -412,14 +441,34 @@ async def test_addresses_are_reported_before_the_confirming_render(tmp_path: Pat
     assert events == ["fetch", "observe", "fetch"]  # the alert does not wait for render two
 
 
+async def test_an_address_shown_while_loading_is_reported_before_the_page_is_read(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path)
+    token = Address(Chain.ETHEREUM, USDC_ETH)
+    h.validator.confirm(token, "Base")
+    h.fetcher.html(URL, PAGE_A.replace("</body>", f"<p>CA: {USDC_ETH}</p></body>"))
+    h.fetcher.early[URL] = [
+        EarlyText("text", USDC_ETH, "CA:", 999.5),
+        EarlyText("attr", f"https://x.io/wallet/{WETH}", "href", 999.6),  # waits for the read
+    ]
+    await h.check()
+    early, full = h.observations
+    assert (early.read, early.seen_at, early.started_at) == (False, 999.5, None)
+    [sighting] = early.sightings
+    assert sighting.context == "CA:" and sighting.hinted
+    assert [r.contract for r in early.results] == [ConfirmedContract(token, "Base")]
+    assert full.read and full.seen_at == h.now
+
+
 async def test_an_observation_says_when_its_render_began_and_ended(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     h.fetcher.html(URL, PAGE_A.replace("</body>", f"<p>{USDC_ETH}</p></body>"))
     original = h.fetcher.fetch
 
-    async def slow_fetch(url: str, *, timeout: float | None = None) -> FetchResult:
+    async def slow_fetch(url: str, *, timeout: float | None = None, on_text=None) -> FetchResult:
         h.now += 1.5  # the render takes 1.5 s
-        return await original(url, timeout=timeout)
+        return await original(url, timeout=timeout, on_text=on_text)
 
     h.fetcher.fetch = slow_fetch  # type: ignore[method-assign]
     observed: list[Observation] = []

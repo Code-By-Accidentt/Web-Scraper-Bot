@@ -7,8 +7,17 @@ import logging
 import time
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
-from scraper_bot.models.pages import Node, NoiseEntry, NoiseMemory, Signature, Snapshot
+from scraper_bot.models.pages import (
+    Node,
+    NoiseEntry,
+    NoiseMemory,
+    Signature,
+    Snapshot,
+    VolatileEntry,
+    VolatileMemory,
+)
 from scraper_bot.pages.urls import url_to_filename
 from scraper_bot.storage.files import atomic_write_text
 
@@ -19,7 +28,7 @@ SNAPSHOT_VERSION = 2
 
 
 class SnapshotStore:
-    """Keeps one JSON file per page with its last accepted signature and noise memory."""
+    """Keeps one JSON file per page with its last accepted signature and its memories."""
 
     def __init__(self, directory: Path) -> None:
         """Keep the snapshots in ``directory``, creating it if needed."""
@@ -44,18 +53,17 @@ class SnapshotStore:
                 Node(str(tag), tuple((str(k), str(v)) for k, v in attrs), str(text))
                 for tag, attrs, text in data["nodes"]
             )
-            raw_noise = data.get("noise")
-            if raw_noise is None:
-                raw_noise = {}
-            if not isinstance(raw_noise, dict):
-                raise TypeError("noise must be an object")
             noise: NoiseMemory = {
                 str(key): NoiseEntry(int(count), float(last_seen))
-                for key, (count, last_seen) in raw_noise.items()
+                for key, (count, last_seen) in _object(data, "noise").items()
             }
             raw_deep = data.get("deep_seen")
             deep_seen = frozenset(str(v) for v in raw_deep) if isinstance(raw_deep, list) else None
-            return Snapshot(signature, noise, deep_seen)
+            volatile: VolatileMemory = {
+                str(key): VolatileEntry(int(count), float(last_seen), frozenset(map(int, places)))
+                for key, (count, last_seen, places) in _object(data, "volatile").items()
+            }
+            return Snapshot(signature, noise, deep_seen, volatile)
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             log.warning("snapshot %s is unreadable (%s); it will be rebuilt", path.name, exc)
             return None
@@ -68,6 +76,10 @@ class SnapshotStore:
             "saved_at": time.time(),
             "nodes": [[node.tag, list(node.attrs), node.text] for node in snapshot.signature],
             "noise": {key: [entry.count, entry.last_seen] for key, entry in snapshot.noise.items()},
+            "volatile": {
+                key: [entry.count, entry.last_seen, sorted(entry.positions)]
+                for key, entry in snapshot.volatile.items()
+            },
         }
         if snapshot.deep_seen is not None:
             payload["deep_seen"] = sorted(snapshot.deep_seen)
@@ -93,3 +105,16 @@ class SnapshotStore:
         if removed:
             log.info("removed %d orphaned snapshot(s)", removed)
         return removed
+
+
+def _object(data: dict[str, Any], name: str) -> dict[str, Any]:
+    """Return the JSON object a snapshot file keeps under ``name``, {} when it has none.
+
+    Anything else there makes the file unreadable.
+    """
+    value = data.get(name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"{name} must be an object")
+    return value

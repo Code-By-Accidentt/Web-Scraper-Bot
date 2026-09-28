@@ -112,12 +112,14 @@ class Settings:
     headless: bool
     blocked_resource_types: tuple[str, ...]
     browser_args: tuple[str, ...]
+    hide_automation: bool  # no "Headless" User-Agent or webdriver flag; cookies kept
 
     http2: bool  # RPC and Telegram over HTTP/2, so parallel calls share one warm connection
     evm_networks: tuple[EvmNetwork, ...]
     solana_rpc_url: str
     sui_rpc_url: str
     require_erc20: bool
+    skip_stable_copies: bool
     rpc_timeout: float
     max_concurrent_rpc: int
     rejected_ttl: float
@@ -214,11 +216,13 @@ class Settings:
                 "BLOCKED_RESOURCE_TYPES", DEFAULT_BLOCKED_RESOURCE_TYPES
             ),
             browser_args=reader.arguments("BROWSER_ARGS", DEFAULT_BROWSER_ARGS),
+            hide_automation=reader.flag("HIDE_AUTOMATION", True),
             http2=reader.flag("HTTP2", True),
             evm_networks=networks,
             solana_rpc_url=solana_rpc_url,
             sui_rpc_url=sui_rpc_url,
             require_erc20=reader.flag("REQUIRE_ERC20", True),
+            skip_stable_copies=reader.flag("SKIP_STABLE_COPIES", True),
             rpc_timeout=reader.number("RPC_TIMEOUT", 5.0, minimum=1.0),
             max_concurrent_rpc=reader.integer("MAX_CONCURRENT_RPC", 8, minimum=1),
             rejected_ttl=reader.number("REJECTED_TTL_HOURS", 6.0, minimum=0.0) * 3600.0,

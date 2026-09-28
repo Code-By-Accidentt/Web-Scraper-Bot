@@ -17,7 +17,7 @@ from scraper_bot.app.notices import (
 )
 from scraper_bot.app.runtime import build_runtime
 from scraper_bot.chains.enrichment import TokenEnricher
-from scraper_bot.pages.fetching.chromium import PlaywrightFetcher
+from scraper_bot.pages.fetching.chromium import ACCEPT_LANGUAGE, PlaywrightFetcher
 from scraper_bot.pages.fetching.result import BrowserUnavailable
 from scraper_bot.settings.env import Settings
 from scraper_bot.settings.live import Preferences
@@ -87,6 +87,7 @@ class Application:
             fetcher.on_sandbox_lost = lambda error: notifier.report_later(
                 "sandbox", "Chromium runs without its sandbox", error, hint=SANDBOX_HINT
             )
+            fetcher.on_user_agent = lambda agent: _speak_as(agent, http, probes)
             try:
                 await fetcher.start()
             except BrowserUnavailable as exc:
@@ -121,6 +122,13 @@ class Application:
             log.warning("could not verify the Telegram token now; continuing anyway")
         else:
             log.info("Telegram bot @%s (id %s)", profile.get("username"), profile.get("id"))
+
+
+def _speak_as(user_agent: str, *clients: httpx.AsyncClient) -> None:
+    """Make the HTTP clients send the browser's User-Agent and language, as one reader would."""
+    for client in clients:
+        client.headers["User-Agent"] = user_agent
+        client.headers["Accept-Language"] = ACCEPT_LANGUAGE
 
 
 def _http2(settings: Settings) -> bool:

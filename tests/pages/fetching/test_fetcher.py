@@ -7,6 +7,7 @@ covered by ``test_fetcher_browser.py`` behind an opt-in flag.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -515,6 +516,24 @@ class FakeChromium:
         self.context_options = kwargs
         return FakeContext(self)
 
+    async def new_page(self) -> FakeTab:  # the throwaway tab that reads the User-Agent
+        return FakeTab()
+
+
+HEADLESS_UA = "Mozilla/5.0 (X11; Linux x86_64) HeadlessChrome/149.0.0.0 Safari/537.36"
+HIDDEN = "--disable-blink-features=AutomationControlled"
+
+
+class FakeTab:
+    def __init__(self) -> None:
+        self.context = self  # closing its own context closes the tab
+
+    async def evaluate(self, _script: str) -> str:
+        return HEADLESS_UA
+
+    async def close(self) -> None:
+        pass
+
 
 class FakeContext:
     def __init__(self, browser: FakeChromium) -> None:
@@ -526,6 +545,12 @@ class FakeContext:
     async def route(self, pattern: str, _handler: object) -> None:
         self.browser.routes.append(pattern)
 
+    async def expose_binding(self, name: str, _callback: object) -> None:
+        self.browser.listeners.append(f"binding:{name}")
+
+    async def add_init_script(self, _script: str) -> None:
+        self.browser.listeners.append("init script")
+
 
 @dataclass
 class FakePlaywright:
@@ -535,9 +560,12 @@ class FakePlaywright:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, ["--disable-3d-apis", "--disable-webgl", "--disable-webgl2"]),
-        ("", []),
-        ("--lang=en-US '--window-size=1366,900'", ["--lang=en-US", "--window-size=1366,900"]),
+        (None, ["--disable-3d-apis", "--disable-webgl", "--disable-webgl2", HIDDEN]),
+        ("", [HIDDEN]),
+        (
+            "--lang=en-US '--window-size=1366,900'",
+            ["--lang=en-US", "--window-size=1366,900", HIDDEN],
+        ),
     ],
 )
 async def test_launch_passes_the_browser_args_and_always_installs_the_filter(
@@ -553,7 +581,35 @@ async def test_launch_passes_the_browser_args_and_always_installs_the_filter(
     assert launch["chromium_sandbox"] is True and fetcher.sandboxed
     assert playwright.chromium.routes == ["**/*"]  # beacons are dropped even with no types
     assert playwright.chromium.context_options["accept_downloads"] is False
-    assert playwright.chromium.listeners == ["page"]  # tabs a page opens get closed
+    # tabs a page opens get closed; the observer calls its binding from the first node
+    assert playwright.chromium.listeners == ["page", "binding:__textSeen", "init script"]
+
+
+async def test_hidden_automation_reads_like_a_person_and_keeps_the_saved_state(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path, BROWSER_ARGS="--disable-blink-features=Foo")
+    state = {"cookies": [{"name": "cf_clearance", "value": "x", "domain": ".x.io"}], "origins": []}
+    settings.data_dir.mkdir(parents=True)
+    (settings.data_dir / "browser_state.json").write_text(json.dumps(state), encoding="utf-8")
+    fetcher = PlaywrightFetcher(settings)
+    heard: list[str] = []
+    fetcher.on_user_agent = heard.append  # the HTTP clients learn it
+    playwright = FakePlaywright()
+    fetcher._playwright = playwright  # type: ignore[assignment]
+    await fetcher._launch()
+    assert playwright.chromium.launches[0]["args"] == [
+        "--disable-blink-features=Foo,AutomationControlled"
+    ]
+    options = playwright.chromium.context_options
+    assert options["user_agent"] == heard[0] == HEADLESS_UA.replace("Headless", "")
+    assert options["locale"] == "en-US" and options["storage_state"] == state
+
+    plain = PlaywrightFetcher(make_settings(tmp_path, HIDE_AUTOMATION="false"))
+    plain._playwright = playwright = FakePlaywright()  # type: ignore[assignment]
+    await plain._launch()
+    assert HIDDEN not in playwright.chromium.launches[0]["args"]  # type: ignore[operator]
+    assert "user_agent" not in playwright.chromium.context_options
 
 
 async def test_without_a_usable_sandbox_the_browser_starts_without_it(tmp_path: Path) -> None:

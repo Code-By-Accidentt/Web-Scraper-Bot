@@ -18,21 +18,24 @@ bothers you.
 - **Change detection that does not lie.** Structural diff of the rendered DOM (text and
   attributes), every change confirmed by a second render, whatever differs between the two
   renders (timers, counters, banners) is ignored (a real change that lands between them is
-  reported by the next round), elements that keep flapping are silenced. Alerts say *what*
-  changed, not only how much.
+  reported by the next round), elements that keep flapping are silenced. A timer or clock
+  the bot has seen tick costs no second render. Alerts say *what* changed, not only how
+  much.
 - **Token discovery on three chain families.** ERC-20 tokens on 10 EVM networks
   (Ethereum, Base, Arbitrum, Optimism, BSC, Fantom, Sonic, Avalanche, Arc, Robinhood
   Chain), SPL / Token-2022 mints on Solana, Sui coins. An LP pair leads to its token; wallets
   (EIP-7702 included), NFTs, vaults, programs, stablecoins and wrapped natives never
-  count. Candidates are taken from the whole rendered page and, with deep scan (off by
+  count, nor do copies of them (a token called USDC, WETH, ... at another address, judged
+  per network). Candidates are taken from the whole rendered page and, with deep scan (off by
   default), from iframes, shadow DOM and every script or JSON answer the page loaded.
   Verdicts are cached; a rate-limited node never turns a real token into a cached
   rejection.
-- **Alerts first, details second.** A token alert leaves the moment a render shows the
-  token: where it stood on the page, the words in front of it and when it appeared. A
-  second later the same message gains the name, supply, Solana authorities and risky
-  extensions, the token's age, other networks and the DEX pair. One alert per token,
-  across pages, sites and modes.
+- **Alerts first, details second.** A token alert leaves the moment the page shows the
+  token, while it is still loading (milliseconds after the document or the script that
+  shows it, plus the on-chain check): where it stood on the page, the words in front of
+  it and when it appeared. A second later the same message gains the name, supply,
+  Solana authorities and risky extensions, the token's age, the other networks where the
+  address is a token and the DEX pair. One alert per token, across pages, sites and modes.
 - **Addresses published before their token.** An address that is on the page before
   its contract exists is watched (every second at first, then every 5 and 30 s, when the
   page names it as the CA or in turbo) and announced once it is deployed.
@@ -46,8 +49,10 @@ bothers you.
 - **Block awareness.** 401/403/407/429/503, WAF challenges and connection resets slow the
   site's interval down (doubling up to a cap, or longer when the site sends `Retry-After`),
   with one warning that names the protection (Cloudflare, Vercel, AWS WAF, DataDome, ...)
-  and one recovery notice. A captcha widget on a page is reported once. No proxy rotation,
-  no captcha solving.
+  and one recovery notice; while the site still refuses one light request, nothing is
+  rendered. The browser does not announce itself as automated and keeps its cookies
+  across restarts, so a check it passed on its own is not asked again. A captcha widget
+  on a page is reported once. No proxy rotation, no captcha solving.
 - **Pages that keep timing out** get one alert and a longer load timeout until they render
   again.
 - **Persistent and supervised.** Sites, flags, snapshots and caches live under `data/` and

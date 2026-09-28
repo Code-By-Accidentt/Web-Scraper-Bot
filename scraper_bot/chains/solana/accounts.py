@@ -163,6 +163,18 @@ def parse_token2022_metadata(data: bytes) -> tuple[str | None, str | None]:
     return None, None
 
 
+def token_names(mint: bytes, metadata: bytes) -> tuple[str | None, str | None]:
+    """Return (name, symbol) of a mint from its Metaplex metadata, else from its Token-2022 data.
+
+    ``mint`` and ``metadata`` are the data of the mint and of its Metaplex metadata account
+    (empty when there is none).
+    """
+    name, symbol = parse_metaplex_metadata(metadata)
+    if name is None and symbol is None:
+        name, symbol = parse_token2022_metadata(mint)
+    return name, symbol
+
+
 def parse_authorities(data: bytes) -> tuple[bool, bool] | None:
     """Return (mint authority kept, freeze authority kept) of a mint, or None when too short.
 

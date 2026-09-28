@@ -18,12 +18,20 @@ PAIR_TOKEN1 = "0xd21220a7"
 VAULT_ASSET = "0x38d52e0f"
 
 # EvmContractValidator unpacks the answers in exactly this order.
-TOKEN_PROBE = (ERC20_TOTAL_SUPPLY, ERC20_DECIMALS, PAIR_TOKEN0, PAIR_TOKEN1, VAULT_ASSET)
+TOKEN_PROBE = (
+    ERC20_TOTAL_SUPPLY,
+    ERC20_DECIMALS,
+    PAIR_TOKEN0,
+    PAIR_TOKEN1,
+    VAULT_ASSET,
+    ERC20_SYMBOL,
+)
 
 # EIP-7702: a delegated wallet's code is 0xef0100 plus the delegate's 20-byte address.
 DELEGATION_PREFIX = "0xef0100"
 DELEGATION_CODE_LENGTH = 2 + 2 * 23
 
+MAX_DECIMALS = 255  # decimals() is a uint8
 _EMPTY_CODE = frozenset({"", "0x", "0x0"})
 
 
@@ -63,6 +71,15 @@ def word_uint(result: object) -> int | None:
         return int(result[2:66], 16)
     except ValueError:
         return None
+
+
+def looks_like_token(supply: object, decimals: object) -> bool:
+    """Return True when totalSupply() and decimals() both answered, as an ERC-20 token does.
+
+    Both answers must hold a number, and decimals must fit a uint8.
+    """
+    places = word_uint(decimals)
+    return word_uint(supply) is not None and places is not None and places <= MAX_DECIMALS
 
 
 def decode_abi_string(result: Any) -> str | None:

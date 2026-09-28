@@ -33,6 +33,7 @@ class Tuning(Protocol):
     settle_delay: float
     render_failure_threshold: int
     require_erc20: bool
+    skip_stable_copies: bool
     contract_pause_threshold: int
     rejected_ttl: float
     deep_scan: bool

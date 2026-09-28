@@ -2,13 +2,16 @@
 
 App pages load wallet-connect bundles and swap widgets full of these. Without this list,
 the first round on such a site would announce a dozen "contracts" and auto-pause it.
-Every token below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24;
-those on Arc and Robinhood Chain were taken from the chains' own docs on 2026-09-27.
+Every token below was checked on-chain (its ``symbol()`` or mint account) on 2026-09-24,
+those added in 2.1.3 on 2026-09-28; those on Arc and Robinhood Chain were taken from the
+chains' own docs on 2026-09-27. Copies of such tokens elsewhere are known by their symbol
+(``STABLE_SYMBOLS``).
 """
 
 from __future__ import annotations
 
 import logging
+import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -32,6 +35,10 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("PYUSD", "0x6c3ea9036406852006290770BEdFcAbA0e23A0e8"),
         ("FDUSD", "0xc5f0f7b66764F6ec8C8Dff7BA683102295E16409"),
         ("USDS", "0xdC035D45d973E3EC169d2276DDab16f1e407384F"),
+        ("EURC", "0x1aBaEA1f7C830bD89Acc67eC4af516284b1bC33c"),
+        ("rETH", "0xae78736Cd615f374D3085123A210448E74Fc6393"),
+        ("weETH", "0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee"),
+        ("RLUSD", "0x8292Bb45bf1Ee4d140127049757C2E0fF06317eD"),
     ),
     "Base": (
         ("USDC", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
@@ -41,6 +48,7 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("USDT", "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"),
         ("wstETH", "0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452"),
         ("EURC", "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42"),
+        ("USDe", "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"),
     ),
     "Arbitrum": (
         ("USDC", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"),
@@ -50,12 +58,15 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("WBTC", "0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"),
         ("DAI", "0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"),
         ("ARB", "0x912CE59144191C1204E64559FE8253a0e49E6548"),
+        ("wstETH", "0x5979D7b546E38E414F7E9822514be443A4800529"),
+        ("USDe", "0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"),
     ),
     "Optimism": (
         ("USDC", "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"),
         ("USDC.e", "0x7F5c764cBc14f9669B88837ca1490cCa17c31607"),
         ("USDT", "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"),
         ("WBTC", "0x68f180fcCe6836688e9084f035309E29Bf0A2095"),
+        ("wstETH", "0x1F32b1c2345538c0c6f582fCB022739c4A194Ebb"),
     ),
     "BSC": (
         ("USDT", "0x55d398326f99059fF775485246999027B3197955"),
@@ -66,6 +77,7 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("ETH", "0x2170Ed0880ac9A755fd29B2688956BD959F933F8"),
         ("DAI", "0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3"),
         ("USD1", "0x8d0D000Ee44948FC98c9B98A4FA4921476f08B0d"),
+        ("slisBNB", "0xB0b84D294e0C75A6abe60171b70edEb2EFd14A1B"),
     ),
     "Avalanche": (
         ("USDC", "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"),
@@ -76,11 +88,13 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("USDC.e", "0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664"),
         ("DAI.e", "0xd586E7F844cEa2F87f50152665BCbc2C279D8d70"),
         ("BTC.b", "0x152b9d0FdC40C096757F570A51E494bd4b943E50"),
+        ("sAVAX", "0x2b2C81e08f1Af8835a78Bb2A90AE924ACE0eA4bE"),
     ),
     "Sonic": (
         ("wS", "0x039e2fB66102314Ce7b64Ce5Ce3E5183bc94aD38"),
         ("USDC.e", "0x29219dd400f2Bf60E5a23d13Be72B486D4038894"),
         ("WETH", "0x50c42dEAcD8Fc9773493ED674b675bE577f2634b"),
+        ("stS", "0xE5DA20F15420aD15DE0fa650600aFc998bbE3955"),
     ),
     "Fantom": (
         ("WFTM", "0x21be370D5312f44cB42ce377BC9b8a0cEF1A4C83"),
@@ -131,6 +145,50 @@ SUI_PACKAGES: tuple[tuple[str, str], ...] = (
     ("USDC", "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7"),
     ("USDT", "0x375f70cf2ae4c00bf37117d0c85a2c71545e6ee05c4a5c7d282cd66a4504b068"),
 )
+
+# Stablecoins, wrapped coins, native coins and staked coins. A token that carries one of
+# these symbols but is not on the lists above is a copy (bridged, plumbing or a scam).
+STABLE_SYMBOLS: tuple[str, ...] = (
+    *("USDC", "USDT", "USDC.e", "USDbC", "USDT.e", "USDT0", "EURC", "DAI", "USDe", "PYUSD"),
+    *("FDUSD", "USDS", "USD1", "USDG", "RLUSD", "TUSD", "FRAX", "LUSD", "GHO", "crvUSD"),
+    *("BUSD", "DAI.e"),
+    *("WETH", "WBTC", "cbBTC", "WBNB", "WAVAX", "WFTM", "WSOL", "WETH.e", "WBTC.e"),
+    *("BTCB", "BTC.b"),
+    *("ETH", "BTC", "BNB", "SOL", "AVAX"),
+    *("stETH", "wstETH", "rETH", "weETH", "cbETH", "sAVAX", "stS", "slisBNB"),
+    *("jitoSOL", "mSOL", "bSOL", "JupSOL"),
+)
+
+# Each group is a Latin letter followed by the Cyrillic and Greek letters (and Tether's ₮)
+# drawn like it, as in "USDС" with a Cyrillic С.
+_LOOKALIKE_GROUPS = (
+    "AАΑ BВΒ CС EЕΕ HНҺΗ IІΙӀ JЈ KКΚ MМΜ NΝ OОΟ PРΡ SЅ TТΤ₮ XХΧ YУҮΥ ZΖ "
+    "aаα bв cс dԁ eе hһн iіι jј kкκ lӏ mм oоο pрρ sѕ tтτ uυ vν xхχ yуү"
+)
+_LOOKALIKES = str.maketrans(
+    {look: group[0] for group in _LOOKALIKE_GROUPS.split() for look in group[1:]}
+)
+
+
+def _symbol_key(symbol: str) -> str:
+    """Return a token symbol in the form in which symbols are compared.
+
+    Invisible characters go, NFKC turns fullwidth and styled letters (ＵＳＤＣ, 𝐔𝐒𝐃𝐂) into
+    plain ones, look-alike letters become Latin, and the case is folded.
+    """
+    visible = "".join(char for char in symbol if unicodedata.category(char) != "Cf")
+    return unicodedata.normalize("NFKC", visible).translate(_LOOKALIKES).casefold().strip()
+
+
+_STABLE_KEYS = frozenset(_symbol_key(symbol) for symbol in STABLE_SYMBOLS)
+
+
+def is_stable_symbol(symbol: str | None) -> bool:
+    """Return True when ``symbol`` reads as one of ``STABLE_SYMBOLS``, look-alikes included.
+
+    Only the whole symbol counts, so "USDCAT" or "PEPEUSDC" do not; None never does.
+    """
+    return symbol is not None and _symbol_key(symbol) in _STABLE_KEYS
 
 
 class StopList:

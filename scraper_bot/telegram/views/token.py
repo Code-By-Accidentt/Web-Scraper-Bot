@@ -135,7 +135,11 @@ def describe_token(info: TokenInfo, now: float) -> list[str]:
     lines.extend(_risk_lines(info))
     lines.extend(_age_lines(info, now))
     if info.also_on:
-        lines.append("Also on: " + ", ".join(escape(name) for name in info.also_on))
+        places = (
+            f"{escape(network)} ({escape(symbol)})" if symbol else escape(network)
+            for network, symbol in info.also_on
+        )
+        lines.append("Also on: " + ", ".join(places))
     if info.pair_url:
         # No link: the pair URL holds the pair's own address, and an alert names one token.
         market = [escape(f"{info.dex or 'DEX'} {info.pair or ''}".strip())]

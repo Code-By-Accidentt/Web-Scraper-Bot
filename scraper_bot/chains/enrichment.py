@@ -27,6 +27,7 @@ from scraper_bot.chains.evm.abi import (
     decode_abi_uint,
     has_code,
     is_delegated_wallet,
+    looks_like_token,
 )
 from scraper_bot.chains.networks import NETWORK_LINKS
 from scraper_bot.chains.rpc.client import JsonRpcClient, RpcError
@@ -34,10 +35,9 @@ from scraper_bot.chains.solana.accounts import (
     account_data,
     metadata_address,
     parse_authorities,
-    parse_metaplex_metadata,
     parse_mint,
     parse_risky_extensions,
-    parse_token2022_metadata,
+    token_names,
 )
 from scraper_bot.chains.sui.objects import coin_metadata, find_coin, total_supply
 from scraper_bot.models.addresses import Chain, ConfirmedContract, clean_label
@@ -50,6 +50,7 @@ DEXSCREENER_API = "https://api.dexscreener.com"
 _MAX_DECIMALS = 36
 _AGE_BLOCKS = 90  # public nodes keep about 100 blocks of EVM state
 _SIGNATURE_PAGE = 1000  # Solana: one page of a mint's transactions
+_ALSO_ON_MARGIN = 0.1  # seconds "other networks" keeps back to hand in what answered
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +81,8 @@ class TokenInfo:
     deployed_before: float | None = None  # seconds: deployed longer ago than this
     created_at: float | None = None  # Solana: epoch seconds of the mint's first transaction
     busy: bool = False  # Solana: 1000+ transactions, too many to find the first one
-    also_on: tuple[str, ...] = ()  # other EVM networks with a contract at this address
+    # (network, symbol) of the other EVM networks where this address is a token too
+    also_on: tuple[tuple[str, str | None], ...] = ()
 
     @property
     def supply(self) -> float | None:
@@ -191,7 +193,12 @@ class TokenEnricher:
                 self._bounded(self._chain_details(contract), budget, "chain"),
                 self._bounded(self._market_details(contract), budget, "market"),
                 self._bounded(self._age(contract), budget, "age"),
-                self._bounded(self._also_on(contract), budget, "other networks"),
+                # The networks answering in time are kept; the outer bound is a safety net.
+                self._bounded(
+                    self._also_on(contract, max(budget - _ALSO_ON_MARGIN, 0.1)),
+                    budget,
+                    "other networks",
+                ),
             )
             on_chain = {**age, **others, **on_chain}
         return TokenInfo(**{**market, **on_chain})
@@ -262,9 +269,7 @@ class TokenEnricher:
         risky = parse_risky_extensions(mint_data)
         if risky:
             details["risky_extensions"] = risky
-        name, symbol = parse_metaplex_metadata(account_data(metadata_account))
-        if name is None and symbol is None:
-            name, symbol = parse_token2022_metadata(mint_data)
+        name, symbol = token_names(mint_data, account_data(metadata_account))
         if name:
             details["name"] = name
         if symbol:
@@ -330,21 +335,55 @@ class TokenEnricher:
             return {"deployed_within": window}
         return {"deployed_before": window}
 
-    async def _also_on(self, contract: ConfirmedContract) -> dict[str, Any]:
-        """Return the other EVM networks with code at the same address (a foreign token?)."""
+    async def _also_on(
+        self, contract: ConfirmedContract, budget: float | None = None
+    ) -> dict[str, Any]:
+        """Return the other EVM networks where the address is a token too, with its symbol.
+
+        Every network gets one batch, all at once; one that has not answered within
+        ``budget`` seconds is left out, so a slow node never costs the others. A symbol
+        that cannot be read leaves just the network's name.
+        """
         if contract.address.chain is not Chain.ETHEREUM or contract.network not in self._evm:
             return {}
-        others = [(n, c) for n, c in self._evm.items() if n != contract.network]
-        codes = await asyncio.gather(
-            *(c.call("eth_getCode", [contract.address.value, "latest"]) for _, c in others),
-            return_exceptions=True,
-        )
+        tasks = [
+            asyncio.ensure_future(self._token_on(name, client, contract.address.value))
+            for name, client in self._evm.items()
+            if name != contract.network
+        ]
+        if not tasks:
+            return {}
+        done, pending = await asyncio.wait(tasks, timeout=budget)
+        for task in pending:
+            task.cancel()
         found = tuple(
-            name
-            for (name, _), code in zip(others, codes, strict=True)
-            if isinstance(code, str) and has_code(code) and not is_delegated_wallet(code)
+            answer
+            for task in tasks
+            if task in done and task.exception() is None and (answer := task.result())
         )
         return {"also_on": found} if found else {}
+
+    @staticmethod
+    async def _token_on(
+        name: str, client: JsonRpcClient, address: str
+    ) -> tuple[str, str | None] | None:
+        """Return (network, symbol) when ``address`` is a token on this network, else None.
+
+        It is one when its bytecode is no delegated wallet and it answers totalSupply() and
+        decimals(), the validator's test for a token.
+        """
+        code, supply, decimals, symbol = await client.call_batch(
+            [
+                ("eth_getCode", [address, "latest"]),
+                *(
+                    ("eth_call", [{"to": address, "data": selector}, "latest"])
+                    for selector in (ERC20_TOTAL_SUPPLY, ERC20_DECIMALS, ERC20_SYMBOL)
+                ),
+            ]
+        )
+        if not has_code(code) or is_delegated_wallet(code):
+            return None
+        return (name, decode_abi_string(symbol)) if looks_like_token(supply, decimals) else None
 
     async def _solana_age(self, mint: str) -> dict[str, Any]:
         """Return when the mint's first transaction happened, or ``busy`` when it has too many.

@@ -201,7 +201,7 @@ def build_runtime(
         EvmContractValidator(
             http, cfg.evm_networks, timeout=cfg.rpc_timeout, tuning=prefs, stoplist=stoplist
         ),
-        SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout),
+        SolanaContractValidator(http, cfg.solana_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
         cache,
         sui=SuiCoinValidator(http, cfg.sui_rpc_url, timeout=cfg.rpc_timeout, tuning=prefs),
         max_concurrent=cfg.max_concurrent_rpc,

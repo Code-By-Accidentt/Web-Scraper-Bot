@@ -85,7 +85,7 @@ The full list of live keys is in [configuration.md](configuration.md).
 Example `/status`:
 
 ```text
-🤖 scraper-bot 2.1.2, up 3h 12m
+🤖 scraper-bot 2.1.3, up 3h 12m
 Browser: connected
 ⚠️ RPC not answering: Fantom for 2m 10s
 Sites: 2 total, 2 running, 0 paused

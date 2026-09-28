@@ -152,6 +152,22 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         ),
     ),
     PreferenceSpec(
+        "skip_stable_copies",
+        "skip_stable_copies",
+        "contracts",
+        "bool",
+        "Skip copies of stablecoins and wrapped coins",
+        "On: a token whose symbol is a stablecoin's or a wrapped or staked coin's (USDC, "
+        "USDT, WETH, stETH, ...) but whose address is not on the stop-list is a copy (bridged, "
+        "plumbing or a scam) and is not announced. Look-alike letters count (USDС with a "
+        "Cyrillic С), longer symbols do not (USDCAT). It is judged per network: the same "
+        "address with another symbol elsewhere is still announced there. On EVM and Sui it "
+        "needs require_erc20 on.",
+        caution=_when(
+            False, "Bridged and fake USDC, USDT, WETH and the like will be announced as launches."
+        ),
+    ),
+    PreferenceSpec(
         "contract_pause_threshold",
         "contract_pause_threshold",
         "contracts",

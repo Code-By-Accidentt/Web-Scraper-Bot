@@ -26,7 +26,7 @@ from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.site_monitor import MonitorStats
 from scraper_bot.monitoring.turbo.session import TurboStats
 from scraper_bot.pages.fetching.prober import ProbeResult
-from scraper_bot.pages.fetching.result import FetchResult
+from scraper_bot.pages.fetching.result import EarlyListener, EarlyText, FetchResult
 from scraper_bot.settings.env import Settings
 from scraper_bot.telegram.client import SentMessage
 
@@ -48,6 +48,7 @@ class FakeTuning:
     settle_delay: float = 0.0
     render_failure_threshold: int = 5
     require_erc20: bool = True
+    skip_stable_copies: bool = True
     contract_pause_threshold: int = 5
     rejected_ttl: float = 0.0
     deep_scan: bool = True
@@ -96,6 +97,7 @@ class FakeFetcher:
         self.scripts: dict[str, list[FetchResult]] = defaultdict(list)
         self.calls: list[str] = []
         self.timeouts: list[float | None] = []  # the ``timeout`` passed to each fetch
+        self.early: dict[str, list[EarlyText]] = {}  # reported by the next fetch that listens
 
     def script(self, url: str, *results: FetchResult) -> None:
         self.scripts[url].extend(results)
@@ -116,9 +118,15 @@ class FakeFetcher:
             ),
         )
 
-    async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult:
+    async def fetch(
+        self, url: str, *, timeout: float | None = None, on_text: EarlyListener | None = None
+    ) -> FetchResult:
         self.calls.append(url)
         self.timeouts.append(timeout)
+        if on_text is not None and url in self.early:
+            for item in self.early.pop(url):
+                on_text(item)
+            await asyncio.sleep(0)  # the early checks start while the page still loads
         queue = self.scripts[url]
         if not queue:
             return FetchResult(url, None, error="no scripted response")
@@ -187,6 +195,8 @@ class FakeProber:
     def __init__(self, statuses: dict[str, int | None] | None = None) -> None:
         self.statuses = statuses or {}
         self.calls: list[str] = []
+        self.peeks: list[str] = []
+        self.peek_status = 200  # what a light GET of any page answers
 
     async def probe(self, url: str) -> ProbeResult:
         self.calls.append(url)
@@ -194,6 +204,10 @@ class FakeProber:
         if status is None:
             return ProbeResult(url, None, error="ConnectError: name not resolved")
         return ProbeResult(url, status)
+
+    async def peek(self, url: str) -> FetchResult:
+        self.peeks.append(url)
+        return FetchResult(url, self.peek_status, "<html><title>page</title></html>")
 
 
 class FakeNotifier:

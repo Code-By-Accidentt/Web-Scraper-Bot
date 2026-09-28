@@ -11,13 +11,14 @@ from dataclasses import dataclass
 from itertools import islice
 
 from scraper_bot.models.addresses import Address, ConfirmedContract, ValidationResult
-from scraper_bot.models.pages import PageCheckOutcome, PageStatus
+from scraper_bot.models.pages import BlockSignal, PageCheckOutcome, PageStatus
 from scraper_bot.models.sightings import Observation, Sighting, Timeline
 from scraper_bot.models.sites import LastChange, SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
+from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.pages.urls import SubUrlDeriver
@@ -60,6 +61,8 @@ class _PageHealth:
 
 
 _MAX_BLOCK_LEVEL = 8
+# Blocked rounds in a row that a refusal to one light request spares from rendering.
+_LIGHT_SKIPS = 3
 _MAX_TIMEOUT_FACTOR = 3
 _FIRST_SEEN_MEMORY = 20_000  # (page, address) pairs remembered for "on page since"
 
@@ -88,6 +91,7 @@ class SiteMonitor:
         rng: random.Random | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         page_load_timeout: float = 30.0,
+        block_detector: BlockDetector | None = None,
     ) -> None:
         """Set up the monitor of ``site``; nothing runs until :meth:`run`.
 
@@ -107,6 +111,8 @@ class SiteMonitor:
         self._rng = rng or random.Random()
         self._sleep = sleep
         self._page_load_timeout = page_load_timeout
+        self._blocks = block_detector or BlockDetector()
+        self._light_skips = 0  # blocked rounds in a row whose renders a light request spared
         self._stop = asyncio.Event()
         self._stats = MonitorStats()
         self._planned_delay: float | None = None
@@ -147,10 +153,24 @@ class SiteMonitor:
         """Check every live page once and return the outcomes.
 
         Each outcome is handled as soon as its check ends. A failed check is reported to the
-        user and left out of the result.
+        user and left out of the result. While the site blocks, a light request may show it
+        still refuses; then nothing is rendered and the refusal is the round's only outcome.
         """
         started = time.perf_counter()
         self._round_tokens = {}
+        refusal = await self._light_check()
+        if refusal is not None:
+            if self._watcher is not None:
+                await self._watcher.recheck()
+            self._stats.rounds += 1
+            self._stats.last_round_at = time.time()
+            self._stats.last_round_seconds = time.perf_counter() - started
+            self._stats.last_pages = 0
+            outcome = PageCheckOutcome(
+                self._site.url, PageStatus.UNAVAILABLE, error=refusal.reason, block=refusal
+            )
+            await self._update_block_state([outcome])
+            return [outcome]
         pages = await live_pages(self._prober, self._deriver, self._site.url)
         results = await asyncio.gather(
             *(self._check_and_handle(url) for url in pages), return_exceptions=True
@@ -184,6 +204,29 @@ class SiteMonitor:
         self._count_timing_out()
         await self._update_block_state(outcomes)
         return outcomes
+
+    async def _light_check(self) -> BlockSignal | None:
+        """While the site blocks, ask its root page once over HTTP before rendering anything.
+
+        Return the block signal of a refusal: the round then renders nothing, so the bot does
+        not prolong the ban. After ``_LIGHT_SKIPS`` spared rounds in a row one renders anyway,
+        as the browser may pass where the HTTP client is refused. Anything but a refusal
+        (the page, a 404, a network error) lets the round render as usual.
+        """
+        if not self._stats.blocked or self._light_skips >= _LIGHT_SKIPS:
+            self._light_skips = 0
+            return None
+        signal = self._blocks.inspect(await self._prober.peek(self._site.url))
+        if signal is None:
+            self._light_skips = 0
+            return None
+        self._light_skips += 1
+        log.info(
+            "[%s] still refused (%s); nothing rendered this round",
+            self._site.url,
+            signal.describe(),
+        )
+        return signal
 
     def next_delay(self) -> float:
         """Return the seconds until the next round.

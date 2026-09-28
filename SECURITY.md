@@ -24,10 +24,11 @@ and a fix lands on `main` before anything is discussed publicly.
 | Telegram bot token | `.env` only (`TELEGRAM_BOT_TOKEN`) | Never logged: every error message that could contain the API URL is redacted to `<token>`. `.env` is git-ignored. |
 | Chat ids | `.env` (`TELEGRAM_CHAT_IDS`, `TELEGRAM_ALLOWED_CHAT_IDS`) | Alerts go only to `TELEGRAM_CHAT_IDS`. |
 | Monitored URLs, page snapshots, found and rejected addresses, unsent alerts, live settings | `data/` | Plain files, git-ignored. They hold page text of the sites you watch and every address the bot saw. Back them up and protect them like any other data. |
+| The browser's cookies and local storage | `data/browser_state.json` (with `HIDE_AUTOMATION`, the default) | Only what the monitored sites set for an anonymous visitor (the bot logs in nowhere), such as a passed Cloudflare or Vercel check. Anyone who reads the file can present those cookies to the sites: keep it private like the rest of `data/`. |
 | Logs | console or `LOG_FILE` | Contain URLs and addresses, never the token. |
 
 The bot only reads: it renders pages, calls read-only JSON-RPC methods (`eth_getCode`,
-`eth_call`, `getAccountInfo`, `sui_getObject`, `suix_getCoinMetadata`, ...) and reads
+`eth_call`, `getMultipleAccounts`, `sui_getObject`, `suix_getCoinMetadata`, ...) and reads
 DexScreener. It holds no keys, signs nothing and never sends a transaction.
 
 ## Who can control the bot
@@ -75,21 +76,26 @@ Keep these points in mind:
 - The public RPC endpoints in `.env` see every address the bot checks and your IP. Use
   your own endpoints if that matters.
 - DexScreener sees every confirmed contract address (token details).
-- The monitored sites see a headless Chrome that says so (its user agent contains
-  `HeadlessChrome` and `navigator.webdriver` is true) coming from your IP, at the pace set
-  by `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`, plus, per derived sub-page and round, a
-  HEAD request (a GET when it answers 404/405/410/501; redirects followed) with a desktop
-  Chrome user agent: the probes that find which sub-pages exist. Their analytics services
-  do not: the bot drops the beacons.
+- The monitored sites see Chrome coming from your IP, at the pace set by
+  `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`, plus, per derived sub-page and round, a
+  HEAD request (a GET when it answers 404/405/410/501; redirects followed): the probes
+  that find which sub-pages exist; while a site blocks, one GET of its root page per
+  round. With `HIDE_AUTOMATION` (the default) the browser and these requests send the
+  browser's own User-Agent without "Headless" and `navigator.webdriver` is false; with
+  `false` the browser says it is headless and the probes send a fixed desktop Chrome
+  user agent. Their analytics services see nothing: the bot drops the beacons.
 
 ## What the bot never does
 
-- No captcha solving, no proxy or IP rotation, no fingerprint spoofing in the browser.
-  When a site answers 401/403/407/429/503, shows a challenge page or resets connections,
-  the bot slows down (the interval doubles up to `BLOCK_MAX_BACKOFF`; a longer
-  `Retry-After` from the site is honoured), tells you once, naming the protection when it
-  can, and resumes the normal pace after a round without block signals in which the root
-  page answered.
+- No captcha solving, no proxy or IP rotation, no tampering with a site's check scripts.
+  `HIDE_AUTOMATION` only drops the marks of automation (the "Headless" in the User-Agent,
+  `navigator.webdriver`) and keeps cookies; the browser never poses as another browser,
+  device or place. When a site answers 401/403/407/429/503, shows a challenge page or
+  resets connections, the bot slows down (the interval doubles up to `BLOCK_MAX_BACKOFF`;
+  a longer `Retry-After` from the site is honoured; while the site still refuses one
+  light request, nothing is rendered), tells you once, naming the protection when it can,
+  and resumes the normal pace after a round without block signals in which the root page
+  answered.
 - No writes to any blockchain, no wallets, no private keys.
 - No outbound traffic other than Telegram, the configured RPC endpoints, DexScreener and
   the sites you asked it to watch, including the third-party hosts their pages load

@@ -15,6 +15,8 @@ from scraper_bot.models.sightings import Observation, Sighting, SightingSource
 from scraper_bot.pages.changes.detector import ChangeDetector
 from scraper_bot.pages.changes.noise import NoiseFilter
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
+from scraper_bot.pages.changes.volatile import VolatileShapes
+from scraper_bot.pages.early import EarlyReader
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
@@ -59,7 +61,8 @@ class PageChecker:
 
     A change counts only if a second render ``confirm_delay`` seconds later still shows it;
     what differs between the two renders is volatile and stays out of the report and the
-    snapshot. Elements that keep changing across rounds are silenced by :class:`NoiseFilter`.
+    snapshot, and a render that differs only in shapes seen ticking needs no second render.
+    Elements that keep changing across rounds are silenced by :class:`NoiseFilter`.
     Renders much smaller than the stored snapshot replace it only after a few rounds.
     """
 
@@ -88,6 +91,7 @@ class PageChecker:
         self._blocks = block_detector or BlockDetector()
         self._sleep = sleep
         self._clock = clock
+        self._shapes = VolatileShapes()
         self._small: dict[str, int] = {}  # page -> rounds in a row that rendered small
 
     async def check(
@@ -99,12 +103,13 @@ class PageChecker:
     ) -> PageCheckOutcome:
         """Check one page and return the outcome; ``load_timeout`` (seconds) overrides the default.
 
-        ``on_observation`` gets the first render's addresses and verdicts at once, before any
-        comparison, so a token alert never waits for change detection. Later calls carry only
-        the addresses the second render adds.
+        ``on_observation`` hears first the addresses the page shows while it still loads,
+        then the first render's addresses and verdicts, before any comparison, so a token
+        alert waits neither for the page to settle nor for change detection. Later calls
+        carry only the addresses the second render adds.
         """
         started = self._clock()
-        first = await self._fetcher.fetch(page_url, timeout=load_timeout)
+        first = await self._first_fetch(page_url, load_timeout, on_observation)
         seen_at = self._clock()
         if first.started_at is not None:
             started = first.started_at
@@ -162,7 +167,9 @@ class PageChecker:
             return PageCheckOutcome(
                 page_url, PageStatus.BASELINE, candidates=candidates, captcha=captcha
             )
-        if not self._detector.differs(snapshot.signature, current):
+        if not self._detector.differs(snapshot.signature, current) or await self._only_ticking(
+            snapshot, current
+        ):
             self._small.pop(page_url, None)
             return PageCheckOutcome(
                 page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
@@ -241,15 +248,19 @@ class PageChecker:
             self._detector.diff, snapshot.signature, confirmed, page_url, ignore=volatile
         )
         noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
+        now = self._clock()
         report, memory = await asyncio.to_thread(
             noise.apply,
             report,
             snapshot.noise,
-            self._clock(),
+            now,
             before=snapshot.signature,
             after=accepted,
         )
-        self._snapshots.save(page_url, Snapshot(accepted, memory, deep_seen))
+        ticking = await asyncio.to_thread(
+            self._shapes.learn, snapshot.volatile, snapshot.signature, current, confirmed, now
+        )
+        self._snapshots.save(page_url, Snapshot(accepted, memory, deep_seen, ticking))
         if report.is_empty:
             return PageCheckOutcome(
                 page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
@@ -261,6 +272,40 @@ class PageChecker:
             candidates=candidates,
             captcha=captcha,
         )
+
+    async def _only_ticking(self, snapshot: Snapshot, render: Signature) -> bool:
+        """True when ``render`` differs from the snapshot only in elements known to tick.
+
+        Such a render needs no second one: that would only show the same elements ticking.
+        """
+        if not snapshot.volatile:
+            return False
+        return await asyncio.to_thread(
+            self._shapes.explains, snapshot.volatile, snapshot.signature, render, self._clock()
+        )
+
+    async def _first_fetch(
+        self, page_url: str, load_timeout: float | None, observer: Observer | None
+    ) -> FetchResult:
+        """Render the page, reporting what it shows while it loads, and return the render.
+
+        Returns once the addresses seen while loading are checked and reported too.
+        """
+        if observer is None:
+            return await self._fetcher.fetch(page_url, timeout=load_timeout)
+        reader = EarlyReader(
+            page_url,
+            extractor=self._extractor,
+            validate=self._validate,
+            observe=lambda observation: self._observe(observer, observation),
+        )
+        try:
+            result = await self._fetcher.fetch(page_url, timeout=load_timeout, on_text=reader.take)
+        except BaseException:
+            reader.cancel()
+            raise
+        await reader.close()
+        return result
 
     def _small_round(self, page_url: str, stored: Signature, render: Signature) -> bool:
         """Return True when this round is skipped: its render is much smaller than the snapshot.

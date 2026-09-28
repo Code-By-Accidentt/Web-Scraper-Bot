@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from playwright import async_api as pw
 
 from scraper_bot.chains.rpc.client import parse_retry_after
+from scraper_bot.pages.fetching.observer import (
+    BEFORE_CHARS,
+    EARLY_BINDING,
+    EARLY_CHARS,
+    EARLY_ITEMS,
+    OBSERVER_JS,
+)
 from scraper_bot.pages.fetching.request_filter import is_unwanted
-from scraper_bot.pages.fetching.result import BrowserUnavailable, FetchResult
+from scraper_bot.pages.fetching.result import (
+    BrowserUnavailable,
+    EarlyListener,
+    EarlyText,
+    FetchResult,
+)
 from scraper_bot.settings.env import Settings
 from scraper_bot.settings.live import Tuning
+from scraper_bot.storage.files import atomic_write_text
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +46,15 @@ _CLOSE_TIMEOUT = 5.0  # seconds a tab, the browser or the driver gets to close
 RECYCLE_AFTER = 3600.0  # seconds one Playwright driver serves before a fresh one replaces it
 RECYCLE_RENDERS = 10_000  # renders one Playwright driver serves before a fresh one replaces it
 _RECYCLE_WAIT = 30.0  # seconds a scheduled restart waits for the renders in flight
+# With automation hidden: what the browser and the HTTP clients say about the reader.
+LOCALE = "en-US"
+ACCEPT_LANGUAGE = "en-US,en;q=0.9"
+_BLINK_FEATURES = "--disable-blink-features="
+_AUTOMATION_FEATURE = "AutomationControlled"  # disabled, navigator.webdriver reads false
+STATE_FILE = "browser_state.json"  # cookies and local storage kept between browsers
+_STATE_EVERY = 300.0  # seconds between saves of the browser state
+_STATE_READ_TIMEOUT = 2.0  # seconds the browser gets to hand over its state
+_STATE_MAX_CHARS = 2 * 1024 * 1024  # a bigger state is saved with its cookies only
 
 _SHADOW_ROOTS_JS = """
 () => {
@@ -64,6 +87,39 @@ async def _quietly(close: Callable[[], Awaitable[object]]) -> None:
     with contextlib.suppress(Exception):
         async with asyncio.timeout(_CLOSE_TIMEOUT):
             await close()
+
+
+def _with_automation_hidden(args: list[str]) -> list[str]:
+    """Return ``args`` with the AutomationControlled blink feature disabled.
+
+    It joins a ``--disable-blink-features`` switch already in ``args`` (Chromium reads only
+    the last one), so ``navigator.webdriver`` reads false as in a browser a person runs.
+    """
+    for index, arg in enumerate(args):
+        if arg.startswith(_BLINK_FEATURES):
+            if _AUTOMATION_FEATURE not in arg[len(_BLINK_FEATURES) :].split(","):
+                args[index] = f"{arg},{_AUTOMATION_FEATURE}"
+            return args
+    return [*args, _BLINK_FEATURES + _AUTOMATION_FEATURE]
+
+
+class _EarlyTap:
+    """Passes the pieces a loading page reports to its fetch's listener, a bounded number."""
+
+    def __init__(self, listener: EarlyListener) -> None:
+        """Pass at most ``EARLY_ITEMS`` pieces to ``listener``."""
+        self._listener = listener
+        self._left = EARLY_ITEMS
+
+    def take(self, item: EarlyText) -> None:
+        """Pass one piece on, unless the page has used up its share."""
+        if self._left <= 0:
+            return
+        self._left -= 1
+        try:
+            self._listener(item)
+        except Exception:
+            log.exception("handling text seen while a page loaded failed")
 
 
 class _OwnTabs:
@@ -125,6 +181,9 @@ class PlaywrightFetcher:
     or 10 000 renders, because Playwright keeps a little memory for every call it makes.
     With ``deep_scan`` the result also carries frame and shadow-root markup and the script and
     JSON bodies the page loaded, so addresses hidden there cost no extra request.
+    With ``hide_automation`` the browser reads like one a person runs (no "Headless" in its
+    User-Agent, ``navigator.webdriver`` false, one language), and its cookies outlive restarts
+    in ``data/browser_state.json``, so a passed site check is not asked again.
     """
 
     def __init__(
@@ -150,10 +209,20 @@ class PlaywrightFetcher:
         self._browser: pw.Browser | None = None
         self._context: pw.BrowserContext | None = None
         self._tabs = _OwnTabs()
+        self._taps: dict[pw.Page, _EarlyTap] = {}  # tabs whose fetch listens while they load
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_pages)
         self._launch_lock = asyncio.Lock()
         self._blocked = frozenset(settings.blocked_resource_types)
+        self._hide = settings.hide_automation
         self._args = list(settings.browser_args)
+        if self._hide:
+            self._args = _with_automation_hidden(self._args)
+        self._state_path = settings.data_dir / STATE_FILE
+        self._state_saved = 0.0  # when the browser state was last saved, on ``clock``
+        self._saving: asyncio.Task[None] | None = None
+        self.user_agent: str | None = None  # what the browser sends; None: its own
+        # Called with the User-Agent after every launch, so HTTP clients can send the same.
+        self.on_user_agent: Callable[[str], None] | None = None
         self._sandbox = "--no-sandbox" not in self._args
         self.sandbox_error: str | None = None  # why the sandbox was dropped; None if it was not
         self._launched = False
@@ -188,19 +257,25 @@ class PlaywrightFetcher:
             await self._bring_up()
 
     async def stop(self) -> None:
-        """Close the browser and stop Playwright for good.
+        """Save the browser state, close the browser and stop Playwright for good.
 
         A browser or driver that is gone already, or slow to close, is no error.
         """
         self._stopped = True
+        if self._saving is not None:
+            await asyncio.wait({self._saving})
+        await self._save_state()
         await self._close_browser()
         await self._stop_driver()
 
-    async def fetch(self, url: str, *, timeout: float | None = None) -> FetchResult:
+    async def fetch(
+        self, url: str, *, timeout: float | None = None, on_text: EarlyListener | None = None
+    ) -> FetchResult:
         """Render ``url`` in a new tab and return the result.
 
-        Page errors come back inside the result. If the browser or the Playwright driver
-        died, they start again and the fetch is tried once more; :class:`BrowserUnavailable`
+        ``on_text`` hears the address-like text the page shows while it still loads. Page
+        errors come back inside the result. If the browser or the Playwright driver died,
+        they start again and the fetch is tried once more; :class:`BrowserUnavailable`
         means they could not start.
         """
         async with self._semaphore:
@@ -208,19 +283,22 @@ class PlaywrightFetcher:
             self._rendering += 1
             self._idle.clear()
             try:
-                return await self._render(url, timeout)
+                return await self._render(url, timeout, on_text)
             finally:
                 self._rendering -= 1
                 self._renders += 1
                 if not self._rendering:
                     self._idle.set()
+                self._save_state_when_due()
 
-    async def _render(self, url: str, timeout: float | None) -> FetchResult:
+    async def _render(
+        self, url: str, timeout: float | None, on_text: EarlyListener | None
+    ) -> FetchResult:
         """Fetch ``url``; if the browser or the driver turns out gone, start it and retry once."""
         for attempt in (1, 2):
             context = await self._ensure_context()
             try:
-                return await self._fetch_in(context, url, timeout)
+                return await self._fetch_in(context, url, timeout, on_text)
             except Exception as exc:
                 driver = self._driver_gone(exc)
                 if not driver and not isinstance(exc, pw.Error):
@@ -233,13 +311,18 @@ class PlaywrightFetcher:
         return FetchResult(url, None, error="browser unavailable")
 
     async def _fetch_in(
-        self, context: pw.BrowserContext, url: str, timeout: float | None
+        self,
+        context: pw.BrowserContext,
+        url: str,
+        timeout: float | None,
+        on_text: EarlyListener | None = None,
     ) -> FetchResult:
         """Open ``url`` in a new tab of ``context``, let it settle and read it.
 
         A timeout or page error comes back in the result, a page that stops answering too;
         an error meaning the browser or the driver is gone is raised, so :meth:`fetch` can
-        start them again.
+        start them again. The new tab holds no earlier document, so all it reports to
+        ``on_text`` is ``url`` loading.
         """
         tuning = self._tuning
         load_timeout = timeout or self._settings.page_load_timeout
@@ -249,6 +332,8 @@ class PlaywrightFetcher:
         except TimeoutError:
             error = f"browser did not open a tab within {load_timeout:.0f}s"
             return FetchResult(url, None, error=error, timed_out=True)
+        if on_text is not None:
+            self._taps[page] = _EarlyTap(on_text)
         responses: list[pw.Response] = []
         if deep_scan:
             # Playwright wraps the handler; a builtin like responses.append breaks it.
@@ -308,8 +393,23 @@ class PlaywrightFetcher:
                 started_at=started_at,
             )
         finally:
+            self._taps.pop(page, None)
             self._tabs.forget(page)
             await _quietly(page.close)
+
+    def _on_early(self, source: dict[str, Any], *args: object) -> None:
+        """Take a piece of text a loading tab reports and pass it to that tab's fetch.
+
+        Pieces from a tab no fetch listens to, and calls not shaped like the observer's
+        (a page could call the binding itself), are dropped.
+        """
+        tap = self._taps.get(source.get("page"))  # type: ignore[arg-type]
+        if tap is None or len(args) != 3:
+            return
+        kind, text, before = args
+        if kind not in ("text", "attr") or not isinstance(text, str) or not isinstance(before, str):
+            return
+        tap.take(EarlyText(kind, text[:EARLY_CHARS], before[-BEFORE_CHARS:], time.time()))
 
     async def _deep_scan(
         self, page: pw.Page, responses: list[pw.Response], *, timeout: float | None = None
@@ -458,6 +558,7 @@ class PlaywrightFetcher:
                 (self._clock() - self._up_since) / 60,
             )
             async with self._launch_lock:
+                await self._save_state()
                 await self._close_browser()
                 await self._stop_driver()
                 await self._bring_up()
@@ -480,9 +581,11 @@ class PlaywrightFetcher:
     async def _launch(self) -> None:
         """Launch Chromium and open the shared context; every request goes through the filter.
 
-        The context refuses downloads, and closes any tab a page opens. If the sandbox keeps
-        Chromium from starting (as root, or without user namespaces), launch again without it
-        and remember why; the browser is then isolated only by the bot's own user account.
+        The context refuses downloads, closes any tab a page opens, and runs the observer that
+        reports addresses while a page loads. If the sandbox keeps Chromium from starting (as
+        root, or without user namespaces), launch again without it and remember why; the
+        browser is then isolated only by the bot's own user account. With automation hidden,
+        ``on_user_agent`` hears the User-Agent the context sends.
         """
         assert self._playwright is not None, "start() must be called first"
         cfg = self._settings
@@ -510,18 +613,19 @@ class PlaywrightFetcher:
             if self._launched and self.on_sandbox_lost is not None:
                 self.on_sandbox_lost(self.sandbox_error)
         try:
-            context = await browser.new_context(
-                viewport={"width": 1366, "height": 900},
-                ignore_https_errors=True,
-                accept_downloads=False,
-            )
+            user_agent = await self._plain_user_agent(browser) if self._hide else None
+            context = await self._open_context(browser, user_agent)
             context.on("page", self._tabs.on_page)
             await context.route("**/*", self._route)
+            # The binding first: the observer calls it from the first node the page parses.
+            await context.expose_binding(EARLY_BINDING, self._on_early)
+            await context.add_init_script(OBSERVER_JS)
         except BaseException:
             await _quietly(browser.close)
             raise
         self._browser, self._context = browser, context
         self._launched = True
+        self._state_saved = self._clock()
         log.info(
             "browser started (%s, headless=%s, sandbox=%s, args=%s)",
             channel or "chromium",
@@ -529,6 +633,111 @@ class PlaywrightFetcher:
             "on" if self._sandbox else "off",
             " ".join(self._args) or "none",
         )
+        if user_agent is not None:
+            self.user_agent = user_agent
+            if self.on_user_agent is not None:
+                self.on_user_agent(user_agent)
+
+    @staticmethod
+    async def _plain_user_agent(browser: pw.Browser) -> str | None:
+        """Return the browser's own User-Agent with "HeadlessChrome" read as "Chrome".
+
+        It is read from a throwaway tab, so the version and platform are the browser's
+        own. None if it cannot be read; the browser then keeps its own.
+        """
+        try:
+            page = await _within(_CLOSE_TIMEOUT, browser.new_page())
+            try:
+                agent = await _within(_CLOSE_TIMEOUT, page.evaluate("navigator.userAgent"))
+            finally:
+                await _quietly(page.context.close)
+        except (pw.Error, TimeoutError) as exc:
+            log.warning(
+                "could not read the browser's User-Agent: %s", PlaywrightFetcher._brief(exc)
+            )
+            return None
+        return str(agent).replace("HeadlessChrome/", "Chrome/")
+
+    async def _open_context(self, browser: pw.Browser, user_agent: str | None) -> pw.BrowserContext:
+        """Open the shared context; with automation hidden it also restores the saved state.
+
+        It then speaks ``LOCALE`` with the given User-Agent. A saved state that cannot be
+        used is moved aside, and the context starts without it.
+        """
+        options: dict[str, Any] = {
+            "viewport": {"width": 1366, "height": 900},
+            "ignore_https_errors": True,
+            "accept_downloads": False,
+        }
+        if not self._hide:
+            return await browser.new_context(**options)
+        options["locale"] = LOCALE
+        options["extra_http_headers"] = {"Accept-Language": ACCEPT_LANGUAGE}
+        if user_agent is not None:
+            options["user_agent"] = user_agent
+        state = self._saved_state()
+        if state is not None:
+            try:
+                return await browser.new_context(storage_state=state, **options)
+            except pw.Error as exc:
+                self._set_state_aside(self._brief(exc))
+        return await browser.new_context(**options)
+
+    def _saved_state(self) -> dict[str, Any] | None:
+        """Return the browser state saved by an earlier browser, or None when there is none.
+
+        A file that does not hold a state is moved aside.
+        """
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            self._set_state_aside(str(exc))
+            return None
+        if not isinstance(state, dict) or not isinstance(state.get("cookies", []), list):
+            self._set_state_aside("not a browser state")
+            return None
+        return state
+
+    def _set_state_aside(self, reason: str) -> None:
+        """Move an unusable state file aside (``.bad``), so the next save starts afresh."""
+        log.warning("%s is unusable (%s); the browser starts without it", self._state_path, reason)
+        with contextlib.suppress(OSError):
+            self._state_path.replace(self._state_path.with_name(STATE_FILE + ".bad"))
+
+    def _save_state_when_due(self) -> None:
+        """Start saving the browser state in the background once ``_STATE_EVERY`` has passed."""
+        if not self._hide or self._stopped or self._context is None:
+            return
+        if self._saving is not None and not self._saving.done():
+            return
+        if self._clock() - self._state_saved < _STATE_EVERY:
+            return
+        self._state_saved = self._clock()
+        self._saving = asyncio.ensure_future(self._save_state())
+
+    async def _save_state(self) -> None:
+        """Save the context's cookies and local storage to ``data/browser_state.json``.
+
+        A state over ``_STATE_MAX_CHARS`` is saved with its cookies only. A browser that
+        cannot hand its state over (closing, gone) leaves the last save in place.
+        """
+        context = self._context
+        if not self._hide or context is None:
+            return
+        try:
+            state = await _within(_STATE_READ_TIMEOUT, context.storage_state())
+        except Exception as exc:
+            log.debug("browser state not saved: %s", self._brief(exc))
+            return
+        text = json.dumps(state)
+        if len(text) > _STATE_MAX_CHARS:
+            text = json.dumps({"cookies": state.get("cookies", []), "origins": []})
+        try:
+            await asyncio.to_thread(atomic_write_text, self._state_path, text)
+        except OSError as exc:
+            log.warning("could not save the browser state to %s: %s", self._state_path, exc)
 
     @staticmethod
     def _sandbox_trouble(exc: pw.Error) -> bool:
