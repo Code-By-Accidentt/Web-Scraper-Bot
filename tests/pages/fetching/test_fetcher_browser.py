@@ -254,6 +254,18 @@ async def test_the_browser_reads_like_a_person_and_keeps_cookies_across_restarts
     assert "ua: Mozilla/5.0" in page and "Headless" not in page
 
 
+async def test_a_tab_kept_on_the_site_fetches_with_the_browser_cookies(
+    site: str, tmp_path: Path
+) -> None:
+    origin = site.replace("/index.html", "")
+    async with browser(settings_for(tmp_path, DEEP_SCAN="false")) as fetcher:
+        assert (await fetcher.fetch(origin + "/cookie")).ok  # the site sets a cookie
+        first = await fetcher.tab_fetch(origin + "/whoami", origin=origin)
+        again = await fetcher.tab_fetch(origin + "/whoami", origin=origin)  # the same tab
+    assert first.status == 200 and "cookie: passed=1" in first.html
+    assert "Headless" not in first.html and again.status == 200
+
+
 async def test_playwright_starts_afresh_after_its_share_of_renders(
     site: str, tmp_path: Path
 ) -> None:

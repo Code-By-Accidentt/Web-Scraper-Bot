@@ -84,6 +84,9 @@ class Settings:
     settle_delay: float
     render_failure_threshold: int
     confirm_delay: float
+    light_interval: float  # seconds between light polls; 0 = the light mode is off
+    light_turbo_interval: float
+    render_interval: float  # seconds between renders of pages the light mode covers
     contract_pause_threshold: int
     sub_url_patterns: tuple[str, ...]
     ignored_attributes: tuple[str, ...]
@@ -185,6 +188,9 @@ class Settings:
             settle_delay=reader.number("SETTLE_DELAY", 0.25, minimum=0.0),
             render_failure_threshold=reader.integer("RENDER_FAILURE_THRESHOLD", 5, minimum=0),
             confirm_delay=reader.number("CONFIRM_DELAY", 2.0, minimum=0.0),
+            light_interval=reader.number("LIGHT_INTERVAL", 1.0, minimum=0.0),
+            light_turbo_interval=reader.number("LIGHT_TURBO_INTERVAL", 0.3, minimum=0.1),
+            render_interval=reader.number("RENDER_INTERVAL", 30.0, minimum=4.0),
             contract_pause_threshold=reader.integer("CONTRACT_PAUSE_THRESHOLD", 5, minimum=1),
             sub_url_patterns=reader.text_list("SUB_URL_PATTERNS", DEFAULT_SUB_URL_PATTERNS),
             ignored_attributes=tuple(

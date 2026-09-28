@@ -150,6 +150,11 @@ class PageCheckOutcome:
     candidates: tuple[Address, ...] = ()  # every syntactically valid address seen on the page
     timed_out: bool = False  # the document never arrived within the load timeout
     captcha: str | None = None  # a captcha widget the page shows, e.g. "hCaptcha"
+    # What the light mode learns from a render that read the page: its nodes, the JSON APIs
+    # it called, and whether some of its elements tick (timers).
+    signature: Signature | None = None
+    api_calls: tuple[str, ...] = ()
+    ticking: bool = False
 
 
 def shorten(text: str, limit: int) -> str:

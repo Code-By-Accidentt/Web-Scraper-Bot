@@ -29,6 +29,9 @@ class Tuning(Protocol):
     poll_interval_min: float
     poll_interval_max: float
     confirm_delay: float
+    light_interval: float
+    light_turbo_interval: float
+    render_interval: float
     network_idle_timeout: float
     settle_delay: float
     render_failure_threshold: int

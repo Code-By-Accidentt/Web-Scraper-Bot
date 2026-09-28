@@ -165,14 +165,25 @@ class PageChecker:
         if snapshot is None:
             self._snapshots.save(page_url, Snapshot(current, deep_seen=deep_seen))
             return PageCheckOutcome(
-                page_url, PageStatus.BASELINE, candidates=candidates, captcha=captcha
+                page_url,
+                PageStatus.BASELINE,
+                candidates=candidates,
+                captcha=captcha,
+                signature=current,
+                api_calls=first.api_calls,
             )
         if not self._detector.differs(snapshot.signature, current) or await self._only_ticking(
             snapshot, current
         ):
             self._small.pop(page_url, None)
             return PageCheckOutcome(
-                page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
+                page_url,
+                PageStatus.UNCHANGED,
+                candidates=candidates,
+                captcha=captcha,
+                signature=current,
+                api_calls=first.api_calls,
+                ticking=bool(snapshot.volatile),
             )
 
         await self._sleep(self._tuning.confirm_delay)
@@ -261,16 +272,16 @@ class PageChecker:
             self._shapes.learn, snapshot.volatile, snapshot.signature, current, confirmed, now
         )
         self._snapshots.save(page_url, Snapshot(accepted, memory, deep_seen, ticking))
-        if report.is_empty:
-            return PageCheckOutcome(
-                page_url, PageStatus.UNCHANGED, candidates=candidates, captcha=captcha
-            )
+        status = PageStatus.UNCHANGED if report.is_empty else PageStatus.CHANGED
         return PageCheckOutcome(
             page_url,
-            PageStatus.CHANGED,
-            report=report,
+            status,
+            report=None if report.is_empty else report,
             candidates=candidates,
             captcha=captcha,
+            signature=current,
+            api_calls=first.api_calls,
+            ticking=bool(ticking) or bool(volatile),
         )
 
     async def _only_ticking(self, snapshot: Snapshot, render: Signature) -> bool:

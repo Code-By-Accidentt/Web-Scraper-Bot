@@ -40,7 +40,8 @@ scraper_bot/
     fetching/
       result.py         FetchResult, EarlyText and the PageFetcher protocol
       chromium.py       PlaywrightFetcher: one browser, a tab per fetch, deep scan; reads
-                        like a person's browser and keeps its cookies (HIDE_AUTOMATION)
+                        like a person's browser and keeps its cookies (HIDE_AUTOMATION);
+                        notes the JSON APIs a page calls; fetch() from tabs kept on sites
       observer.py       the script in every tab that reports address-like text while the
                         page still loads
       request_filter.py requests never needed: prefetches, analytics beacons
@@ -48,6 +49,10 @@ scraper_bot/
                         still refuse?
       blocking.py       recognises blocks (401/403/407/429/503, challenge pages, connection
                         resets) and names the protection; spots captcha widgets
+    light/            the light mode
+      poller.py         LightPoller: a site's pages and own JSON APIs polled over HTTP between
+                        renders; which pages it covers; renders asked for after a new deploy
+      transport.py      plain conditional GETs, or fetch() from a tab kept on the site
     changes/
       normalizer.py     rendered HTML -> ordered list of Node(tag, attrs, own text)
       detector.py       ordered diff of two node lists (bounded work), volatile-node exclusion
@@ -136,7 +141,8 @@ SiteMonitor.run_once
  │                                     transport error (DNS, connection, TLS, 10 s timeout)
  │                                     means "does not exist"
  │
- ├─ PageChecker.check(page)  for the root and every live sub-page, concurrently
+ ├─ PageChecker.check(page)  for the root and every live sub-page that is due, concurrently
+ │   (a page the light mode covers is due every render_interval, or at once after a deploy)
  │   ├─ PlaywrightFetcher.fetch        tab from the shared browser (max MAX_CONCURRENT_PAGES),
  │   │   │                             domcontentloaded -> network idle (capped) -> settle;
  │   │   │                             prefetches and analytics beacons are dropped; deep scan
@@ -172,6 +178,18 @@ SiteMonitor.run_once
  │   load timeouts
  ├─ UnverifiedWatcher.recheck          re-validate watched addresses that are due
  └─ update block state (backoff) and /status counters
+
+LightPoller.run   one per site, from the end of its first round
+ ├─ every light_interval (light_turbo_interval while turbo runs for the site),
+ │  nothing while the site blocks:
+ │   ├─ each live page: a conditional GET (If-None-Match / If-Modified-Since)
+ │   │   ├─ 304 or the same body     -> a read of the page, if the light mode covers it
+ │   │   ├─ addresses it never had   -> find_sightings -> validate -> on_observation
+ │   │   └─ other scripts than before (a new deploy) -> the monitor renders it now
+ │   └─ each adopted API: a GET; addresses it never carried -> validate -> on_observation
+ │       (Found in: site API)
+ ├─ tries one API of the site the renders saw the page call (at most 2 per page)
+ └─ judges coverage: HTML with 80% of the render's texts, no ticking, no own polling
 ```
 
 A token alert goes out from a task the `Notifier` owns, the moment the page shows the
@@ -382,6 +400,29 @@ and a data-centre IP stays one. The client hints (`Sec-CH-UA`) name Chrome or Ch
 in the `chrome` and `chromium` channels; the old headless shell (`BROWSER_CHANNEL=bundled`)
 still names HeadlessChrome there.
 
+**The light mode watches between renders.** A render costs dozens of requests and a
+second of CPU, so the monitor also asks every live page over plain HTTP each
+`light_interval` (1 s; `light_turbo_interval`, 0.3 s, while a turbo session runs for the
+site), conditionally, so an unchanged page is a 304 without a body. A page whose HTML
+gains an address hands it to the usual pipeline at once (checked on-chain, one alert per
+token, the pending watch). The site's own JSON APIs that a render saw the page call
+(GET, answered in JSON, on the site's domain or a subdomain; price feeds and other
+sites are never asked) are tried once: one that holds addresses or names a CA (`"ca":`,
+`"contract":`, `"mint":`) is polled too, at most two per page and six per site. What it
+carries when adopted is its baseline; an address it later adds is announced even before
+the page shows it, as "Found in: site API". A page whose HTML carries at least 80% of its
+render's texts, and that neither ticks (a timer, see above) nor calls its API again and
+again on its own, is covered: the monitor then renders it only every `render_interval`
+(30 s), for change detection; every other page (a single-page app, a page that reveals
+its CA from a script) keeps its render every round, and gets the polls on top. A page
+whose HTML starts loading other scripts (a new deploy of a single-page app) is rendered
+at once (at most every 10 s; a list that changes on every request is ignored). A site
+that refuses the plain client (a block signal) while the renders pass is asked with
+fetch() from a tab kept on its origin (`PlaywrightFetcher.tab_fetch`, opened on the
+origin's robots.txt, at most eight such tabs): the requests then carry the browser's
+cookies, headers and TLS. Refused there too, the polls rest a minute; while the site
+blocks the bot they stop. `light_interval 0` turns the light mode off.
+
 **Addresses are read while the page loads.** Every tab runs a small observer before the
 page's own scripts (`pages/fetching/observer.py`): a `MutationObserver` on the document
 that reports each new visible text or attribute value that may hold an address (script
@@ -483,7 +524,9 @@ half-written file; the address caches are appended to line by line, and
   whose answer timed out may have arrived and is never resent. A notice holds up its
   caller for 2 s at most (a 🛑 for 10 s) and stays queued; the details edit of an alert
   waits only for the token alerts queued before it.
-- Per site one monitor task; turbo sessions and their timers are separate tasks;
+- Per site one monitor task and one light-mode task (started after its first round);
+  the light polls of a site run concurrently, every page and API once per interval,
+  through the HTTP/1.1 probe client (keep-alive) or the site's kept tab; turbo sessions and their timers are separate tasks;
   fire-and-forget notifications from task callbacks go through `Notifier.report_later`.
 - Shutdown (Ctrl-C or SIGTERM, even during the start) order: Telegram listener,
   heartbeat and warm-up, the pending watch saved, turbo sessions and monitors (8 s each

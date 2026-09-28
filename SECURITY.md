@@ -80,7 +80,9 @@ Keep these points in mind:
   `POLL_INTERVAL_MIN` / `POLL_INTERVAL_MAX`, plus, per derived sub-page and round, a
   HEAD request (a GET when it answers 404/405/410/501; redirects followed): the probes
   that find which sub-pages exist; while a site blocks, one GET of its root page per
-  round. With `HIDE_AUTOMATION` (the default) the browser and these requests send the
+  round. The light mode adds a conditional GET of every live page each `light_interval`
+  (1 s by default) and of up to two of the site's own JSON APIs per page; for a site that
+  refuses plain requests these come from the browser (fetch() in a tab kept on the site). With `HIDE_AUTOMATION` (the default) the browser and these requests send the
   browser's own User-Agent without "Headless" and `navigator.webdriver` is false; with
   `false` the browser says it is headless and the probes send a fixed desktop Chrome
   user agent. Their analytics services see nothing: the bot drops the beacons.

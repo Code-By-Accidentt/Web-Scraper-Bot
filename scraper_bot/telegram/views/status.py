@@ -119,6 +119,8 @@ class StatusReporter:
         )
         if site.last_change is not None:
             text += f"; last change {format_clock(site.last_change.at)}"
+        if stats.light:
+            text += f"; light: {escape(stats.light)}"
         if stats.timing_out:
             text += f"; 🐢 {stats.timing_out} page(s) timing out"
         if stats.blocked:

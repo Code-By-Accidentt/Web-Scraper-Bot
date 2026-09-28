@@ -78,18 +78,18 @@ The full list of live keys is in [configuration.md](configuration.md).
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Version and uptime, browser state, sites with their last round (duration, pages, rounds), last change, pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
+| `/status` | Version and uptime, browser state, sites with their last round (duration, pages rendered, rounds), last change, what the light mode polls (`light: 2 page(s) and 1 API(s) every 1 s, 1 rendered every 30 s`, and `through the browser` for a site that refuses plain requests), pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
 | `/help` | The command list. |
 | `/start` | Your chat id (needed for `TELEGRAM_CHAT_IDS`) plus the command list. |
 
 Example `/status`:
 
 ```text
-🤖 scraper-bot 2.1.3, up 3h 12m
+🤖 scraper-bot 2.2.0, up 3h 12m
 Browser: connected
 ⚠️ RPC not answering: Fantom for 2m 10s
 Sites: 2 total, 2 running, 0 paused
-• https://app.flutch.fun: last round 4s ago (2.0s, 4 page(s), 1187 rounds); last change 2026-09-23 12:01
+• https://app.flutch.fun: last round 4s ago (2.0s, 4 page(s), 1187 rounds); last change 2026-09-23 12:01; light: 4 page(s) and 1 API(s) every 1 s
 • https://docs.example.io: last round 6s ago (1.3s, 1 page(s), 1190 rounds); 🐢 1 page(s) timing out
 🚀 Turbo https://app.flutch.fun: 41 cycles, 0 confirmed, 2 pending, 28m 40s left
 ⏳ 3 address(es) watched until they become a token

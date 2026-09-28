@@ -64,6 +64,7 @@ class Harness:
         threshold: int = 5,
         watcher: RecordingWatcher | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        light: Any = None,
     ) -> None:
         self.site = SiteState(ROOT)
         self.checker = FakeChecker()
@@ -91,6 +92,7 @@ class Harness:
             watcher=watcher,  # type: ignore[arg-type]
             rng=random.Random(1),
             sleep=sleep,
+            light=light.bind if light is not None else None,
         )
 
     def outcome(
@@ -254,6 +256,43 @@ async def test_a_blocked_site_is_rendered_again_only_when_a_light_request_passes
     h.outcome(ROOT, PageStatus.UNCHANGED)
     await h.monitor.run_once()  # the light request passes: the round renders and recovers
     assert not h.monitor.stats.blocked and h.notifier.recovered == [ROOT]
+
+
+class FakeLight:
+    """Stand-in for LightPoller: the test says which pages it covers."""
+
+    def __init__(self) -> None:
+        self.covered_pages: set[str] = set()
+        self.render_soon: Callable[[str], None] = lambda _url: None
+
+    def bind(self, _url: str, _observe: Any, render_soon: Any, _blocked: Any) -> "FakeLight":
+        self.render_soon = render_soon
+        return self
+
+    def covered(self, url: str) -> bool:
+        return url in self.covered_pages
+
+    def keep(self, _pages: Sequence[str]) -> None:
+        pass
+
+    def learn(self, _outcome: PageCheckOutcome) -> None:
+        pass
+
+    def summary(self) -> str:
+        return "1 page(s) every 1 s"
+
+
+async def test_a_page_the_light_mode_covers_is_rendered_only_every_render_interval() -> None:
+    light = FakeLight()
+    h = Harness(statuses={APP: 404, DOCS: 404}, light=light)
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()
+    light.covered_pages.add(ROOT)  # its HTML turned out to show it all
+    await h.monitor.run_once()  # rendered a moment ago: the light mode watches it
+    assert h.checker.calls.count(ROOT) == 1 and h.monitor.stats.light == "1 page(s) every 1 s"
+    light.render_soon(ROOT)  # its HTML loads new scripts: a new deploy
+    await h.monitor.run_once()
+    assert h.checker.calls.count(ROOT) == 2
 
 
 async def test_retry_after_and_max_backoff_bound_the_delay() -> None:

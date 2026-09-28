@@ -10,7 +10,7 @@ playwright install chromium              # only for the opt-in browser tests
 ## Checks
 
 ```bash
-pytest -q                                # ~970 tests, offline, about 14 s
+pytest -q                                # ~980 tests, offline, about 14 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
 SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/fetching/test_fetcher_browser.py   # real Chromium
 ```
@@ -73,6 +73,8 @@ loads, the hidden automation marks and cookies kept across a restart) and real r
 | Address extraction | 1 MB of JS 112 ms, 5 MB 0.57 s |
 | Address reported while the page loads (2.1.3, local page, 20 loads, instant validator) | 17 ms p50 / 21 ms p95 after the document was sent (the full read: 0.8 s); 23 / 29 ms after a script showed it on a page that keeps polling (the full read: 2.2 s); the same in Chromium and Chrome |
 | Timer fast path (2.1.3) | 2 ms on 900 nodes, 13–28 ms on 12 000 nodes, in a thread |
+| Light mode (2.2, whole bot, local sites, 20 reveals each, on-chain check left out) | at 1 s: HTML 0.47 s p50 / 0.97 s p95, site API 0.55 / 0.99 s; at 0.3 s: HTML 0.16 / 0.31 s, API 0.17 / 0.30 s, from the site serving the address to the alert |
+| Light mode load (2.2) | 10 plain sites for 60 s: 1.02 requests a second per site, the bot 10% of one core, Chrome about 1% of 16 cores (a render every 30 s per page) |
 
 These numbers set the defaults in `.env.example`; re-measure before changing them.
 

@@ -15,6 +15,7 @@ class SightingSource(Enum):
     LINK = "link"  # an attribute of an element: href, src, data-*
     SOURCE = "page source"  # only in raw HTML (inline scripts, meta tags), frames or shadow roots
     SCRIPT = "loaded script"  # scripts and JSON the page loaded (deep scan)
+    API = "site API"  # a JSON API of the site that the light mode polls
 
 
 @dataclass(frozen=True, slots=True)

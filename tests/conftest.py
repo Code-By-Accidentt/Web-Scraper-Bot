@@ -45,6 +45,9 @@ class FakeTuning:
     poll_interval_max: float = 0.02
     confirm_delay: float = 2.0
     network_idle_timeout: float = 0.0
+    light_interval: float = 1.0
+    light_turbo_interval: float = 0.3
+    render_interval: float = 30.0
     settle_delay: float = 0.0
     render_failure_threshold: int = 5
     require_erc20: bool = True

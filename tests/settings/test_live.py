@@ -166,6 +166,8 @@ def test_unreadable_or_non_object_preferences_file_is_ignored(tmp_path: Path, co
 # poll_interval_max (10) is above 3, and turbo_default/max_minutes carry no caution.
 CAUTION_BOUNDARIES: dict[str, tuple[str, str]] = {
     "poll_interval_min": ("2.99", "3"),
+    "light_interval": ("0.49", "0.5"),
+    "light_turbo_interval": ("0.29", "0.3"),
     "require_erc20": ("off", "on"),
     "skip_stable_copies": ("off", "on"),
     "rejected_ttl_hours": ("0", "0.5"),

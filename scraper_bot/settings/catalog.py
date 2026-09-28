@@ -100,6 +100,38 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "s",
     ),
     PreferenceSpec(
+        "light_interval",
+        "light_interval",
+        "monitoring",
+        "float",
+        "Light mode: seconds between polls",
+        "Between renders each page's HTML and the site's own JSON APIs are asked over plain "
+        "HTTP this often (mostly a 304 without a body); a new address there is checked and "
+        "announced at once. A site that refuses plain requests is asked through the browser. "
+        "0 turns the light mode off.",
+        0,
+        60,
+        "s",
+        caution=lambda value: (
+            "Two or more requests a second to every page; expect sites to rate-limit."
+            if 0 < value < 0.5
+            else None
+        ),
+    ),
+    PreferenceSpec(
+        "render_interval",
+        "render_interval",
+        "monitoring",
+        "float",
+        "Renders of pages the light mode covers",
+        "A page whose HTML carries what its render shows, and that neither ticks nor polls on "
+        "its own, is fully rendered only this often; the light mode watches it meanwhile. "
+        "Other pages are rendered every round.",
+        4,
+        3600,
+        "s",
+    ),
+    PreferenceSpec(
         "network_idle_timeout",
         "network_idle_timeout",
         "monitoring",
@@ -314,6 +346,18 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         60,
         "s",
         caution=_below(2, "One render per second hammers the site; expect to be blocked."),
+    ),
+    PreferenceSpec(
+        "light_turbo_interval",
+        "light_turbo_interval",
+        "turbo",
+        "float",
+        "Light mode in turbo: seconds between polls",
+        "The light mode's pace while a turbo session runs for the site.",
+        0.1,
+        60,
+        "s",
+        caution=_below(0.3, "More than three requests a second to every page; expect limits."),
     ),
     PreferenceSpec(
         "turbo_default_minutes",

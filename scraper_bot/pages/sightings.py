@@ -43,6 +43,7 @@ _RANK = {
     SightingSource.LINK: 1,
     SightingSource.SOURCE: 2,
     SightingSource.SCRIPT: 3,
+    SightingSource.API: 4,
 }
 
 
@@ -105,6 +106,17 @@ def find_sightings(
     # Before extras, which also hold dom: frames and shadow roots are page source, not scripts.
     _offer_raw(best, extractor, dom, SightingSource.SOURCE, None)
     _offer_raw(best, extractor, extras, SightingSource.SCRIPT, None)
+    return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
+
+
+def raw_sightings(extractor: AddressExtractor, text: str, source: SightingSource) -> list[Sighting]:
+    """Return one sighting per address in a raw text (an API answer), in order of appearance.
+
+    The words in front of each address (a JSON key such as ``"ca":``) give its context and
+    hint, as they do on a page.
+    """
+    best: dict[Address, Sighting] = {}
+    _offer_raw(best, extractor, (text,), source, None)
     return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
 
 

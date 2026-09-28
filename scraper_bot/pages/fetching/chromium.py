@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -55,6 +56,21 @@ STATE_FILE = "browser_state.json"  # cookies and local storage kept between brow
 _STATE_EVERY = 300.0  # seconds between saves of the browser state
 _STATE_READ_TIMEOUT = 2.0  # seconds the browser gets to hand over its state
 _STATE_MAX_CHARS = 2 * 1024 * 1024  # a bigger state is saved with its cookies only
+_MAX_API_CALLS = 100  # JSON API calls noted per render
+# The light mode's fetch() from a tab: kept tabs ("anchors") wait on a light document of
+# their site's origin, so the requests carry the browser's cookies, headers and TLS.
+_ANCHOR_PATH = "/robots.txt"
+_MAX_ANCHORS = 8
+_TAB_FETCH_LIMIT = 3 * 1024 * 1024  # characters of an answer handed over
+_TAB_FETCH_JS = """
+async ([url, limit]) => {
+  const response = await fetch(url, {cache: "no-cache", credentials: "include"});
+  const text = await response.text();
+  const headers = {};
+  response.headers.forEach((value, name) => { headers[name] = value; });
+  return [response.status, headers, text.length > limit ? text.slice(0, limit) : text];
+}
+"""
 
 _SHADOW_ROOTS_JS = """
 () => {
@@ -87,6 +103,17 @@ async def _quietly(close: Callable[[], Awaitable[object]]) -> None:
     with contextlib.suppress(Exception):
         async with asyncio.timeout(_CLOSE_TIMEOUT):
             await close()
+
+
+def _note_api_call(calls: list[str], response: pw.Response) -> None:
+    """Add the URL of a GET fetch/XHR call that answered JSON to ``calls`` (up to a limit)."""
+    request = response.request
+    if len(calls) >= _MAX_API_CALLS or request.resource_type not in {"fetch", "xhr"}:
+        return
+    if request.method != "GET" or response.status != 200:
+        return
+    if "json" in response.headers.get("content-type", "").lower():
+        calls.append(response.url)
 
 
 def _with_automation_hidden(args: list[str]) -> list[str]:
@@ -210,6 +237,8 @@ class PlaywrightFetcher:
         self._context: pw.BrowserContext | None = None
         self._tabs = _OwnTabs()
         self._taps: dict[pw.Page, _EarlyTap] = {}  # tabs whose fetch listens while they load
+        self._anchors: OrderedDict[str, pw.Page] = OrderedDict()  # origin -> its kept tab
+        self._anchor_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(settings.max_concurrent_pages)
         self._launch_lock = asyncio.Lock()
         self._blocked = frozenset(settings.blocked_resource_types)
@@ -338,6 +367,8 @@ class PlaywrightFetcher:
         if deep_scan:
             # Playwright wraps the handler; a builtin like responses.append breaks it.
             page.on("response", lambda response: responses.append(response))
+        api_calls: list[str] = []
+        page.on("response", lambda response: _note_api_call(api_calls, response))
         started_at = time.time()
         try:
             try:
@@ -391,9 +422,71 @@ class PlaywrightFetcher:
                 headers=headers,
                 retry_after=parse_retry_after(headers.get("retry-after")),
                 started_at=started_at,
+                api_calls=tuple(api_calls),
             )
         finally:
             self._taps.pop(page, None)
+            self._tabs.forget(page)
+            await _quietly(page.close)
+
+    async def tab_fetch(self, url: str, *, origin: str, timeout: float = 10.0) -> FetchResult:
+        """Fetch ``url`` with fetch() from a tab kept on ``origin``, as the browser would.
+
+        The request carries the browser's cookies, headers and TLS, so a site that refuses a
+        plain HTTP client but lets the browser in answers it. The tab stays on a light
+        document of the origin for the next call. Errors come back in the result.
+        """
+        await self._ready.wait()
+        started_at = time.time()
+        try:
+            async with asyncio.timeout(timeout):
+                page = await self._anchor(origin)
+                status, headers, text = await page.evaluate(_TAB_FETCH_JS, [url, _TAB_FETCH_LIMIT])
+        except TimeoutError:
+            await self._drop_anchor(origin)
+            error = f"no answer within {timeout:.0f}s"
+            return FetchResult(url, None, error=error, timed_out=True, started_at=started_at)
+        except Exception as exc:  # a fetch that failed, a closed tab, a browser that is gone
+            await self._drop_anchor(origin)
+            return FetchResult(url, None, error=self._brief(exc), started_at=started_at)
+        answered = {str(name).lower(): str(value) for name, value in dict(headers).items()}
+        return FetchResult(
+            url,
+            int(status),
+            str(text),
+            headers=answered,
+            retry_after=parse_retry_after(answered.get("retry-after")),
+            started_at=started_at,
+        )
+
+    async def _anchor(self, origin: str) -> pw.Page:
+        """Return the tab kept on ``origin``, opening it on the origin's robots.txt if needed.
+
+        Beyond ``_MAX_ANCHORS`` origins the one used longest ago gives its tab up.
+        """
+        async with self._anchor_lock:
+            page = self._anchors.get(origin)
+            if page is not None and not page.is_closed():
+                self._anchors.move_to_end(origin)
+                return page
+            page = await self._tabs.open(await self._ensure_context())
+            try:
+                await page.goto(origin + _ANCHOR_PATH, wait_until="domcontentloaded")
+            except BaseException:
+                self._tabs.forget(page)
+                await _quietly(page.close)
+                raise
+            self._anchors[origin] = page
+            while len(self._anchors) > _MAX_ANCHORS:
+                _, oldest = self._anchors.popitem(last=False)
+                self._tabs.forget(oldest)
+                await _quietly(oldest.close)
+            return page
+
+    async def _drop_anchor(self, origin: str) -> None:
+        """Close the tab kept on ``origin``; the next call opens a fresh one."""
+        page = self._anchors.pop(origin, None)
+        if page is not None:
             self._tabs.forget(page)
             await _quietly(page.close)
 
@@ -757,8 +850,12 @@ class PlaywrightFetcher:
                     await self._stop_driver()
 
     async def _close_browser(self) -> None:
-        """Close the browser, if there is one, and forget it and its context; errors are ignored."""
+        """Close the browser, if there is one, and forget it and its context; errors are ignored.
+
+        The kept tabs go with it; the next light fetch of their origins opens new ones.
+        """
         browser, self._browser, self._context = self._browser, None, None
+        self._anchors.clear()
         if browser is not None:
             await _quietly(browser.close)
 

@@ -67,8 +67,9 @@ _SAVE_EVERY = 5.0
 _STORE_VERSION = 2
 _MINT_OWNERS = frozenset({TOKEN_PROGRAM, TOKEN_2022_PROGRAM})
 _WATCHED_CHAINS = frozenset({Chain.ETHEREUM, Chain.SOLANA})  # a Sui package cannot be known early
-# A hint in the words before a link (pump.fun/, /token/, "CA") counts like one in text.
-_VISIBLE = frozenset({SightingSource.TEXT, SightingSource.LINK})
+# A hint in the words before a link (pump.fun/, /token/, "CA") counts like one in text, and
+# so does a key of the site's own API ("ca": ...).
+_VISIBLE = frozenset({SightingSource.TEXT, SightingSource.LINK, SightingSource.API})
 _SOLANA = "Solana"  # the "network" of a Solana address in ``absent_on``
 
 Listener = Callable[[Address], None]

@@ -30,10 +30,16 @@ bothers you.
   default), from iframes, shadow DOM and every script or JSON answer the page loaded.
   Verdicts are cached; a rate-limited node never turns a real token into a cached
   rejection.
-- **Alerts first, details second.** A token alert leaves the moment the page shows the
-  token, while it is still loading (milliseconds after the document or the script that
-  shows it, plus the on-chain check): where it stood on the page, the words in front of
-  it and when it appeared. A second later the same message gains the name, supply,
+- **Light mode.** Between renders every page's HTML and the site's own JSON APIs are
+  asked over plain HTTP every second (conditional requests, mostly a 304): an address
+  that appears there is announced about half a second later, one the API names before
+  the page shows it too ("site API"). A page whose HTML shows what its render shows is
+  rendered only every 30 s; a new deploy of a single-page app is rendered at once. A site
+  that refuses plain requests is asked through the browser.
+- **Alerts first, details second.** A token alert leaves the moment the bot sees the
+  token, a render included: while it is still loading (milliseconds after the document
+  or the script that shows it, plus the on-chain check): where it stood on the page, the
+  words in front of it and when it appeared. A second later the same message gains the name, supply,
   Solana authorities and risky extensions, the token's age, the other networks where the
   address is a token and the DEX pair. One alert per token, across pages, sites and modes.
 - **Addresses published before their token.** An address that is on the page before

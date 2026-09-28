@@ -26,7 +26,12 @@ from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.pending.watch import PendingWatch
-from scraper_bot.monitoring.site_monitor import AutoPauseCallback, PersistCallback, SiteMonitor
+from scraper_bot.monitoring.site_monitor import (
+    AutoPauseCallback,
+    Observer,
+    PersistCallback,
+    SiteMonitor,
+)
 from scraper_bot.monitoring.turbo.manager import TurboManager
 from scraper_bot.monitoring.turbo.session import LimitsSource, TurboSession
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
@@ -35,6 +40,8 @@ from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.fetching.result import PageFetcher
+from scraper_bot.pages.light.poller import LightPoller
+from scraper_bot.pages.light.transport import BrowserTransport, HttpTransport, LightTransport
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.settings.env import Settings
@@ -245,6 +252,35 @@ def build_runtime(
     )
     # A token that Arc or Robinhood Chain reports too late is confirmed at the next tick.
     validator.on_late_token = pending.hurry
+    light_http = HttpTransport(probe_http or http)
+    # A browser that can fetch() from a tab kept on a site asks the sites that refuse httpx.
+    light_browser: LightTransport | None = (
+        BrowserTransport(fetcher) if hasattr(fetcher, "tab_fetch") else None  # type: ignore[arg-type]
+    )
+
+    def build_light(
+        site_url: str,
+        observe: Observer,
+        render_soon: Callable[[str], None],
+        is_blocked: Callable[[], bool],
+    ) -> LightPoller:
+        """Build the light poller of one site; its pace follows turbo sessions of the site."""
+        return LightPoller(
+            site_url,
+            http=light_http,
+            browser=light_browser,
+            extractor=extractor,
+            validator=validator,
+            normalizer=normalizer,
+            tuning=prefs,
+            observe=observe,
+            request_render=render_soon,
+            is_blocked=is_blocked,
+            # turbo is built below; a session of this site speeds its polls up.
+            turbo_active=lambda: any(session.url == site_url for session in turbo.active()),
+            block_detector=block_detector,
+            sleep=sleep,
+        )
 
     def build_monitor(
         site: SiteState, persist: PersistCallback, on_auto_pause: AutoPauseCallback
@@ -273,6 +309,8 @@ def build_runtime(
             pending=pending,
             sleep=sleep,
             page_load_timeout=cfg.page_load_timeout,
+            block_detector=block_detector,
+            light=build_light,
         )
 
     def build_turbo(

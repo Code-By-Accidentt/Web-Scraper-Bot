@@ -20,6 +20,7 @@ from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.prober import HttpProber
+from scraper_bot.pages.light.poller import LightPoller
 from scraper_bot.pages.page_checker import PageChecker
 from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.settings.live import Tuning
@@ -29,6 +30,9 @@ log = logging.getLogger(__name__)
 
 PersistCallback = Callable[[], None]
 AutoPauseCallback = Callable[[str, str], Awaitable[None]]
+Observer = Callable[[Observation], Awaitable[None]]
+# (site URL, observe, render a page soon, is the site blocking?) -> the site's light poller
+LightFactory = Callable[[str, Observer, Callable[[str], None], Callable[[], bool]], LightPoller]
 
 
 @dataclass(slots=True)
@@ -44,6 +48,7 @@ class MonitorStats:
     blocked_since: float | None = None
     retry_after: float | None = None
     timing_out: int = 0  # pages the user was warned about for repeated load timeouts
+    light: str | None = None  # what the light mode polls, for /status
 
     @property
     def blocked(self) -> bool:
@@ -92,10 +97,12 @@ class SiteMonitor:
         sleep: Callable[[float], Awaitable[None]] | None = None,
         page_load_timeout: float = 30.0,
         block_detector: BlockDetector | None = None,
+        light: LightFactory | None = None,
     ) -> None:
         """Set up the monitor of ``site``; nothing runs until :meth:`run`.
 
         ``sleep`` replaces the stop-aware wait between rounds (tests pass an instant one).
+        ``light`` builds the light poller that watches the site between renders.
         """
         self._site = site
         self._checker = checker
@@ -114,7 +121,15 @@ class SiteMonitor:
         self._blocks = block_detector or BlockDetector()
         self._light_skips = 0  # blocked rounds in a row whose renders a light request spared
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()  # ends the pause between rounds early
         self._stats = MonitorStats()
+        self._light = (
+            light(site.url, self._observed, self._render_soon, lambda: self._stats.blocked)
+            if light is not None
+            else None
+        )
+        self._render_now: set[str] = set()  # pages the light mode wants rendered at once
+        self._rendered_at: dict[str, float] = {}  # page -> when it was last rendered
         self._planned_delay: float | None = None
         self._health: dict[str, _PageHealth] = {}
         self._last_read: dict[str, float] = {}  # page -> when it was last read successfully
@@ -136,17 +151,29 @@ class SiteMonitor:
     def request_stop(self) -> None:
         """Ask the monitor to stop; a round in progress still finishes."""
         self._stop.set()
+        self._wake.set()
 
     async def run(self) -> None:
-        """Run rounds, with a pause between them, until a stop is requested."""
+        """Run rounds, with a pause between them, until a stop is requested.
+
+        The light mode starts after the first round, which shows it the live pages.
+        """
         log.info("monitor started for %s", self._site.url)
+        polling: asyncio.Task[None] | None = None
         try:
             while not self._stop.is_set():
                 await self.run_once()
                 if self._stop.is_set():
                     break
+                if polling is None and self._light is not None:
+                    polling = asyncio.create_task(
+                        self._light.run(self._stop), name=f"light:{self._site.url}"
+                    )
                 await self._sleep_between_rounds()
         finally:
+            if polling is not None:
+                polling.cancel()
+                await asyncio.gather(polling, return_exceptions=True)
             log.info("monitor stopped for %s", self._site.url)
 
     async def run_once(self) -> list[PageCheckOutcome]:
@@ -172,11 +199,14 @@ class SiteMonitor:
             await self._update_block_state([outcome])
             return [outcome]
         pages = await live_pages(self._prober, self._deriver, self._site.url)
+        if self._light is not None:
+            self._light.keep(pages)
+        due = [url for url in pages if self._due(url)]
         results = await asyncio.gather(
-            *(self._check_and_handle(url) for url in pages), return_exceptions=True
+            *(self._check_and_handle(url) for url in due), return_exceptions=True
         )
         outcomes: list[PageCheckOutcome] = []
-        for url, result in zip(pages, results, strict=True):
+        for url, result in zip(due, results, strict=True):
             if isinstance(result, PageCheckOutcome):
                 outcomes.append(result)
             elif isinstance(result, asyncio.CancelledError):
@@ -198,7 +228,8 @@ class SiteMonitor:
         self._stats.rounds += 1
         self._stats.last_round_at = time.time()
         self._stats.last_round_seconds = time.perf_counter() - started
-        self._stats.last_pages = len(pages)
+        self._stats.last_pages = len(due)
+        self._stats.light = self._light.summary() if self._light is not None else None
         for url in [url for url in self._health if url not in pages]:
             del self._health[url]
         self._count_timing_out()
@@ -250,9 +281,13 @@ class SiteMonitor:
         stretched = None
         if health is not None and health.factor > 1:
             stretched = self._page_load_timeout * health.factor
+        self._render_now.discard(page_url)
+        self._rendered_at[page_url] = time.monotonic()
         outcome = await self._checker.check(
             page_url, load_timeout=stretched, on_observation=self._observed
         )
+        if self._light is not None:
+            self._light.learn(outcome)
         await self._handle(outcome)
         await self._track_timeouts(outcome)
         return outcome
@@ -488,11 +523,33 @@ class SiteMonitor:
                 site.url, time.time() - since if since is not None else None
             )
 
+    def _due(self, page_url: str) -> bool:
+        """True when the page is rendered this round.
+
+        A page the light mode covers waits ``render_interval`` between renders, unless the
+        light mode asked for a render (a new deploy); every other page renders each round.
+        """
+        if self._light is None or not self._light.covered(page_url):
+            return True
+        if page_url in self._render_now:
+            return True
+        last = self._rendered_at.get(page_url)
+        return last is None or time.monotonic() - last >= self._tuning.render_interval
+
+    def _render_soon(self, page_url: str) -> None:
+        """Render ``page_url`` in the next round, and start that round now."""
+        self._render_now.add(page_url)
+        self._wake.set()
+
     async def _sleep_between_rounds(self) -> None:
-        """Wait the planned delay (or a new one) before the next round, less if stopped."""
+        """Wait the planned delay (or a new one) before the next round.
+
+        The wait ends early on a stop, or when the light mode asks for a render.
+        """
         delay = self._planned_delay if self._planned_delay is not None else self.next_delay()
         self._planned_delay = None
         if self._sleep is not None:
             await self._sleep(delay)
             return
-        await wait_or_stop(self._stop, delay)
+        await wait_or_stop(self._wake, delay)
+        self._wake.clear()

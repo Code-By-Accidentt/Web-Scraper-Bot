@@ -38,6 +38,8 @@ needs a restart.
 | `SETTLE_DELAY` | 0.25 | Extra pause after network idle so scripts can finish drawing. 0.25 s gave the same result as 0.5 s and 1 s on every measured page. | `settle_delay` |
 | `RENDER_FAILURE_THRESHOLD` | 5 | Load timeouts in a row on one page that send one 🐢 alert and double that page's load timeout (up to 3x) until it renders again. 0 = off. | `render_failure_threshold` |
 | `CONFIRM_DELAY` | 2 | Seconds between the two renders that confirm a change. Longer delays classify slower tickers as volatile. A render that differs only in elements already seen ticking (a timer, a clock) needs no second render. | `confirm_delay` |
+| `LIGHT_INTERVAL` | 1 | Light mode: between renders every live page's HTML and the site's own JSON APIs (the ones a render saw the page call, at most 2 per page) are asked over plain HTTP this often, conditionally (mostly a 304 without a body). A new address there is checked and announced at once; one an API adds before the page shows it comes as "Found in: site API". A site that refuses plain requests is asked with fetch() from a tab kept on it. 0 = off. Below 0.5 s asks for `confirm`. | `light_interval` |
+| `RENDER_INTERVAL` | 30 | A page whose HTML carries what its render shows (80% of its texts), and that neither ticks nor polls on its own, is fully rendered only this often, for change detection; the light mode watches it meanwhile, and a new deploy (other scripts in its HTML) renders it at once. Other pages are rendered every round. Minimum 4. | `render_interval` |
 | `CONTRACT_PAUSE_THRESHOLD` | 5 | New confirmed contracts on one page in one round that are sent as a `.txt` document and pause the site until `/resume`. | `contract_pause_threshold` |
 | `SUB_URL_PATTERNS` | 7 patterns | Sub-pages derived from every root URL; `{domain}` is the host without `www.`. Probed every round, rendered when they exist. A pattern whose page always answers 401/403 keeps its site in block backoff: leave it out. An empty value means the default list. | – |
 | `IGNORED_ATTRIBUTES` | nonce, integrity, csrf tokens, ... | HTML attributes never compared. An empty value means the default list. | – |
@@ -56,6 +58,7 @@ needs a restart.
 | `TURBO_STOP_AFTER` | 1 | Confirmed contracts that end a session. 0 = only the timer or `/turbo stop`. | `turbo_stop_after` |
 | `TURBO_MAX_SITES` | 1 | Sites in turbo (running or scheduled) at the same time. | `turbo_max_sites` |
 | `TURBO_MAX_PAGES` | 4 | Pages rendered per cycle, the root page included. | `turbo_max_pages` |
+| `LIGHT_TURBO_INTERVAL` | 0.3 | The light mode's pace while a turbo session runs for the site (minimum 0.1). Below 0.3 s asks for `confirm`. | `light_turbo_interval` |
 | `TURBO_RECHECK_INTERVAL` | 1 | Seconds between on-chain checks of a turbo site's addresses that are not a token yet (the pending watch). Elsewhere an address the page names as the CA is checked every second for 15 min, then every 5 s up to an hour, then every 30 s; any other address every 30 s. | `turbo_recheck_interval` |
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot. The pause doubles per blocked round up to this value; a longer `Retry-After` from the site is honoured as sent. Meanwhile each round first sends one plain GET to the root page and renders nothing while that is refused (every fourth blocked round renders anyway). | `block_max_backoff` |
 
@@ -123,7 +126,7 @@ from `.env`), `/settings <key>` explains one knob with its range and default, `/
 (`/settings reset` alone resets all). Values are
 type- and range-checked, related pairs stay consistent (`poll_interval_min` never above
 `poll_interval_max`, `turbo_default_minutes` never above `turbo_max_minutes`), and risky
-values (polling below 3 s, `require_erc20 off`, `skip_stable_copies off`, `deep_scan on`, a rejected TTL of 0,
+values (polling below 3 s, light polls below 0.5 s or in turbo below 0.3 s, `require_erc20 off`, `skip_stable_copies off`, `deep_scan on`, a rejected TTL of 0,
 `flap_window_hours 0`,
 `turbo_interval` below 2 s, more than one turbo site, more than 8 turbo pages, a block
 backoff below 60 s) must be repeated with `confirm`.
