@@ -33,13 +33,14 @@ from scraper_bot.telegram.commands.parsing import ParsedCommand, parse_command, 
 from scraper_bot.telegram.markup import code, escape
 from scraper_bot.telegram.timefmt import format_clock, format_duration, format_schedule
 from scraper_bot.telegram.views.settings import describe_setting, settings_overview
+from scraper_bot.telegram.views.status import describe_auto_window
 
 log = logging.getLogger(__name__)
 
 
 Handler = Callable[[int, str], Awaitable[str]]
 
-# An unauthorised chat learns its chat id from /start at most this often (seconds).
+# An unauthorised chat gets its chat id from /start at most once in this many seconds.
 _STRANGER_REPLY_INTERVAL = 600.0
 _STRANGER_MEMORY = 1000
 
@@ -78,7 +79,7 @@ class BotCommands:
         self._preferences = preferences
         self._clock = clock
         self._stranger_replies: dict[int, float] = {}
-        self._warned_chats: set[int] = set()  # told that TELEGRAM_CHAT_IDS is empty
+        self._warned_chats: set[int] = set()  # chats we told that TELEGRAM_CHAT_IDS is empty
         self._handlers: dict[str, Handler] = {
             "start": self._start,
             "help": self._help,
@@ -123,7 +124,7 @@ class BotCommands:
             and command.name in {"add", "list", "resume"}
             and chat_id not in self._warned_chats
         ):
-            # Once per chat and start: the reminder must not bury every reply.
+            # Only once per chat per start, so the reminder doesn't bury every reply.
             self._warned_chats.add(chat_id)
             reply += (
                 f"\n\n⚠️ TELEGRAM_CHAT_IDS is empty, so alerts are dropped. "
@@ -175,7 +176,7 @@ class BotCommands:
             }
         self._stranger_replies[chat_id] = now
         if self._allowlist:
-            # With an allowlist only that list commands; TELEGRAM_CHAT_IDS would not help.
+            # With an allowlist only its chats give commands, so TELEGRAM_CHAT_IDS won't help.
             where = "TELEGRAM_ALLOWED_CHAT_IDS"
         else:
             where = (
@@ -304,7 +305,7 @@ class BotCommands:
         )
 
     def _turbo_status(self) -> str:
-        """Return the running and scheduled turbo sessions, or the usage when there are none."""
+        """Return the turbo sessions and auto-turbo windows, or the usage when there are none."""
         assert self._turbo is not None
         lines = []
         for session in self._turbo.active():
@@ -322,6 +323,11 @@ class BotCommands:
                 f"{plan.minutes:.0f} min; "
                 f"cancel with {code(f'/turbo stop {plan.url}')}"
             )
+        lines += [
+            f"{describe_auto_window(window, time.time())}; "
+            f"cancel with {code(f'/turbo stop {window.site_url}')}"
+            for window in self._turbo.auto_windows()
+        ]
         if not lines:
             return f"No turbo session is running.\n{TURBO_USAGE}"
         return "\n".join(lines)
@@ -348,7 +354,7 @@ class BotCommands:
             return usage("/remove <url>")
         url = self._manager.resolve(argument)
         if self._turbo is not None:
-            # Its session would keep handing the site's addresses to the pending watch.
+            # Otherwise its turbo session keeps feeding the site's addresses to the pending watch.
             with contextlib.suppress(TurboError):
                 await self._turbo.stop(url)
         site = await self._manager.remove_site(url)

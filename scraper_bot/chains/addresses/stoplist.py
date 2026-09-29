@@ -20,7 +20,7 @@ from scraper_bot.models.addresses import Address, Chain
 
 log = logging.getLogger(__name__)
 
-# (symbol, address) per network, for the reader; lookups use the lower-cased address.
+# (symbol, address) per network. The symbol is for the reader, and lookups ignore letter case.
 EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
     "Ethereum": (
         ("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
@@ -105,7 +105,7 @@ EVM_TOKENS: dict[str, tuple[tuple[str, str], ...]] = {
         ("WBTC", "0x321162Cd933E2Be498Cd2267a90534A804051b11"),
     ),
     "Arc": (
-        ("USDC", "0x3600000000000000000000000000000000000000"),  # the gas token's ERC-20 face
+        ("USDC", "0x3600000000000000000000000000000000000000"),  # the gas token as an ERC-20
         ("EURC", "0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1"),
         ("USYC", "0x8a5D989Bbb96929F689B0200f435f53dA42bF490"),
         ("cirBTC", "0x171A4217b86A807A64eB94757Db6849fb4bDbAA0"),
@@ -122,7 +122,8 @@ EVM_SENTINELS = (
     "0x000000000000000000000000000000000000dEaD",
     "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE",
 )
-# Lower: zero address, precompiles, system contracts (BSC 0x1000-0x2005, Arbitrum 0x64-0xff).
+# Addresses under this limit are the zero address, precompiles and system contracts
+# (BSC 0x1000-0x2005, Arbitrum 0x64-0xff).
 EVM_SYSTEM_LIMIT = 0x10000
 # OP-stack predeploys (Base, Optimism): WETH 0x4200...0006, GasPriceOracle ...000F, OP ...0042.
 OP_STACK_PREDEPLOYS = range(0x42 << 152, (0x42 << 152) + 0x800)
@@ -140,14 +141,14 @@ SOLANA_MINTS: tuple[tuple[str, str], ...] = (
     ("INF", "5oVNBeEEQvYi1cX3ir8Dx5n1P7pdxydbGF2X4TxVusJm"),
 )
 
-# Sui coins are matched by package, so the coin type and the bare package id both hit.
+# Sui coins match by package, so both the coin type and the bare package id are caught.
 SUI_PACKAGES: tuple[tuple[str, str], ...] = (
     ("USDC", "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7"),
     ("USDT", "0x375f70cf2ae4c00bf37117d0c85a2c71545e6ee05c4a5c7d282cd66a4504b068"),
 )
 
-# Stablecoins, wrapped coins, native coins and staked coins. A token that carries one of
-# these symbols but is not on the lists above is a copy (bridged, plumbing or a scam).
+# Stablecoins plus wrapped, native and staked coins. A token with one of these symbols that
+# isn't on the lists above is a copy (bridged, plumbing or a scam).
 STABLE_SYMBOLS: tuple[str, ...] = (
     *("USDC", "USDT", "USDC.e", "USDbC", "USDT.e", "USDT0", "EURC", "DAI", "USDe", "PYUSD"),
     *("FDUSD", "USDS", "USD1", "USDG", "RLUSD", "TUSD", "FRAX", "LUSD", "GHO", "crvUSD"),
@@ -159,8 +160,8 @@ STABLE_SYMBOLS: tuple[str, ...] = (
     *("jitoSOL", "mSOL", "bSOL", "JupSOL"),
 )
 
-# Each group is a Latin letter followed by the Cyrillic and Greek letters (and Tether's ₮)
-# drawn like it, as in "USDС" with a Cyrillic С.
+# Each group is a Latin letter, then the Cyrillic and Greek letters (and Tether's ₮) that
+# look like it, as in "USDС" with a Cyrillic С.
 _LOOKALIKE_GROUPS = (
     "AАΑ BВΒ CС EЕΕ HНҺΗ IІΙӀ JЈ KКΚ MМΜ NΝ OОΟ PРΡ SЅ TТΤ₮ XХΧ YУҮΥ ZΖ "
     "aаα bв cс dԁ eе hһн iіι jј kкκ lӏ mм oоο pрρ sѕ tтτ uυ vν xхχ yуү"
@@ -216,7 +217,7 @@ class StopList:
         extra: list[Address] = []
         if path.is_file():
             try:
-                # utf-8-sig drops Notepad's BOM; a file in another encoding still loads.
+                # utf-8-sig drops Notepad's BOM, and a file in another encoding still loads.
                 text = path.read_text(encoding="utf-8-sig", errors="replace")
             except OSError as exc:
                 log.warning("%s is unreadable (%s); only the built-in stop-list applies", path, exc)

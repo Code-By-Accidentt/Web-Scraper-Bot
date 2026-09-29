@@ -19,7 +19,7 @@ from scraper_bot.settings.defaults import ChangedDefault
 from scraper_bot.storage.outbox import Outbox, OutboxEntry
 from scraper_bot.telegram.client import SentMessage, TelegramClient
 from scraper_bot.telegram.markup import code, escape, pre
-from scraper_bot.telegram.timefmt import format_duration
+from scraper_bot.telegram.timefmt import format_duration, format_moment, format_utc_offset
 from scraper_bot.telegram.views.token import (
     NO_PAIR_YET,
     describe_token,
@@ -30,8 +30,8 @@ from scraper_bot.telegram.views.token import (
 
 log = logging.getLogger(__name__)
 
-_NOTICE_WAIT = 2.0  # seconds a caller waits for its notice to go out before moving on
-_REPORT_WAIT = 10.0  # the same for a problem report, whose caller wants to know it went out
+_NOTICE_WAIT = 2.0  # how long a caller waits for its notice to go out before moving on (s)
+_REPORT_WAIT = 10.0  # same for a problem report, since its caller wants to know it went out
 
 
 class Notifier:
@@ -69,7 +69,7 @@ class Notifier:
         self._clock = clock
         self._problems: dict[str, float] = {}
         self._background: set[asyncio.Future[Any]] = set()
-        # Token alerts and documents that have not left yet: a summary must not overtake them.
+        # Token alerts and documents that haven't gone out yet, so a summary can wait for them.
         self._unsent: set[asyncio.Future[Any]] = set()
         self.outbox: Outbox | None = None
 
@@ -200,7 +200,7 @@ class Notifier:
         resent = 0
         for entry in left:
             for chat_id in [chat for chat in entry.chats if chat not in self._chat_ids]:
-                self._delivered(entry, chat_id)  # taken out of TELEGRAM_CHAT_IDS meanwhile
+                self._delivered(entry, chat_id)  # taken out of TELEGRAM_CHAT_IDS in the meantime
             if not entry.chats:
                 continue
             try:
@@ -387,6 +387,87 @@ class Notifier:
             + (f"\n{found}" if found else "")
         )
         self._spawn(self._after_alerts(text))
+
+    async def auto_turbo_planned(
+        self,
+        site_url: str,
+        page_url: str,
+        what: str,
+        target: float | None,
+        start: float,
+        end: float,
+        *,
+        moved_from: float | None = None,
+    ) -> None:
+        """Say that a site is checked faster around the launch time one of its pages shows.
+
+        ``what`` is what the page showed, ``target`` the launch time (None for a phrase,
+        which names no time) and ``moved_from`` the launch time it showed before a move.
+        """
+        now = self._clock()
+        if target is None:
+            head = f"⏰ {escape(what)} appeared on {escape(page_url)}."
+        elif moved_from is not None:
+            head = (
+                f"⏰ The launch time for {escape(site_url)} changed from "
+                f"{format_moment(moved_from, now)} to {_launch_at(target, now)}: "
+                f"{escape(page_url)} shows a {escape(what)}."
+            )
+        else:
+            head = (
+                f"⏰ {escape(page_url)} shows a {escape(what)}: "
+                f"launch at {_launch_at(target, now)}."
+            )
+        span = "now" if start <= now + 1 else f"from {format_moment(start, now)}"
+        await self._notify(
+            f"{head}\nAuto-turbo for {escape(site_url)}: checking faster {span} until "
+            f"{format_moment(end, now)}, or until its first token.\n"
+            f"Cancel with {code(f'/turbo stop {site_url}')}"
+        )
+
+    async def auto_turbo_full(
+        self, site_url: str, page_url: str, what: str, target: float | None, windows: int
+    ) -> None:
+        """Say that a page shows a launch time, but auto-turbo already covers enough sites."""
+        now = self._clock()
+        if target is None:
+            head = f"⏰ {escape(what)} appeared on {escape(page_url)}."
+        else:
+            head = (
+                f"⏰ {escape(page_url)} shows a {escape(what)}: "
+                f"launch at {_launch_at(target, now)}."
+            )
+        await self._notify(
+            f"{head}\nAuto-turbo already covers {windows} site(s) (auto_turbo_max_sites), so "
+            f"{escape(site_url)} keeps its usual pace; {code(f'/turbo {site_url}')} speeds it up "
+            "by hand."
+        )
+
+    async def auto_turbo_finished(
+        self,
+        site_url: str,
+        reason: str,
+        contracts: Sequence[ConfirmedContract],
+        seconds: float | None,
+    ) -> None:
+        """Send the auto-turbo summary once the token alerts it lists have gone out.
+
+        ``seconds`` is how long the site was checked faster: None when a token ended the
+        window before it began.
+        """
+        found = "\n".join(f"• {code(c.address.value)} ({escape(c.network)})" for c in contracts)
+        if seconds is None:
+            text = (
+                f"🎯 Auto-turbo for {escape(site_url)} ended before its faster checks began: "
+                f"{escape(reason)}"
+            )
+        else:
+            text = (
+                f"🎯 Auto-turbo finished on {escape(site_url)}: {escape(reason)}\n"
+                f"Checked faster for {format_duration(seconds)}, "
+                f"{len(contracts)} confirmed contract(s)."
+            )
+        self._spawn(self._after_alerts(text + (f"\n{found}" if found else "")))
 
     async def site_blocked(
         self, site_url: str, page_url: str, signal: BlockSignal, next_delay: float
@@ -658,7 +739,13 @@ class Notifier:
         self._ship_document(filename, "\n".join(lines) + "\n", caption)
 
 
-_ALERTS_OUT_WAIT = 300.0  # seconds a follow-up notice waits at most for the alerts before it
+_ALERTS_OUT_WAIT = 300.0  # how long a follow-up notice waits for the alerts ahead of it (s)
+
+
+def _launch_at(timestamp: float, now: float) -> str:
+    """Return a launch time like ``15:04 (UTC+02:00, in 5m 30s)``."""
+    zone = format_utc_offset(timestamp)
+    return f"{format_moment(timestamp, now)} ({zone}, in {format_duration(timestamp - now)})"
 
 
 def _problem_text(title: str, detail: str, hint: str | None) -> str:

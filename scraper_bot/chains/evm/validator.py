@@ -30,12 +30,12 @@ log = logging.getLogger(__name__)
 
 
 _REVERT_MARKERS = ("revert", "invalid opcode", "out of gas", "vm execution")
-# Above this many background requests a lookup waits for all its networks instead.
+# With this many requests already in the background, a lookup waits for all its networks.
 _MAX_BACKGROUND = 64
-# Seconds the optional networks get once the required ones answered (healthy: about 50 ms).
+# Seconds optional networks get after the required ones answer. A healthy one takes about 50 ms.
 OPTIONAL_GRACE = 0.5
 _MAX_LATE = 1000  # late tokens and pairs kept for the next lookup
-# When no network found a token or pair, the first of these kinds seen is the verdict.
+# If no network found a token or pair, the verdict is the first of these kinds any network gave.
 _REJECTIONS = (
     AddressKind.WALLET,
     AddressKind.VAULT,
@@ -76,9 +76,9 @@ class EvmContractValidator:
         self._stoplist = stoplist
         self.health = EndpointHealth(clock, optional=self._optional)
         self._background: set[asyncio.Task[ChainVerdict]] = set()
-        # (address, network) -> a token or pair found after the verdict; the next lookup uses it.
+        # (address, network) -> a token or pair found too late. The next lookup returns it.
         self._late: dict[tuple[str, str], ChainVerdict] = {}
-        # Called with (address, network, verdict) for every late answer of an optional network.
+        # Called with (address, network, verdict) for every late answer from an optional network.
         self.on_late: Callable[[str, str, ChainVerdict], None] | None = None
 
     async def find_network(
@@ -101,7 +101,7 @@ class EvmContractValidator:
             late = self._late.pop((address, name), None)
             if late is not None:
                 return dataclasses.replace(late, network=name)
-        # An optional endpoint that keeps failing is not asked at all: it is left out at once.
+        # An optional endpoint that keeps failing isn't asked at all. It's just left out.
         resting = [name for name, _ in asked if self.health.resting(name)]
         clients = [(n, c) for n, c in asked if n not in resting]
         order = {name: index for index, (name, _) in enumerate(clients)}
@@ -116,7 +116,7 @@ class EvmContractValidator:
         try:
             while pending:
                 timeout = None
-                # Only optional networks left: wait the grace, not the whole RPC timeout.
+                # Only optional networks left, so give them the grace, not the whole RPC timeout.
                 only_optional = all(tasks[task] in self._optional for task in pending)
                 if only_optional and verdicts and len(self._background) < _MAX_BACKGROUND:
                     if grace_ends is None:
@@ -147,7 +147,7 @@ class EvmContractValidator:
         except BaseException:
             for task in pending:
                 task.cancel()
-            for task in tasks:  # retrieve the other errors, so asyncio does not warn
+            for task in tasks:  # retrieve the other errors so asyncio doesn't warn
                 if task.done() and not task.cancelled():
                     task.exception()
             raise
@@ -285,7 +285,7 @@ class EvmContractValidator:
             if isinstance(answer, BaseException) and not _is_revert(answer):
                 raise answer
         if not has_code(code):
-            return ChainVerdict(AddressKind.NO_CODE)  # that node is behind: watch it, never reject
+            return ChainVerdict(AddressKind.NO_CODE)  # node is behind: watch it, don't rule it out
         first, second = word_address(token0), word_address(token1)
         # Pairs and pools of every common DEX keep their two tokens sorted by address.
         if first and second and first < second:

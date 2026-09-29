@@ -35,7 +35,7 @@ _NEGATIVE_RE = re.compile(
     r"|/address/|/account/",
     re.IGNORECASE,
 )
-# Other addresses in a context are masked: an alert names exactly one address.
+# We mask the other addresses in a context, so an alert names exactly one address.
 _ADDRESS_LIKE_RE = re.compile(r"0x[0-9a-fA-F]{8,}(?:::\w+::\w+)?|[1-9A-HJ-NP-Za-km-z]{32,44}")
 _SPACES_RE = re.compile(r"\s+")
 _RANK = {
@@ -47,7 +47,7 @@ _RANK = {
 }
 
 
-# Fields a captcha fills with a fresh random token on every render: never an address.
+# Fields a captcha fills with a fresh random token on every render, never an address.
 _CAPTCHA_FIELDS = frozenset({"g-recaptcha-response", "h-captcha-response", "cf-turnstile-response"})
 _CAPTCHA_FIELD_RE = re.compile(
     r"<(textarea|input)\b[^>]{0,300}?\bname=[\"'](?:g-recaptcha|h-captcha|cf-turnstile)-response"
@@ -84,7 +84,8 @@ def find_sightings(
     sighting beats an unhinted one, then text beats a link; source and scripts count only for
     addresses no element shows.
     """
-    # Bare 64-hex ids are Sui only where the text talks about Sui; each script decides alone.
+    # Bare 64-hex ids are Sui only where the page talks about Sui. Frames, shadow roots and
+    # scripts each decide that for themselves.
     sui_context = SUI_CONTEXT_RE.search(html) is not None
     if "-response" in html:
         html = _CAPTCHA_FIELD_RE.sub(lambda match: " " * len(match.group(0)), html)
@@ -103,7 +104,8 @@ def find_sightings(
         if node.text:
             previous = node.text
     _offer_raw(best, extractor, (html,), SightingSource.SOURCE, sui_context)
-    # Before extras, which also hold dom: frames and shadow roots are page source, not scripts.
+    # This comes before extras, which hold dom too, so frames and shadow roots count as page
+    # source rather than scripts.
     _offer_raw(best, extractor, dom, SightingSource.SOURCE, None)
     _offer_raw(best, extractor, extras, SightingSource.SCRIPT, None)
     return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
@@ -144,7 +146,7 @@ def _offer_raw(
     for text in texts:
         for address, start in extractor.locate(text, sui_context=sui_context):
             if address not in best:
-                # raw markup: "&amp;" and "&quot;" read as the page shows them
+                # raw markup, so read "&amp;" and "&quot;" the way the page shows them
                 before = html_lib.unescape(text[max(start - _RAW_WINDOW, 0) : start])
                 best[address] = _sighting(address, source, before)
 

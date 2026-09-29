@@ -22,7 +22,7 @@ from scraper_bot.models.addresses import (
     parse_address_key,
 )
 
-QUIET = 10.0  # seconds without another late token before a burst's document leaves
+QUIET = 10.0  # a burst's document goes out after this long without a new late token (s)
 KEEP_FOR = 24 * 3600.0  # the addresses of a pausing first check count as old news for a day
 LIMIT = 1000  # addresses remembered per site
 _REJECTED = frozenset({ValidationStatus.REJECTED, ValidationStatus.ALREADY_REJECTED})
@@ -108,7 +108,7 @@ class OldNews:
         """
         ready: list[tuple[str, list[ConfirmedContract]]] = []
         for url, site in list(self._sites.items()):
-            # A clock stepped back must not hold a burst back until it catches up.
+            # If the clock jumps back, don't hold the burst until the clock catches up.
             if site.queued and not 0 <= now - site.last_queued < QUIET:
                 ready.append((url, list(site.queued.values())))
                 for address in site.queued:

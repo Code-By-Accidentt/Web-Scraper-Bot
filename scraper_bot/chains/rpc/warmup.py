@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 WARM_INTERVAL = 30.0
 
-# Gets an endpoint's name and failure; in the app, the validators' endpoint health.
+# Gets an endpoint's name and failure. In the app it feeds the validators' endpoint health.
 Recorder = Callable[[str, BaseException | None], None]
 
 

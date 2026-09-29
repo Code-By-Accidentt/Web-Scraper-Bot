@@ -14,6 +14,7 @@ from scraper_bot.models.addresses import (
     ValidationResult,
     ValidationStatus,
 )
+from scraper_bot.models.launch import LaunchClues, LaunchTime, TimeSource
 from scraper_bot.models.pages import (
     BlockSignal,
     ChangeCounts,
@@ -23,6 +24,7 @@ from scraper_bot.models.pages import (
 )
 from scraper_bot.models.sightings import Observation, Sighting, SightingSource, Timeline
 from scraper_bot.models.sites import SiteState
+from scraper_bot.monitoring.pace import AUTO, SitePace
 from scraper_bot.monitoring.site_monitor import _MAX_BLOCK_LEVEL, SiteMonitor
 from scraper_bot.pages.urls import SubUrlDeriver
 from tests.conftest import FakeChecker, FakeNotifier, FakeProber, FakeTuning, node
@@ -65,6 +67,8 @@ class Harness:
         watcher: RecordingWatcher | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         light: Any = None,
+        auto: Any = None,
+        pace: SitePace | None = None,
     ) -> None:
         self.site = SiteState(ROOT)
         self.checker = FakeChecker()
@@ -93,6 +97,8 @@ class Harness:
             rng=random.Random(1),
             sleep=sleep,
             light=light.bind if light is not None else None,
+            auto=auto,
+            pace=pace,
         )
 
     def outcome(
@@ -774,3 +780,30 @@ async def test_a_challenge_render_does_not_open_an_appearance_window() -> None:
     await h.monitor.run_once()
     [(_, timeline)] = h.notifier.contract_details
     assert timeline == Timeline(300.0, missing_at=None)  # found on the first real read
+
+
+class RecordingAuto:
+    """Stand-in for AutoTurbo: records what the monitor hands it."""
+
+    def __init__(self) -> None:
+        self.observed: list[tuple[str, str, LaunchClues]] = []
+
+    async def observe(self, site_url: str, page_url: str, clues: LaunchClues) -> None:
+        self.observed.append((site_url, page_url, clues))
+
+    def forget(self, site_url: str) -> None: ...
+
+
+async def test_launch_clues_reach_the_auto_turbo_and_its_window_shortens_the_rounds() -> None:
+    auto, pace = RecordingAuto(), SitePace()
+    h = Harness(statuses={APP: 404, DOCS: 404}, auto=auto, pace=pace)
+    h.tuning.poll_interval_min = h.tuning.poll_interval_max = 5.0
+    h.tuning.turbo_interval = 2.0
+    clues = LaunchClues(1.0, times=(LaunchTime("k", 7200.0, "15:00 UTC", TimeSource.TEXT),))
+    h.outcome(ROOT, PageStatus.UNCHANGED, launch=clues)
+    await h.monitor.run_once()
+    assert auto.observed == [(ROOT, ROOT, clues)]
+    assert h.monitor.next_delay() == 5.0
+    pace.boost(ROOT, AUTO, rounds=True)
+    h.monitor.stats.last_round_seconds = 0.5
+    assert h.monitor.next_delay() == 1.5  # a round every turbo_interval, from its start

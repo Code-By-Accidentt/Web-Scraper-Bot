@@ -48,9 +48,9 @@ log = logging.getLogger(__name__)
 
 DEXSCREENER_API = "https://api.dexscreener.com"
 _MAX_DECIMALS = 36
-_AGE_BLOCKS = 90  # public nodes keep about 100 blocks of EVM state
+_AGE_BLOCKS = 90  # public nodes only keep about 100 blocks of EVM state
 _SIGNATURE_PAGE = 1000  # Solana: one page of a mint's transactions
-_ALSO_ON_MARGIN = 0.1  # seconds "other networks" keeps back to hand in what answered
+_ALSO_ON_MARGIN = 0.1  # "other networks" stops this early (s) to hand in what answered
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +76,7 @@ class TokenInfo:
     coin_type: str | None = None  # Sui: the coin found behind a bare package id
     mint_authority: bool | None = None  # Solana: more can be minted
     freeze_authority: bool | None = None  # Solana: holders' accounts can be frozen
-    risky_extensions: tuple[str, ...] = ()  # Token-2022 extensions that bind holders
+    risky_extensions: tuple[str, ...] = ()  # Token-2022 extensions that work against holders
     deployed_within: float | None = None  # seconds: deployed at most this long ago
     deployed_before: float | None = None  # seconds: deployed longer ago than this
     created_at: float | None = None  # Solana: epoch seconds of the mint's first transaction
@@ -193,7 +193,7 @@ class TokenEnricher:
                 self._bounded(self._chain_details(contract), budget, "chain"),
                 self._bounded(self._market_details(contract), budget, "market"),
                 self._bounded(self._age(contract), budget, "age"),
-                # The networks answering in time are kept; the outer bound is a safety net.
+                # We keep the networks that answer in time. The outer bound is just a safety net.
                 self._bounded(
                     self._also_on(contract, max(budget - _ALSO_ON_MARGIN, 0.1)),
                     budget,

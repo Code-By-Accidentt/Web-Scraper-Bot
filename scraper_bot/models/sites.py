@@ -55,7 +55,7 @@ class SiteState:
     unverified_enabled: bool = False
     # "Chain:address" -> when it was announced as unverified (watched until confirmed)
     unverified: dict[str, float] = field(default_factory=dict)
-    # page -> the captcha widgets the user was told it shows (told once per page and widget)
+    # page -> the captcha widgets we told the user it shows (once per page and widget)
     captcha_pages: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

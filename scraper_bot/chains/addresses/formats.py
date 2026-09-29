@@ -19,7 +19,7 @@ _EVM_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _SUI_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 _SUI_COIN_TYPE_FULL_RE = re.compile(rf"^0x[0-9a-fA-F]{{1,64}}::{MOVE_IDENT}::{MOVE_IDENT}$")
 _HEX_ONLY_RE = re.compile(r"^[0-9a-fA-F]+$")
-# Lower ids are stdlib and system packages (0x1, 0x2, 0xdee9...): their coins are no launch.
+# Lower ids are stdlib and system packages (0x1, 0x2, 0xdee9...). Their coins are never a launch.
 _SUI_RESERVED_PACKAGES = 0x10000
 
 
@@ -99,9 +99,9 @@ def canonical_address(chain: Chain, raw: str) -> Address | None:
         return Address(chain, to_checksum_address(raw)) if is_evm_address(raw) else None
     if chain is Chain.SOLANA:
         if _HEX_ONLY_RE.match(raw):
-            return None  # all-hex text is a slice of some 0x... id, not a base58 key
+            return None  # all hex, so it's a piece of some 0x... id, not a base58 key
         if raw.islower() or raw.isupper():
-            # Base32 (IPFS, Arweave) or a word: a random base58 key is almost never one-case.
+            # Base32 (IPFS, Arweave) or a word. A random base58 key is almost never all one case.
             return None
         return Address(chain, raw) if is_solana_address(raw) else None
     if chain is Chain.SUI:

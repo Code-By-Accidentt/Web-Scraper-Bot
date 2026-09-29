@@ -21,14 +21,14 @@ log = logging.getLogger(__name__)
 _API_BASE = "https://api.telegram.org"
 _NO_PREVIEW = '{"is_disabled": true}'
 _SEND_ATTEMPTS = 3
-_MAX_RETRY_AFTER = 10.0  # seconds; a command reply facing a longer flood wait is dropped
-_UNSENT_RETRY_PAUSE = 2.0  # seconds before resending a request that did not get through
+_MAX_RETRY_AFTER = 10.0  # a command reply facing a flood wait over this many seconds is dropped
+_UNSENT_RETRY_PAUSE = 2.0  # pause before we resend a request that didn't get through (s)
 _PATIENT_MAX_UNSENT_PAUSE = 30.0  # a patient send doubles that pause up to this
-_GIVE_UP_AFTER = 600.0  # seconds of pauses after which a request is given up: a long outage
-_CHAT_INTERVAL = 1.0  # seconds per request to one chat once its burst is used up
-_CHAT_BURST = 5  # requests a chat that was quiet may get at once; Telegram allows short bursts
+_GIVE_UP_AFTER = 600.0  # after this many seconds of waiting it's a long outage, so we give up
+_CHAT_INTERVAL = 1.0  # gap between requests to one chat once its burst is used up (s)
+_CHAT_BURST = 5  # Telegram allows short bursts, so a quiet chat may get this many at once
 _GLOBAL_LIMIT = 30  # requests per second over all chats
-# Transport errors that prove the request never left: sending it again cannot duplicate it.
+# These errors mean the request never left, so sending it again can't make a duplicate.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*>")
 
@@ -51,7 +51,7 @@ class _Policy:
     """Where a request waits in its chat's queue and how it copes with failures."""
 
     lane: int  # served in order: 0 command replies, 1 token alerts and documents, 2 the rest
-    attempts: int  # tries of a request that does not get through; 0: until _GIVE_UP_AFTER
+    attempts: int  # tries if it doesn't get through, 0 means keep going until _GIVE_UP_AFTER
     patient: bool  # a 5xx answer is retried too, and the pause doubles up to 30 s
     quick: bool = False  # a flood wait costs a try too, and one over 10 s drops the request
 
@@ -178,7 +178,7 @@ class TelegramClient:
         self._clock = clock
         self._queues: dict[int, _ChatQueue] = {}
         self._recent: deque[float] = deque(maxlen=_GLOBAL_LIMIT)  # when the latest requests left
-        self.username: str | None = None  # the bot's own @name; None until get_me() answers
+        self.username: str | None = None  # the bot's own @name, None until get_me() answers
 
     async def send_message(self, chat_id: int, text: str, *, patient: bool = False) -> bool:
         """Send ``text``, split into chunks if needed; return True when every chunk went out.
@@ -426,7 +426,7 @@ class TelegramClient:
         finally:
             queue.worker = None
             queue.hold = 0.0
-            for lane in queue.lanes:  # left only when cancelled or the HTTP client closed
+            for lane in queue.lanes:  # leftovers mean we were cancelled or the HTTP client closed
                 while lane:
                     lane.popleft().future.cancel()
 
@@ -561,7 +561,7 @@ class TelegramClient:
                 excess = _units(piece + closing) - limit
                 if excess <= 0 or room <= limit // 4:
                     break
-                # Cut earlier until it fits; never below a quarter, so that the loop ends.
+                # Cut earlier until it fits, but never below a quarter, so the loop always ends.
                 room = max(min(room, cut) - excess, limit // 4)
             chunks.append(piece + closing)
             reopen = "".join(tag for _, tag in still_open)

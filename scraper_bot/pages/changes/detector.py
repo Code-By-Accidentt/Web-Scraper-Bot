@@ -10,11 +10,11 @@ from itertools import accumulate
 
 from scraper_bot.models.pages import ChangeReport, Node, Signature
 
-# A render with fewer than this share of the other render's nodes is a truncated load.
+# If one render has less than this share of the other's nodes, it's a truncated load.
 _MIN_SIZE_RATIO = 0.6
 _NUMBER_RE = re.compile(r"\d[\d.,]*")
-# Steps of SequenceMatcher's inner loop allowed on one part of an alignment: this many per
-# node, at least _MIN_STEPS. Real pages of a few thousand nodes need up to about 100.
+# How many steps SequenceMatcher's inner loop gets on one part of an alignment: this many
+# per node, but at least _MIN_STEPS. Real pages of a few thousand nodes need up to about 100.
 _STEPS_PER_NODE = 128
 _MIN_STEPS = 20_000
 
@@ -116,7 +116,7 @@ class ChangeDetector:
         """
         volatile_new = [node for node in new_block if node in ignore]
         stable_new = [node for node in new_block if node not in ignore]
-        # Indexed so a block of thousands of rows is paired in one pass, not a quadratic search.
+        # Index them so thousands of rows pair up in one pass, not in a quadratic search.
         by_text: dict[tuple[str, str], deque[int]] = defaultdict(deque)
         by_shape: dict[tuple[str, tuple[tuple[str, str], ...], str], deque[int]] = defaultdict(
             deque
@@ -191,7 +191,7 @@ class _Alignment:
         self._b = [ids.setdefault(node, len(ids)) for node in b]
         self._blocks: list[tuple[int, int, int]] = []
         self._unordered: set[tuple[int, int]] = set()
-        # All parts together get four times the steps of the whole.
+        # All the parts together may spend four times the budget of the whole.
         self._steps_left = 4 * _budget(len(a) + len(b))
         todo: list[Part] = [(0, len(a), 0, len(b))]
         while todo:
@@ -293,7 +293,8 @@ class _Alignment:
         a, b = self._a[alo:ahi], self._b[blo:bhi]
         budget = min(self._steps_left, _budget(len(a) + len(b)))
         in_b = Counter(b)
-        # cost[i]: the most steps a search over a[:i] can take (every position of each value).
+        # cost[i] is the most steps a search over a[:i] can take: one per value, plus one for
+        # each place in b where that value shows up.
         cost = list(accumulate((in_b[value] + 1 for value in a), initial=0))
         if 4 * cost[-1] > budget:
             return None
@@ -315,7 +316,8 @@ class _Alignment:
         self._steps_left -= ahi - alo + bhi - blo
         once_a, once_b = _found_once(self._a, alo, ahi), _found_once(self._b, blo, bhi)
         pairs = sorted((i, once_b[value]) for value, i in once_a.items() if value in once_b)
-        # longest[k]: the most pairs in order starting with pairs[k], found from the right.
+        # longest[k] is the most pairs we can take in order starting with pairs[k]. We fill it
+        # in from the right.
         longest = [0] * len(pairs)
         tails: list[int] = []
         for k in range(len(pairs) - 1, -1, -1):

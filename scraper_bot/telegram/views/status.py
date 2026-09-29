@@ -10,10 +10,17 @@ from scraper_bot.chains.rpc.health import FailingEndpoint
 from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.pending.watch import PendingWatch
+from scraper_bot.monitoring.turbo.auto import AutoWindowView
 from scraper_bot.monitoring.turbo.manager import TurboManager
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.telegram.markup import escape
-from scraper_bot.telegram.timefmt import format_clock, format_duration, format_schedule
+from scraper_bot.telegram.timefmt import (
+    format_clock,
+    format_duration,
+    format_moment,
+    format_schedule,
+    format_utc_offset,
+)
 
 
 class BrowserHealth(Protocol):
@@ -91,6 +98,7 @@ class StatusReporter:
                     f"⏰ Turbo {escape(plan.url)}: scheduled at "
                     f"{format_schedule(plan.start_at, now)} for {plan.minutes:.0f} min"
                 )
+            lines += [describe_auto_window(w, now) for w in self._turbo.auto_windows()]
         if self._pending is not None and self._pending.count():
             lines.append(
                 f"⏳ {self._pending.count()} address(es) watched until they become a token"
@@ -130,3 +138,20 @@ class StatusReporter:
                 f"interval x{2**stats.block_level}"
             )
         return text
+
+
+def describe_auto_window(window: AutoWindowView, now: float) -> str:
+    """Return one line about an auto-turbo window: the launch it waits for, and when it runs."""
+    page = escape(window.page_url)
+    if window.timed:
+        what = f"launch at {format_moment(window.target, now)} on {page}"
+    else:
+        what = f"{escape(window.what)} on {page}"
+    until = format_moment(window.end_at, now)
+    if window.active:
+        when = f"on until {until} ({format_duration(window.end_at - now)} left)"
+    else:
+        start, zone = format_moment(window.start_at, now), format_utc_offset(window.start_at)
+        wait = format_duration(window.start_at - now)
+        when = f"from {start} ({zone}, in {wait}) until {until}"
+    return f"⏰ Auto-turbo {escape(window.site_url)}: {what}; {when}"

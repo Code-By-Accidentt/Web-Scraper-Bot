@@ -40,7 +40,7 @@ class Outbox:
         self._path = path
         self._entries: dict[str, OutboxEntry] = {}
         self._left_over: list[OutboxEntry] | None = None  # None until the file was read
-        self._frozen = False  # a damaged file could not be moved aside: never overwrite it
+        self._frozen = False  # a damaged file couldn't be moved aside, so never overwrite it
         # Set by the first read of a damaged file: (what was wrong, where it was moved or None).
         self.broken: tuple[str, Path | None] | None = None
 
@@ -98,7 +98,7 @@ class Outbox:
         if bad:
             self._set_aside(f"{bad} damaged entr{'y' if bad == 1 else 'ies'} left out")
             try:
-                self._save()  # the readable entries, so that a crash now does not lose them
+                self._save()  # save the readable ones, so a crash now doesn't lose them
             except OSError as exc:
                 log.error("outbox %s: could not save the readable entries: %s", self._path, exc)
 

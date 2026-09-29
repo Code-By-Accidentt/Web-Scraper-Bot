@@ -40,14 +40,65 @@ argument answers with its usage line, under the name that was typed (`/mute` ans
 | Command | Effect |
 | --- | --- |
 | `/turbo <url> [minutes] [at HH:MM \| in 10m]` | Render the site's root page and its live sub-pages, `turbo_max_pages` pages in all (root included), every `turbo_interval` seconds and announce every new confirmed token at once. An address that is not a token yet is checked every `turbo_recheck_interval` seconds and announced the moment it is deployed; what a page shows on its first good render and already exists is old news. Stops after `turbo_stop_after` confirmed tokens, the timer, `/turbo stop` or a block. `minutes` defaults to `turbo_default_minutes` and is capped at `turbo_max_minutes`. `at 15:30` / `in 10m` (or `2h`) arm it for later; `at` means the server's clock and time zone, which the reply shows together with the time left. |
-| `/turbo stop <url>` | End a session or cancel a scheduled one. |
-| `/turbo` | Status of running and scheduled sessions. |
+| `/turbo stop <url>` | End a session or cancel a scheduled one, and end the site's auto-turbo window. |
+| `/turbo` | Status of running and scheduled sessions and of the auto-turbo windows. |
 
 Replies: `🚀 Turbo started for …: 4 page(s) every 2s for 30 min.`, `⏰ Turbo for …
 scheduled at 2026-09-23 15:30 (UTC+03:00, in 2h 5m) for 30 min. Cancel with /turbo stop …`, `⏹️ Turbo stopped
 for …`, `🚀 Turbo is already running (or scheduled) for …`, `❌ Turbo limit reached: at
 most 1 site(s) at a time.`, `❌ No turbo session for …`. Sessions do not survive a
 restart.
+
+### Auto-turbo
+
+Nothing to type: when a render shows that a launch is near, the bot speeds the site up
+by itself (`auto_turbo`, on by default). What counts:
+
+- a countdown with launch words next to it (launch, TGE, trading, mint, presale, listing,
+  opens, starts, CA, …): `Launch in 00:05:30`, `2d 03:04:05`, `02 Days 03 Hours 04 Minutes`,
+  `Days 02 Hours 03`, `starts in 5m`. It counts once two renders agree on when it ends and
+  that end is less than a day away, so a static text or a clock never does. A countdown
+  right after "round", "ends", "reset", "reward", "funding", "live now", "ongoing" and the
+  like is left alone (a launch word after that word, as in "Presale live now! Launch in …",
+  lifts it), and so is one that starts over after its end (game rounds);
+- a launch time with its time zone in the next 24 hours: `Sep 30, 15:00 UTC`,
+  `30.09 20:00 UTC+3`, `2026-09-30 15:00 (UTC)`, `2026-09-30T15:00Z`,
+  `Trading opens at 16:00 UTC`. A clock without a date counts only while it is still ahead
+  today, or with "tomorrow" next to it. A time without a zone depends on the reader and is
+  skipped; EST, ET, PST, PT and CET follow their region's daylight saving time (where the
+  machine has time zone data), EDT, PDT, CEST and BST are taken as written;
+- a countdown target in the page's inline scripts (`new Date("…Z")`, `Date.UTC(…)`, a unix
+  or ISO time under a name like `launchTime`, `countdownDate`, `startDate`) or in an
+  element attribute (`data-countdown-at="…Z"`);
+- a phrase that appears on a page which has not shown it for a day: `CA: soon` / `TBA`,
+  `contract address coming`, `launching today` / `now`, `presale is live`,
+  `trading is open`. A phrase the page shows from its first render starts nothing, but
+  counts as a launch word for a countdown; one that only turns up because the render
+  before was still loading does not count either. The page title is not read.
+
+From `auto_turbo_before_minutes` (10) before the launch time to `auto_turbo_after_minutes`
+(60) after it, or until the site's first token (`turbo_stop_after`), a round of the site
+starts every `turbo_interval` (2 s) instead of every 4-10 s, its light mode polls every
+`light_turbo_interval` (0.3 s) and its addresses that are not a token yet are checked every
+`turbo_recheck_interval` (1 s). No second render loop is started. A site has one window at
+a time; an earlier launch time takes over a window that has not begun yet. A launch time
+that moves moves the window (one more `⏰` message). After a window ended or was stopped,
+the same launch time (within a minute), the same text showing the same clock the next day
+and the same phrase on the same page plan no window for a day; a launch time that moved
+since, or a countdown to the next sale, gets a new window. At most
+`auto_turbo_max_sites` (3) sites have a window at once; one more gets a message only.
+
+Messages: `⏰ https://x.io shows a countdown “Launch in 00:05:30”: launch at 15:00:12
+(UTC+00:00, in 5m 30s). Auto-turbo for https://x.io: checking faster now until 16:00:12, or
+until its first token. Cancel with /turbo stop https://x.io`; when the page moves the time:
+`⏰ The launch time for https://x.io changed from 15:00 to 16:00 (UTC+00:00, in 1h 5m):
+https://x.io shows a launch time “Trading opens at 16:00 UTC”.`; and at the end,
+`🎯 Auto-turbo finished on https://x.io: found 1 confirmed contract(s) / the window is over
+/ stopped manually. Checked faster for 12m 30s, 1 confirmed contract(s).` A window stopped
+before it began ends without a summary. `/turbo` and `/status` show each window as
+`⏰ Auto-turbo https://x.io: launch at 15:00 on https://x.io/presale; from … until …` (or
+`on until … (… left)` while it runs). Windows do not survive a restart; the page plans them
+again.
 
 ## Unverified mode
 
@@ -78,20 +129,21 @@ The full list of live keys is in [configuration.md](configuration.md).
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Version and uptime, browser state, sites with their last round (duration, pages rendered, rounds), last change, what the light mode polls (`light: 2 page(s) and 1 API(s) every 1 s, 1 rendered every 30 s`, and `through the browser` for a site that refuses plain requests), pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
+| `/status` | Version and uptime, browser state, sites with their last round (duration, pages rendered, rounds), last change, what the light mode polls (`light: 2 page(s) and 1 API(s) every 1 s, 1 rendered every 30 s`, and `through the browser` for a site that refuses plain requests), pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions and auto-turbo windows, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
 | `/help` | The command list. |
 | `/start` | Your chat id (needed for `TELEGRAM_CHAT_IDS`) plus the command list. |
 
 Example `/status`:
 
 ```text
-🤖 scraper-bot 2.2.0, up 3h 12m
+🤖 scraper-bot 2.3.0, up 3h 12m
 Browser: connected
 ⚠️ RPC not answering: Fantom for 2m 10s
 Sites: 2 total, 2 running, 0 paused
 • https://app.flutch.fun: last round 4s ago (2.0s, 4 page(s), 1187 rounds); last change 2026-09-23 12:01; light: 4 page(s) and 1 API(s) every 1 s
 • https://docs.example.io: last round 6s ago (1.3s, 1 page(s), 1190 rounds); 🐢 1 page(s) timing out
 🚀 Turbo https://app.flutch.fun: 41 cycles, 0 confirmed, 2 pending, 28m 40s left
+⏰ Auto-turbo https://docs.example.io: countdown “Launch in 02:10:00”; from 2026-09-30 14:50 (UTC+00:00, in 2h) until 16:00
 ⏳ 3 address(es) watched until they become a token
 Address cache: 14 known contract(s), 231 rejected
 ```

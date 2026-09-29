@@ -8,12 +8,12 @@ so a token alert need not wait for the network to go quiet.
 from __future__ import annotations
 
 EARLY_BINDING = "__textSeen"  # the page calls this to hand a piece of text to Python
-EARLY_ITEMS = 400  # pieces one document may report; the rest waits for the full read
+EARLY_ITEMS = 400  # pieces one document may report (the rest waits for the full read)
 EARLY_CHARS = 4000  # characters of one text or attribute value handed over
 BEFORE_CHARS = 100  # characters of the text in front of a text node
 
-# Only the top document reports (frames are page source, read only by deep scan). Texts of
-# scripts and styles are skipped; the full read finds addresses there.
+# Only the top document reports. Frames count as page source, and only deep scan reads
+# them. We skip the text of scripts and styles, since the full read finds addresses there.
 OBSERVER_JS = f"""
 (() => {{
   if (window.top !== window) return;

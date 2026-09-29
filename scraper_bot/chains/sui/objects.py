@@ -18,7 +18,7 @@ MAX_COIN_CANDIDATES = 128  # structs per package tried as coin types
 
 async def object_kind(client: JsonRpcClient, address: str) -> str:
     """Return "package", "object" or "missing" for a Sui id (wallets and unknown ids: missing)."""
-    # With showType a package answers type "package", a Move object its struct type (mainnet).
+    # With showType a package reports type "package", and a Move object its struct type (mainnet).
     result = await client.call("sui_getObject", [address, {"showType": True}])
     data = result.get("data") if isinstance(result, dict) else None
     if isinstance(data, dict):
@@ -55,7 +55,7 @@ async def coin_type_candidates(client: JsonRpcClient, package: str) -> list[str]
         structs = module.get("structs") if isinstance(module, dict) else None
         if isinstance(structs, dict):
             pairs.extend((str(module_name), str(struct)) for struct in structs)
-    # By convention a coin's witness struct is the module name in upper case.
+    # By convention a coin's witness struct is its module name in upper case, so those go first.
     pairs.sort(key=lambda pair: pair[1].upper() != pair[0].upper())
     return [f"{package}::{module}::{struct}" for module, struct in pairs[:MAX_COIN_CANDIDATES]]
 

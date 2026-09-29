@@ -40,13 +40,13 @@ COVERAGE = 0.8  # share of a render's texts its HTML must carry for the page to 
 APIS_PER_PAGE = 2
 APIS_PER_SITE = 6
 _MIN_TEXTS = 10  # a render with fewer texts is too small to judge
-_API_TRIES = 30  # API URLs of a site tried; later ones are left alone
+_API_TRIES = 30  # most API URLs we try on one site (later ones are left alone)
 _FAILURES = 3  # failed polls in a row before a page rests or an API is dropped
-_RENDER_EVERY = 10.0  # seconds between two renders a page's new scripts may ask for
-_SCRIPT_FLIPS = 3  # script lists changed in a row that mean "changes per request", not a deploy
+_RENDER_EVERY = 10.0  # new scripts on a page may ask for a render at most this often (s)
+_SCRIPT_FLIPS = 3  # more changes in a row than this mean scripts change per request, not a deploy
 _REFUSED_REST = 60.0  # seconds the light mode rests after the browser was refused as well
-_THREAD_FROM = 100_000  # characters of HTML above which the address search runs in a thread
-_JUDGE_EVERY = 30.0  # seconds between judgings a changed HTML alone may cause
+_THREAD_FROM = 100_000  # a text longer than this (chars) gets its address search in a thread
+_JUDGE_EVERY = 30.0  # a changed HTML alone may trigger a new judging at most this often (s)
 _TAG_RE = re.compile(r"<(script|link)\b([^>]{0,2000})>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"\b(src|href|rel)\s*=\s*[\"']?([^\"'\s>]{1,1000})", re.IGNORECASE)
 _HINTED_KEY_RE = re.compile(
@@ -71,6 +71,7 @@ class _Page:
     asked_render_at: float = float("-inf")
     rendered: Signature | None = None  # its last render that read the page
     ticking: bool = False
+    countdowns: dict[str, float] = field(default_factory=dict)  # launch countdown -> time left
     polls: bool = False  # it calls one of its APIs again and again
     covered: bool = False
     judge: bool = False  # its coverage needs judging again
@@ -187,7 +188,14 @@ class LightPoller:
         if page is None:
             page = self._pages[outcome.url] = _Page(outcome.url, _origin_of(outcome.url))
         page.rendered = outcome.signature
-        page.ticking = outcome.ticking
+        # A launch countdown ticks too. A new one counts as ticking until the next render
+        # shows it standing still.
+        countdowns = (
+            {c.key: c.remaining for c in outcome.launch.countdowns} if outcome.launch else {}
+        )
+        moving = any(page.countdowns.get(key) != left for key, left in countdowns.items())
+        page.countdowns = countdowns
+        page.ticking = outcome.ticking or moving
         calls = Counter(_api_key(url) for url in outcome.api_calls)
         page.polls = any(count > 1 for count in calls.values())
         page.judge = True
@@ -294,7 +302,7 @@ class LightPoller:
             await self._read(page, started)
             return
         page.digest, page.html = digest, html
-        # A new render is judged at once; a changed HTML at most every _JUDGE_EVERY seconds.
+        # Judge a new render right away, but a changed HTML at most every _JUDGE_EVERY seconds.
         if page.rendered is not None and self._clock() - page.judged_at >= _JUDGE_EVERY:
             page.judge = True
         self._check_scripts(page, html)

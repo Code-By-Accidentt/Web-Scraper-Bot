@@ -22,7 +22,7 @@ from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)
 
-STOP_WAIT = 10.0  # seconds /remove, /pause and a shutdown wait for a cancelled monitor to end
+STOP_WAIT = 10.0  # how long /remove, /pause and shutdown wait for a cancelled monitor to end (s)
 
 MonitorFactory = Callable[[SiteState, PersistCallback, AutoPauseCallback], SiteMonitor]
 
@@ -88,7 +88,7 @@ class MonitorManager:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._restart_timers: set[asyncio.TimerHandle] = set()
         self._closing = False
-        # state.json is damaged and could not be set aside: saving would overwrite it.
+        # True when state.json is damaged and couldn't be moved aside, so we mustn't save over it.
         self._frozen = False
 
     async def start(self) -> None:
@@ -99,7 +99,7 @@ class MonitorManager:
         """
         self._sites = self._state_store.load()
         broken = self._state_store.broken
-        # A damaged copy may still be repaired: keep its snapshots, import no version-1 files.
+        # A damaged copy may still be fixed, so keep its snapshots and skip the version-1 import.
         repairing = bool(self._state_store.broken_copies())
         if broken is not None:
             problem, moved_to = broken
@@ -108,7 +108,7 @@ class MonitorManager:
                 where = "It could not be moved aside, so the bot does not save the site list."
             else:
                 where = f"The damaged file was moved to: {moved_to}"
-                self.persist()  # the readable sites, so that the next start has them too
+                self.persist()  # save the sites we could read, so the next start has them too
             if self._notifier is not None:
                 self._notifier.report_later(
                     "state",
@@ -328,7 +328,7 @@ class MonitorManager:
         except InvalidUrlError as exc:
             raise SiteNotTracked(raw_url) from exc
         if url not in self._sites and "#" in url:
-            # Before 2.1.1 "/add app.io/#/presale" stored app.io: match that key too.
+            # Before 2.1.1, "/add app.io/#/presale" stored app.io, so match that key too.
             parts = urlsplit(url)
             path = parts.path if parts.path not in {"", "/"} else ""
             url = urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
@@ -358,7 +358,7 @@ class MonitorManager:
             monitor.request_stop()
         if task is not None and not task.done():
             task.cancel()
-            # asyncio.wait, not `await task`: suppressing its CancelledError would hide ours too.
+            # No `await task` here, since suppressing its CancelledError would hide ours too.
             done, _ = await asyncio.wait({task}, timeout=STOP_WAIT)
             if not done:
                 log.warning("monitor for %s did not stop within %.0fs; moving on", url, STOP_WAIT)

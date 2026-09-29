@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from scraper_bot.monitoring.rounds import live_pages
+from scraper_bot.monitoring.turbo.auto import AutoTurbo, AutoWindowView
 from scraper_bot.monitoring.turbo.session import LimitsSource, TurboLimits, TurboSession, TurboStats
 from scraper_bot.pages.fetching.prober import HttpProber
 from scraper_bot.pages.urls import SubUrlDeriver, normalize_url
@@ -32,7 +33,7 @@ class TurboAlreadyRunning(TurboError):
 
 
 class TurboNotRunning(TurboError):
-    """No turbo session runs for this site, or its launch was called off."""
+    """No turbo session or auto-turbo window runs for this site, or its launch was called off."""
 
 
 class TurboLimitReached(TurboError):
@@ -57,7 +58,10 @@ SessionFactory = Callable[[str, list[str], float, LimitsSource], TurboSession]
 
 
 class TurboManager:
-    """Starts, schedules, lists and stops turbo sessions within the configured limits."""
+    """Starts, schedules, lists and stops turbo sessions within the configured limits.
+
+    /turbo stop and the listings cover the auto-turbo windows too, when ``auto`` is given.
+    """
 
     def __init__(
         self,
@@ -69,6 +73,7 @@ class TurboManager:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         notifier: Notifier | None = None,
+        auto: AutoTurbo | None = None,
     ) -> None:
         """Set up the manager; ``session_factory`` builds each session when it starts."""
         self._tuning = tuning
@@ -78,6 +83,7 @@ class TurboManager:
         self._clock = clock
         self._sleep = sleep
         self._notifier = notifier
+        self._auto = auto
         self._sessions: dict[str, TurboSession] = {}
         self._tasks: dict[str, asyncio.Task[TurboStats]] = {}
         self._scheduled: dict[str, tuple[ScheduledTurbo, asyncio.Task[None]]] = {}
@@ -110,6 +116,10 @@ class TurboManager:
         """Return the sessions planned for later."""
         return [plan for plan, _ in self._scheduled.values()]
 
+    def auto_windows(self) -> list[AutoWindowView]:
+        """Return the auto-turbo windows waiting or running."""
+        return self._auto.windows() if self._auto is not None else []
+
     async def start(
         self, raw_url: str, minutes: float | None = None, start_at: float | None = None
     ) -> TurboSession | ScheduledTurbo:
@@ -136,21 +146,24 @@ class TurboManager:
         return await self._launch(url, minutes * 60)
 
     async def stop(self, raw_url: str) -> str:
-        """Stop the site's session, plan or launch and return the site key.
+        """Stop the site's session, plan or launch and its auto-turbo window; return the site key.
 
         A running session gets up to 15 seconds to finish; raises TurboNotRunning when there
         is nothing to stop.
         """
         url = normalize_url(raw_url)
+        auto_stopped = self._auto is not None and await self._auto.stop(url)
         scheduled = self._scheduled.pop(url, None)
         if scheduled is not None:
             scheduled[1].cancel()
             return url
         if url in self._launching:
-            self._called_off.add(url)  # still probing its sub-pages: it will not start
+            self._called_off.add(url)  # still probing its sub-pages, so it won't start
             return url
         session, task = self._sessions.get(url), self._tasks.get(url)
         if session is None or task is None or task.done():
+            if auto_stopped:
+                return url
             raise TurboNotRunning(url)
         session.request_stop()
         # asyncio.wait ignores the session's own outcome but lets our cancellation through.
@@ -158,8 +171,10 @@ class TurboManager:
         return url
 
     async def shutdown(self) -> None:
-        """Cancel every session and plan, wait for them to end, and start nothing more."""
+        """Cancel every session, plan and auto-turbo window, wait for them, start nothing more."""
         self._closing = True
+        if self._auto is not None:
+            await self._auto.shutdown()
         tasks = [task for _, task in self._scheduled.values()] + list(self._tasks.values())
         for task in tasks:
             task.cancel()

@@ -40,10 +40,10 @@ class EvmChain:
     and the pending watch keeps asking it about addresses that have no code yet.
     """
 
-    name: str  # shown to users; the key of every per-network table
+    name: str  # shown to users, and the key of every per-network table
     env_var: str  # the .env key of its RPC URL
     default_rpc: str
-    chain_id: int  # what eth_chainId must answer; checked at start
+    chain_id: int  # what eth_chainId must answer (we check it at startup)
     links: NetworkLinks
     optional: bool = False
 
@@ -142,8 +142,8 @@ EVM_CHAINS: tuple[EvmChain, ...] = (
             _uniswap("avalanche"),
         ),
     ),
-    # Circle's chain, USDC is its gas; flutch.fun launches here.
-    # Not the official rpc.mainnet.arc.io: it answered 403 to calls without a key.
+    # Circle's chain, where gas is paid in USDC. flutch.fun launches here.
+    # Not the official rpc.mainnet.arc.io, which answered 403 to calls without a key.
     EvmChain(
         "Arc",
         "ARC_RPC_URL",
@@ -152,7 +152,7 @@ EVM_CHAINS: tuple[EvmChain, ...] = (
         NetworkLinks("Arc Explorer", "https://explorer.arc.io/token/{address}", "arc"),
         optional=True,
     ),
-    # Robinhood's Arbitrum Orbit L2; pons.family and bag.fun launch here.
+    # Robinhood's Arbitrum Orbit L2. pons.family and bag.fun launch here.
     EvmChain(
         "Robinhood Chain",
         "ROBINHOOD_RPC_URL",

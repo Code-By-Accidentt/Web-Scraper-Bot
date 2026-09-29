@@ -50,7 +50,7 @@ def is_mint(owner: Any, data: bytes) -> bool:
     if owner == TOKEN_PROGRAM:
         return len(data) == MINT_SIZE
     if owner == TOKEN_2022_PROGRAM:
-        # Bare 82 bytes, or padded to 165 with the account-type byte there, then extensions.
+        # Either the bare 82 bytes, or padded to 165, then the account-type byte and extensions.
         return len(data) == MINT_SIZE or (
             len(data) > TOKEN_ACCOUNT_SIZE and data[TOKEN_ACCOUNT_SIZE] == TOKEN_2022_MINT_TYPE
         )
@@ -194,7 +194,7 @@ def parse_risky_extensions(data: bytes) -> tuple[str, ...]:
     found: list[str] = []
     for kind, body in token2022_extensions(data):
         if kind == _TRANSFER_FEE_CONFIG and len(body) >= 108:
-            # bps of the older and the newer fee schedule; either one taking a cut is a tax
+            # bps of the older and the newer fee schedule. If either one takes a cut, it's a tax.
             bps = max(
                 int.from_bytes(body[88:90], "little"), int.from_bytes(body[106:108], "little")
             )

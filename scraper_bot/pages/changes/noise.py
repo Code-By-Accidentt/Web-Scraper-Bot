@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from scraper_bot.models.pages import ChangeReport, Node, NoiseEntry, NoiseMemory, Signature
 from scraper_bot.pages.changes.detector import shape
 
-_WHOLESALE_FROM = 20  # nodes a page needs before a report can swap out most of it
+_WHOLESALE_FROM = 20  # nodes a page needs before losing most of them counts as one swap
 _WHOLESALE_KEY = "page|wholesale"
 
 
@@ -55,7 +55,7 @@ class NoiseFilter:
             key: entry for key, entry in memory.items() if now - entry.last_seen < self._window
         }
         if len(before) >= _WHOLESALE_FROM and len(report.removed) > len(before) // 2:
-            # Counted per page, not per element, or one redesign would silence every element.
+            # We count this per page, not per element, or one redesign would mute every element.
             entry = updated.get(_WHOLESALE_KEY)
             count = entry.count if entry else 0
             updated[_WHOLESALE_KEY] = NoiseEntry(count + 1, now)

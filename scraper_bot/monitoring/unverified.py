@@ -21,7 +21,7 @@ from scraper_bot.telegram.notifier import Notifier
 
 log = logging.getLogger(__name__)
 
-_MEMORY = 7 * 86_400  # seconds an announced address is remembered, so it is not announced twice
+_MEMORY = 7 * 86_400  # how long we remember an announced address, so it isn't announced twice (s)
 _MAX_ENTRIES = 1000
 _DIGEST_PERIOD = 3600.0
 
@@ -116,7 +116,7 @@ class UnverifiedWatcher:
             key = address_key(result.address)
             self._last_check[key] = now
             if result.status is ValidationStatus.CONFIRMED and result.contract is not None:
-                # The pending watch may have confirmed it in the same instant: one alert only.
+                # The pending watch may confirm it at the same moment, so only one of us alerts.
                 if self._registry.claim(result.contract):
                     await self._notifier.address_confirmed(
                         result.contract, self._pages.get(key, self._site.url)

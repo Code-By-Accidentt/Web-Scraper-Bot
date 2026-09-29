@@ -19,6 +19,7 @@ from scraper_bot.pages.changes.volatile import VolatileShapes
 from scraper_bot.pages.early import EarlyReader
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
+from scraper_bot.pages.launch import read_launch
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
 from scraper_bot.settings.live import Tuning
 from scraper_bot.storage.snapshots import SnapshotStore
@@ -28,7 +29,7 @@ log = logging.getLogger(__name__)
 Observer = Callable[[Observation], Awaitable[None]]
 
 # A round whose renders keep less than this share of the stored snapshot's nodes (a loading
-# skeleton, a half-loaded list) is skipped; the third such round in a row is a real change.
+# skeleton, a half-loaded list) gets skipped. The third such round in a row is a real change.
 _SMALL_RENDER = 0.6
 _SMALL_ROUNDS = 3
 
@@ -132,14 +133,14 @@ class PageChecker:
             recording = deep_seen is None and bool(first.extra_texts)
             sightings, deep_seen = _without_old_deep(found, deep_seen, recording=recording)
         else:
-            # A 2xx "challenge" may be the real page with an unlucky title: read what it shows.
+            # A 2xx "challenge" may be a real page with an unlucky title, so read what it shows.
             sightings = tuple(shown_on_a_challenge(found))
         if recording and snapshot is not None:
-            # Stored before deep scan was on: remember its script addresses from now on.
+            # Saved before deep scan was on, so start remembering its script addresses now.
             snapshot.deep_seen = deep_seen
             self._snapshots.save(page_url, snapshot)
         results = await self._validate(sightings)
-        # A challenge or a blank render did not show the page: no appearance window opens.
+        # A challenge or a blank render didn't show the page, so no appearance window opens.
         read = block is None and bool(current)
         await self._observe(
             on_observation, Observation(page_url, seen_at, sightings, results, started, read)
@@ -162,6 +163,9 @@ class PageChecker:
                 error="empty page",
                 candidates=candidates,
             )
+        launch = None
+        if self._tuning.auto_turbo:
+            launch = await asyncio.to_thread(read_launch, first.html, seen_at)
         if snapshot is None:
             self._snapshots.save(page_url, Snapshot(current, deep_seen=deep_seen))
             return PageCheckOutcome(
@@ -171,6 +175,7 @@ class PageChecker:
                 captcha=captcha,
                 signature=current,
                 api_calls=first.api_calls,
+                launch=launch,
             )
         if not self._detector.differs(snapshot.signature, current) or await self._only_ticking(
             snapshot, current
@@ -184,6 +189,7 @@ class PageChecker:
                 signature=current,
                 api_calls=first.api_calls,
                 ticking=bool(snapshot.volatile),
+                launch=launch,
             )
 
         await self._sleep(self._tuning.confirm_delay)
@@ -242,6 +248,7 @@ class PageChecker:
                 error=reason,
                 candidates=candidates,
                 captcha=captcha,
+                launch=launch,
             )
         if self._small_round(page_url, snapshot.signature, confirmed):
             stored = len(snapshot.signature)
@@ -252,8 +259,9 @@ class PageChecker:
                 error=reason,
                 candidates=candidates,
                 captcha=captcha,
+                launch=launch,
             )
-        # The diffs can take seconds of CPU on big pages; a thread keeps the event loop free.
+        # The diffs can take seconds of CPU on big pages, so a thread keeps the event loop free.
         volatile = await asyncio.to_thread(self._detector.volatile_nodes, current, confirmed)
         report, accepted = await asyncio.to_thread(
             self._detector.diff, snapshot.signature, confirmed, page_url, ignore=volatile
@@ -282,6 +290,7 @@ class PageChecker:
             signature=current,
             api_calls=first.api_calls,
             ticking=bool(ticking) or bool(volatile),
+            launch=launch,
         )
 
     async def _only_ticking(self, snapshot: Snapshot, render: Signature) -> bool:

@@ -84,7 +84,7 @@ class Settings:
     settle_delay: float
     render_failure_threshold: int
     confirm_delay: float
-    light_interval: float  # seconds between light polls; 0 = the light mode is off
+    light_interval: float  # seconds between light polls, 0 turns the light mode off
     light_turbo_interval: float
     render_interval: float  # seconds between renders of pages the light mode covers
     contract_pause_threshold: int
@@ -107,6 +107,11 @@ class Settings:
     turbo_recheck_interval: float
     block_max_backoff: float
 
+    auto_turbo: bool  # speed a site up around a launch time one of its pages shows
+    auto_turbo_before: float  # seconds before that time the faster checks start
+    auto_turbo_after: float  # seconds after it they end, unless a token ends them first
+    auto_turbo_max_sites: int
+
     unverified_recheck: float
     unverified_watch: float
     unverified_max_per_hour: int
@@ -115,7 +120,7 @@ class Settings:
     headless: bool
     blocked_resource_types: tuple[str, ...]
     browser_args: tuple[str, ...]
-    hide_automation: bool  # no "Headless" User-Agent or webdriver flag; cookies kept
+    hide_automation: bool  # no "Headless" User-Agent or webdriver flag, cookies outlive restarts
 
     http2: bool  # RPC and Telegram over HTTP/2, so parallel calls share one warm connection
     evm_networks: tuple[EvmNetwork, ...]
@@ -213,6 +218,10 @@ class Settings:
             turbo_max_pages=reader.integer("TURBO_MAX_PAGES", 4, minimum=1),
             turbo_recheck_interval=reader.number("TURBO_RECHECK_INTERVAL", 1.0, minimum=1.0),
             block_max_backoff=reader.number("BLOCK_MAX_BACKOFF", 600.0, minimum=1.0),
+            auto_turbo=reader.flag("AUTO_TURBO", True),
+            auto_turbo_before=reader.number("AUTO_TURBO_BEFORE_MINUTES", 10.0, minimum=0.0) * 60,
+            auto_turbo_after=reader.number("AUTO_TURBO_AFTER_MINUTES", 60.0, minimum=1.0) * 60,
+            auto_turbo_max_sites=reader.integer("AUTO_TURBO_MAX_SITES", 3, minimum=1),
             unverified_recheck=reader.number("UNVERIFIED_RECHECK_MINUTES", 5.0, minimum=1.0) * 60,
             unverified_watch=reader.number("UNVERIFIED_WATCH_HOURS", 24.0, minimum=1.0) * 3600,
             unverified_max_per_hour=reader.integer("UNVERIFIED_MAX_PER_HOUR", 10, minimum=1),

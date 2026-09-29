@@ -19,10 +19,12 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
 from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pace import TURBO, SitePace
 from scraper_bot.monitoring.pending import watch as pending_module
 from scraper_bot.monitoring.pending.entry import PendingEntry, check_interval
 from scraper_bot.monitoring.pending.old_news import QUIET
 from scraper_bot.monitoring.pending.watch import PendingWatch
+from scraper_bot.monitoring.tokens import SiteTokens
 from tests.conftest import FakeNotifier, FakeValidator, make_settings
 
 SITE = "https://launch.io"
@@ -87,6 +89,8 @@ class Harness:
         self.turbo_interval = 1.0
         self.told: list[Address] = []
         self.paused_sites: set[str] = set()
+        self.pace = SitePace()
+        self.tokens = SiteTokens()
         self.path = tmp_path / "pending.json"
         self.watch = self.build(paused=paused)
 
@@ -102,7 +106,21 @@ class Harness:
             is_paused=lambda site: paused or site in self.paused_sites,
             clock=lambda: self.now,
             retry=NO_RETRY,
+            pace=self.pace,
+            tokens=self.tokens,
         )
+
+    def start_turbo(self, site: str) -> None:
+        """Speed ``site`` up as a turbo session does, and note the tokens it hears of."""
+        self.pace.boost(site, TURBO)
+        self.tokens.subscribe(site, self.heard)
+
+    def stop_turbo(self, site: str) -> None:
+        self.pace.release(site, TURBO)
+        self.tokens.unsubscribe(site, self.heard)
+
+    def heard(self, contract: ConfirmedContract) -> None:
+        self.told.append(contract.address)
 
     async def tick(self, seconds: float = 1.0) -> None:
         self.now += seconds
@@ -232,14 +250,14 @@ async def test_unhinted_addresses_are_checked_slowly_hinted_ones_every_second(h)
 
 
 async def test_a_turbo_site_is_checked_at_the_turbo_pace_and_told_about_its_tokens(h) -> None:
-    h.watch.start_turbo(SITE, h.told.append)
+    h.start_turbo(SITE)
     h.watch.offer(SITE, PAGE, text(EVM, "x", False), rejected(EVM, AddressKind.NO_CODE))
     await h.tick(0)
     h.chains.code[EVM.value.lower()] = "0x6080"
     h.validator.confirm(EVM, "Base")
     await h.tick(1)  # slow by its words, but the site is in turbo: checked after 1 s
     assert h.told == [EVM]
-    h.watch.stop_turbo(SITE, h.told.append)
+    h.stop_turbo(SITE)
     h.validator.known(OTHER)
     h.watch.offer(SITE, PAGE, text(OTHER), rejected(OTHER, AddressKind.NO_CODE))
     h.chains.code[OTHER.value.lower()] = "0x6080"
@@ -420,7 +438,7 @@ async def test_a_cached_lp_pair_is_never_watched(h) -> None:
 
 
 async def test_an_old_token_behind_a_new_pair_is_not_news_for_turbo(h) -> None:
-    h.watch.start_turbo(SITE, h.told.append)
+    h.start_turbo(SITE)
     h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
     await h.tick(0)
     h.chains.code[EVM.value.lower()] = "0x6080"
@@ -439,7 +457,7 @@ async def test_an_address_shown_by_two_sites_is_checked_while_either_is_active(h
     assert h.chains.requests == []  # its only site is paused
     assert not h.watch.offer(other_site, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
     assert h.watch.count(other_site) == 1
-    h.watch.start_turbo(other_site, h.told.append)
+    h.start_turbo(other_site)
     h.chains.code[EVM.value.lower()] = "0x6080"
     h.validator.confirm(EVM, "Base")
     await h.tick(1)
@@ -451,17 +469,18 @@ async def test_an_address_shown_by_two_sites_is_checked_while_either_is_active(h
 
 async def test_turbo_on_a_paused_site_still_checks_its_addresses(h) -> None:
     h.paused_sites.add(SITE)
-    h.watch.start_turbo(SITE, h.told.append)
+    h.start_turbo(SITE)
     h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
     await h.tick(0)
     assert h.chains.requests
 
 
-async def test_a_token_the_monitor_announced_reaches_the_turbo_session(h) -> None:
-    h.watch.start_turbo(SITE, h.told.append)
+async def test_a_token_the_monitor_announced_leaves_the_watch(h) -> None:
+    other_site = "https://other.io"
     h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
-    h.watch.announced(SITE, EVM)
-    assert h.told == [EVM] and h.watch.count() == 0
+    h.watch.offer(other_site, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    assert h.watch.announced(SITE, EVM) == {other_site}  # its turbo hears of it too
+    assert h.watch.count() == 0
 
 
 async def test_a_restart_keeps_what_was_seen_absent(h) -> None:
@@ -557,7 +576,7 @@ class PairValidator(FakeValidator):
 async def test_an_old_token_behind_a_deployed_pair_is_nobodys_news(h) -> None:
     h.validator = PairValidator(OTHER, ValidationStatus.ALREADY_KNOWN)
     h.watch = h.build()
-    h.watch.start_turbo(SITE, h.told.append)
+    h.start_turbo(SITE)
     h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
     await h.tick(0)
     h.chains.code[EVM.value.lower()] = "0x6080"
@@ -580,7 +599,7 @@ async def test_starting_turbo_checks_the_sites_addresses_at_once(h) -> None:
     h.watch.offer(SITE, PAGE, text(EVM, "", False), rejected(EVM, AddressKind.NO_CODE))
     await h.tick(0)
     assert h.watch._entries[EVM].next_check == h.now + 30  # slow: every 30 s
-    h.watch.start_turbo(SITE, h.told.append)
+    h.start_turbo(SITE)
     assert h.watch._entries[EVM].next_check <= h.now
 
 

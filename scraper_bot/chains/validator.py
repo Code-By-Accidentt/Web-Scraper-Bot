@@ -29,9 +29,9 @@ log = logging.getLogger(__name__)
 
 
 _MAX_PAIRS = 10_000  # LP pairs remembered with the tokens they hold
-_PROBLEM_AFTER = 300.0  # seconds an endpoint must fail before the user hears about it
-_MAX_PARTIAL = 20_000  # entries kept in _partial, and in _retry_after
-# A limit of their own, so new addresses never queue behind re-checks of partial rejections.
+_PROBLEM_AFTER = 300.0  # how long an endpoint must fail before the user hears about it (s)
+_MAX_PARTIAL = 20_000  # max entries in _partial, and the same cap for _retry_after
+# Re-checks of partial rejections get their own limit, so new addresses never wait behind them.
 _RECHECKS_AT_ONCE = 2
 
 
@@ -78,11 +78,11 @@ class ContractValidator:
         self._retry_delay = retry_delay
         self._clock = clock
         self._on_stuck = on_stuck
-        self._reported: set[str] = set()  # endpoints whose current outage was reported
+        self._reported: set[str] = set()  # endpoints whose current outage we already reported
         self._retry_after: dict[Address, float] = {}
-        # Rejected without an optional network's answer: that network alone is asked again.
+        # Rejected without an optional network's answer. Only that network gets asked again.
         self._partial: dict[Address, _Partial] = {}
-        # Called with (address, network) when an optional network finds a token late.
+        # Called with (address, network) when an optional network finds a token or pair late.
         self.on_late_token: Callable[[Address, str], None] | None = None
         evm.on_late = self._late_answer
         self._inflight: dict[
@@ -181,7 +181,7 @@ class ContractValidator:
             return ValidationResult(address, ValidationStatus.ALREADY_KNOWN)
         pair = self._pairs.get(address)
         if pair is not None:
-            # The pair itself is cached as rejected; its tokens still need a verdict.
+            # We already know this pair. It's rejected, but its tokens still need a verdict.
             return ValidationResult(
                 address, ValidationStatus.ALREADY_REJECTED, kind=AddressKind.PAIR, resolved=pair
             )
@@ -201,11 +201,11 @@ class ContractValidator:
                     return ValidationResult(
                         address, ValidationStatus.ALREADY_REJECTED, kind=partial.kind
                     )
-                # An optional network found a token here late: the lookup below returns it.
+                # An optional network found a token or pair here late. The lookup below returns it.
                 del self._partial[address]
 
-        # Share only checks of the same kind: an urgent one must not queue behind a regular
-        # one, and a check must not get a verdict from fewer networks than it asked.
+        # Only merge checks of the same kind: an urgent one shouldn't wait behind a regular
+        # one, and a check shouldn't get a verdict from fewer networks than it asked.
         key = (address, None if networks is None else frozenset(networks), urgent)
         task = self._inflight.get(key)
         if task is None:
@@ -214,7 +214,7 @@ class ContractValidator:
             )
             self._inflight[key] = task
             task.add_done_callback(lambda _: self._inflight.pop(key, None))
-        # shield: a cancelled caller must not cancel the check other callers wait for
+        # shield() so one cancelled caller doesn't cancel the check the others are waiting on
         return await asyncio.shield(task)
 
     async def _validate_uncached(
@@ -233,7 +233,7 @@ class ContractValidator:
             try:
                 verdict = await self._lookup(address, networks)
             except RpcUnavailable as exc:
-                # Routine per address (the validators log the endpoint failure), so INFO.
+                # Happens for every address (the validators log the endpoint failure), so INFO.
                 log.info(
                     "%s %s: %s; retry in %.0fs",
                     address.chain.value,
@@ -245,7 +245,7 @@ class ContractValidator:
                     self._retry_later(address)
                 self._report_stuck_endpoints()
                 return ValidationResult(address, ValidationStatus.UNAVAILABLE)
-        # An optional network may have failed without holding up this verdict.
+        # We got a verdict, but an optional network may still have failed on the way.
         self._report_stuck_endpoints()
         chain = address.chain.value
         self._partial.pop(address, None)
@@ -276,11 +276,11 @@ class ContractValidator:
             )
         else:
             log.info("%s %s is not a token (%s)%s", chain, address, verdict.kind.value, unanswered)
-        # A decimals-0 mint with nothing minted may still become a token: never cache it.
+        # A decimals-0 mint with nothing minted yet may still become a token, so never cache it.
         if negative_cache and verdict.kind is not AddressKind.NOT_YET_MINTED:
             if verdict.partial:
-                # Not final without the optional network: ask it again later (at once when it
-                # finds a token late) instead of hiding the address for rejected_ttl.
+                # Not final without the optional network. Ask it again later (at once if it
+                # finds a token or pair late) instead of hiding the address for rejected_ttl.
                 self._set_partial(address, verdict.missing, verdict.kind)
             else:
                 self._cache.add_rejected(address)
@@ -306,7 +306,7 @@ class ContractValidator:
         The page showing the address does not wait: a token found now is confirmed from
         this answer at the address's next check, and the pending watch hears of it at once.
         """
-        # Moved on first, so checks of the address meanwhile start no second re-check.
+        # Move the due time on first, so checks in the meantime don't start a second re-check.
         self._partial[address] = dataclasses.replace(partial, due=self._clock() + self._retry_delay)
         task = asyncio.create_task(self._recheck(address, partial))
         self._rechecks.add(task)

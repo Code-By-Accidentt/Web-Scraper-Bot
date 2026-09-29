@@ -9,7 +9,7 @@ import httpx
 from scraper_bot.chains.rpc.client import parse_retry_after
 from scraper_bot.pages.fetching.result import FetchResult
 
-BODY_LIMIT = 3 * 1024 * 1024  # bytes of one answer read; the rest is left out
+BODY_LIMIT = 3 * 1024 * 1024  # we read at most this many bytes of an answer and drop the rest
 TIMEOUT = 5.0  # seconds one light request may take
 
 

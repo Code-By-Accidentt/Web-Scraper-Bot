@@ -26,7 +26,7 @@ class FetchResult:
     timed_out: bool = False  # the document never arrived within the load timeout
     # Epoch seconds when loading began, after any wait for a free tab.
     started_at: float | None = None
-    # The GET fetch/XHR calls with a JSON answer the page made, one URL per call, in order.
+    # URLs of the page's GET fetch/XHR calls that answered JSON, one per call, in order.
     api_calls: tuple[str, ...] = ()
 
     @property

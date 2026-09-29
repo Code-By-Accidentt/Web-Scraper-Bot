@@ -35,7 +35,7 @@ class AlertRegistry:
         key = self._key(contract.address)
         if key in self._claimed:
             if self._cache is not None:
-                # A Sui coin type and its package are one token but two addresses: record both.
+                # A Sui coin type and its package are one token but two addresses, so cache both.
                 self._cache.add_known(contract)
             return False
         if len(self._claimed) >= self._limit:

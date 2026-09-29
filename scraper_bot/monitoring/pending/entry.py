@@ -17,20 +17,21 @@ class PendingEntry:
     """One address the pending watch checks until it becomes a token or is let go."""
 
     address: Address
-    site_url: str  # the site and page named in the alert: the first to show it
+    site_url: str  # the site and page the alert names, where it showed up first
     page_url: str
     first_seen: float  # when a page showed it first (epoch seconds)
-    fast: bool  # named as the token on the page, or seen by a turbo session
+    fast: bool  # the page calls it the token, or a turbo session saw it
     sighting: Sighting | None = None
-    classified: bool = False  # a check found nothing there yet (EVM: and not a wallet)
-    # On a page when a turbo session started: news only where it was seen absent since.
+    classified: bool = False  # a check found nothing there yet, and on EVM that it's not a wallet
+    # Set if it was on a page when a turbo session started. Then it's only news
+    # on a network where we've seen it absent since.
     baseline: bool = False
     next_check: float = 0.0
     # every site showing it -> the page it is on there (site_url and page_url included)
     sites: dict[str, str] = field(default_factory=dict)
-    # network -> the last check that found nothing there (EVM network name, or "Solana")
+    # network -> when a check last found nothing there (EVM network name, or "Solana")
     absent_on: dict[str, float] = field(default_factory=dict)
-    # networks that reported code after their check (not saved): confirmed at the next tick
+    # networks that reported code after their check ended, confirmed next tick (not saved)
     late: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
@@ -56,7 +57,7 @@ class Dropped:
     """An address the watch let go, kept out until ``until`` (epoch seconds)."""
 
     until: float
-    hard: bool  # True: a wallet or a non-token; False: only given up on (expired)
+    hard: bool  # True for a wallet or a non-token, False if we only gave up on it (expired)
 
 
 def entry_to_dict(entry: PendingEntry) -> dict[str, Any]:

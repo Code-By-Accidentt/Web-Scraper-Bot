@@ -12,7 +12,7 @@ ERC20_SYMBOL = "0x95d89b41"
 ERC20_DECIMALS = "0x313ce567"
 ERC20_TOTAL_SUPPLY = "0x18160ddd"
 
-# token0()/token1() of Uniswap V2/V3, Aerodrome and their forks; asset() of ERC-4626 vaults.
+# token0()/token1() of Uniswap V2/V3, Aerodrome and their forks, plus asset() of ERC-4626 vaults.
 PAIR_TOKEN0 = "0x0dfe1681"
 PAIR_TOKEN1 = "0xd21220a7"
 VAULT_ASSET = "0x38d52e0f"

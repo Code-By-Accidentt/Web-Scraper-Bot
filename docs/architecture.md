@@ -60,6 +60,7 @@ scraper_bot/
       noise.py          memory of elements that keep changing (flapping)
     page_checker.py     the per-page pipeline: render -> addresses -> diff -> snapshot
     early.py            EarlyReader: addresses a page shows while it loads, checked at once
+    launch.py           read_launch: countdowns, launch times and launch phrases of a render
     sightings.py        where on a page each address stands and the words in front of it
     urls.py             URL normalisation, sub-page derivation, snapshot file names
 
@@ -86,6 +87,8 @@ scraper_bot/
     monitor_manager.py  add / remove / pause / resume, one task per site, crash restart
     rounds.py           what the monitor and turbo share: pages to render, the paced wait
     alerts.py           AlertRegistry: one alert per token across pages, sites and modes
+    pace.py             SitePace: which sites turbo or auto-turbo speeds up, and what gets faster
+    tokens.py           SiteTokens: a site's new tokens for its turbo session and auto-turbo window
     pending/            PendingWatch: addresses published before deployment
       entry.py            one watched address and its saved form
       old_news.py         tokens a pausing first check showed but confirmed late: one
@@ -94,6 +97,8 @@ scraper_bot/
     turbo/              render every few seconds, hunt tokens
       session.py          TurboSession: one site in a tight loop
       manager.py          TurboManager: start, schedule, list, stop
+      clues.py            LaunchClueTracker: the launch times the renders of a page confirm
+      auto.py             AutoTurbo: a site sped up around the launch time its pages show
     unverified.py       UnverifiedWatcher: announce first, confirm on-chain later
 
   telegram/         what the user sees
@@ -173,14 +178,14 @@ SiteMonitor.run_once
  │        └─ store the second render, without the volatile nodes the old snapshot did not
  │           have, as the new snapshot  -> CHANGED or UNCHANGED
  │
- ├─ per outcome: announce a new sub-page, a captcha widget (once per page and widget),
- │   the change report (unless muted), feed candidates to the UnverifiedWatcher, count
- │   load timeouts
+ ├─ per outcome: hand the render's launch clues to the AutoTurbo, announce a new
+ │   sub-page, a captcha widget (once per page and widget), the change report (unless
+ │   muted), feed candidates to the UnverifiedWatcher, count load timeouts
  ├─ UnverifiedWatcher.recheck          re-validate watched addresses that are due
  └─ update block state (backoff) and /status counters
 
 LightPoller.run   one per site, from the end of its first round
- ├─ every light_interval (light_turbo_interval while turbo runs for the site),
+ ├─ every light_interval (light_turbo_interval in turbo or an auto-turbo window),
  │  nothing while the site blocks:
  │   ├─ each live page: a conditional GET (If-None-Match / If-Modified-Since)
  │   │   ├─ 304 or the same body     -> a read of the page, if the light mode covers it
@@ -329,8 +334,9 @@ decimals-0 mint with nothing minted, or no verdict) goes to `PendingWatch`. It c
 batches (one `eth_getCode` batch per network, one `getMultipleAccounts` per 100 Solana
 accounts): every second for a quarter of an hour when the page names the address as the
 token (CA, contract, mint, ...), then every 5 s up to an hour and every 30 s up to a day;
-other addresses every 30 s. While its site is in turbo, every address of the site is
-checked at least every `turbo_recheck_interval`. Wallets leave at once: an EVM address
+other addresses every 30 s. While `SitePace` speeds its site up (turbo or auto-turbo),
+every address of the site is checked at least every `turbo_recheck_interval`. Wallets
+leave at once: an EVM address
 that has sent a transaction or delegates via EIP-7702 has a key and never becomes a
 contract, and a Solana address holding an account that is not a mint never becomes one.
 When the address turns into a token it is validated like any other and announced with
@@ -361,6 +367,33 @@ watch at the turbo pace (`turbo_recheck_interval`). `/unverified <url> on` remai
 place where addresses are announced before they are tokens; it validates with
 `negative_cache=False`, so earlier rejections are ignored, and its `✅ Confirmed` claims
 the `AlertRegistry` like every token alert.
+
+**Auto-turbo speeds a site up around its launch.** With `auto_turbo` on, the page checker
+reads each render once more for launch clues (`pages/launch.py`, in a worker thread, a few
+milliseconds on usual pages): countdowns with launch words next to them and no veto word
+("round", "ends", "reset", "funding" ...) right before, launch times written with their
+time zone, countdown targets in inline scripts or element attributes, launch phrases.
+`LaunchClueTracker` (`monitoring/turbo/clues.py`) takes a countdown's end as a launch time
+only once two renders agree on it within its step plus 5 s, the later one shows less time
+left and the end is less than a day away; a stated time needs one render; a phrase must
+appear on a page that has not shown it for a day, after a render that was not still
+loading. `AutoTurbo` (`monitoring/turbo/auto.py`, one for all sites) then plans one window
+per site, from `auto_turbo_before` before the launch time to `auto_turbo_after` after it;
+an earlier launch time takes over a window that has not begun. Inside the window it boosts
+the site in `SitePace` (`monitoring/pace.py`): the site's monitor then waits
+`turbo_interval` between the starts of its rounds, its light poller polls every
+`light_turbo_interval` and the pending watch checks its addresses at the turbo pace, and
+the boost wakes the monitor at once. A /turbo session boosts the same way, without the
+rounds. The window ends at its end, at the site's `turbo_stop_after`-th token, on
+`/turbo stop` or when the site is paused or removed. The tokens come from `SiteTokens`
+(`monitoring/tokens.py`): the monitor publishes a token that appeared since the page's
+last read, the pending watch one it confirmed, a turbo session its own; turbo sessions and
+windows subscribe. A launch time that moves by more than a minute before it is reached
+moves the window; a countdown that starts over after its end (a game round) plans nothing
+more. After a window ended, its launch times (including the ones it took over from), the
+same text with the same clock a day later and its phrase on the same page plan nothing for
+a day.
+Windows live in memory only, like turbo sessions.
 
 **Blocks slow the bot down, nothing else.** A block signal from any page of a site
 (HTTP 401/403/407/429/503, a mitigation header such as `cf-mitigated: challenge`,
@@ -402,8 +435,8 @@ still names HeadlessChrome there.
 
 **The light mode watches between renders.** A render costs dozens of requests and a
 second of CPU, so the monitor also asks every live page over plain HTTP each
-`light_interval` (1 s; `light_turbo_interval`, 0.3 s, while a turbo session runs for the
-site), conditionally, so an unchanged page is a 304 without a body. A page whose HTML
+`light_interval` (1 s; `light_turbo_interval`, 0.3 s, while a turbo session or an
+auto-turbo window runs for the site), conditionally, so an unchanged page is a 304 without a body. A page whose HTML
 gains an address hands it to the usual pipeline at once (checked on-chain, one alert per
 token, the pending watch). The site's own JSON APIs that a render saw the page call
 (GET, answered in JSON, on the site's domain or a subdomain; price feeds and other

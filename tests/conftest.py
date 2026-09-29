@@ -70,6 +70,10 @@ class FakeTuning:
     turbo_max_pages: int = 4
     turbo_recheck_interval: float = 0.0
     block_max_backoff: float = 600.0
+    auto_turbo: bool = True
+    auto_turbo_before: float = 600.0
+    auto_turbo_after: float = 3600.0
+    auto_turbo_max_sites: int = 3
 
 
 MINIMAL_ENV = {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_IDS": "1,2"}
@@ -238,6 +242,10 @@ class FakeNotifier:
         self.problems: list[tuple[str, str, str, str | None]] = []
         self.started_calls: list[tuple[str, int, int]] = []
         self.late_batches: list[tuple[str, tuple[ConfirmedContract, ...]]] = []
+        # (site, what, target, start, end, moved_from) of each auto-turbo notice
+        self.auto_planned: list[tuple[str, str, float | None, float, float, float | None]] = []
+        self.auto_full: list[tuple[str, str]] = []
+        self.auto_finished: list[tuple[str, str, int, float | None]] = []
 
     async def page_discovered(self, page_url: str) -> None:
         self.discovered.append(page_url)
@@ -312,6 +320,33 @@ class FakeNotifier:
         renders: int,
     ) -> None:
         self.turbo_finished_calls.append((site_url, reason, len(contracts)))
+
+    async def auto_turbo_planned(
+        self,
+        site_url: str,
+        page_url: str,
+        what: str,
+        target: float | None,
+        start: float,
+        end: float,
+        *,
+        moved_from: float | None = None,
+    ) -> None:
+        self.auto_planned.append((site_url, what, target, start, end, moved_from))
+
+    async def auto_turbo_full(
+        self, site_url: str, page_url: str, what: str, target: float | None, windows: int
+    ) -> None:
+        self.auto_full.append((site_url, what))
+
+    async def auto_turbo_finished(
+        self,
+        site_url: str,
+        reason: str,
+        contracts: Sequence[ConfirmedContract],
+        seconds: float | None,
+    ) -> None:
+        self.auto_finished.append((site_url, reason, len(contracts), seconds))
 
     async def site_blocked(
         self, site_url: str, page_url: str, signal: BlockSignal, next_delay: float

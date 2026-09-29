@@ -15,8 +15,10 @@ from scraper_bot.models.addresses import Address, ConfirmedContract, ValidationS
 from scraper_bot.models.pages import BlockSignal
 from scraper_bot.models.sightings import Sighting, Timeline
 from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pace import TURBO, SitePace
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.rounds import wait_or_stop
+from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.result import PageFetcher
@@ -34,7 +36,7 @@ class TurboLimits:
     interval: float  # seconds between render cycles
     default_minutes: float
     max_minutes: float
-    stop_after: int  # confirmed contracts that end the session; 0 = never
+    stop_after: int  # confirmed contracts that end the session (0 = never)
     max_sites: int  # concurrent (running or scheduled) sessions
     max_pages: int  # pages rendered per cycle, the root page included
 
@@ -81,11 +83,15 @@ class TurboSession:
         pending: PendingWatch,
         registry: AlertRegistry,
         normalizer: HtmlNormalizer | None = None,
+        pace: SitePace | None = None,
+        tokens: SiteTokens | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], Awaitable[None]] | None = None,
     ) -> None:
         """Set up a session over ``pages`` of ``url`` that lasts ``duration`` seconds once run.
 
+        While it runs, ``pace`` has the site's light polls and pending checks sped up, and
+        ``tokens`` brings the site's tokens that others announced.
         ``sleep`` replaces the stop-aware pause between cycles (tests pass an instant one).
         """
         self._url = url
@@ -101,6 +107,8 @@ class TurboSession:
         self._duration = duration
         self._pending = pending
         self._registry = registry
+        self._pace = pace or SitePace()
+        self._tokens = tokens or SiteTokens()
         self._clock = clock
         self._sleep = sleep
         self._stats = TurboStats()
@@ -160,7 +168,8 @@ class TurboSession:
             self._url, len(self._pages), limits.interval, self._duration / 60, limits.stop_after
         )
         reason: str | None = None
-        self._pending.start_turbo(self._url, self._deployed)
+        self._pace.boost(self._url, TURBO)
+        self._tokens.subscribe(self._url, self._found)
         try:
             while True:
                 if self._stop.is_set():
@@ -183,7 +192,8 @@ class TurboSession:
             reason = "bot is shutting down"
             raise
         finally:
-            self._pending.stop_turbo(self._url, self._deployed)
+            self._pace.release(self._url, TURBO)
+            self._tokens.unsubscribe(self._url, self._found)
             stats.stop_reason = reason or MANUAL_STOP
             log.info("turbo finished for %s: %s", self._url, stats.stop_reason)
             with contextlib.suppress(Exception):
@@ -209,7 +219,7 @@ class TurboSession:
         self._stats.cycles += 1
         self._stats.renders += len(results)
         signals = {result.url: self._blocks.inspect(result) for result in results}
-        # Pages read before go first: an address a new page also shows is news, not baseline.
+        # Pages read before go first, so an address a new page also shows is news, not a baseline.
         for result in sorted(results, key=lambda r: r.url not in self._last_read):
             if not result.ok:
                 continue
@@ -227,7 +237,7 @@ class TurboSession:
             )
             blocked = signals[result.url] is not None
             if blocked:
-                # A 2xx that looks like a challenge may be the real page: read its text only.
+                # A 2xx that looks like a challenge may be the real page, so read only its text.
                 found = shown_on_a_challenge(found)
             fresh = [s for s in found if s.address not in self._seen]
             self._seen.update(sighting.address for sighting in fresh)
@@ -251,29 +261,29 @@ class TurboSession:
         by_address = {sighting.address: sighting for sighting in sightings}
         for result in results:
             sighting = by_address.get(result.via or result.address)
-            if result.contract is not None:
-                claimed = self._registry.claim(result.contract)  # records it as known
-                self._deployed(result.contract.address)
-                if claimed:
+            contract = result.contract
+            if contract is not None:
+                if self._registry.claim(contract):  # records it as known
                     timeline = Timeline(seen_at, missing_at=self._last_read.get(page_url))
                     await self._notifier.contract_found(
-                        result.contract, page_url, sighting=sighting, timeline=timeline
+                        contract, page_url, sighting=sighting, timeline=timeline
                     )
+                self._tokens.publish({self._url}, contract.address, contract.network)
             elif result.status is ValidationStatus.ALREADY_KNOWN and result.via is None:
-                # the monitor announced it meanwhile (an old token behind a new pair is not news)
-                self._deployed(result.address)
+                # the monitor announced it in the meantime
+                # (an old token behind a new pair isn't news)
+                network = self._cache.known_network(result.address)
+                self._tokens.publish({self._url}, result.address, network)
             elif self._pending.offer(self._url, page_url, sighting, result, fast=True):
                 self._stats.pending += 1
 
-    def _deployed(self, address: Address) -> None:
+    def _found(self, contract: ConfirmedContract) -> None:
         """Add a token of this site to the session's finds, once.
 
-        Both the session and the pending watch call this.
+        It comes from the session itself, the regular monitor or the pending watch.
         """
-        if any(contract.address == address for contract in self._stats.found):
-            return
-        network = self._cache.known_network(address) or "unknown network"
-        self._stats.found.append(ConfirmedContract(address, network))
+        if all(known.address != contract.address for known in self._stats.found):
+            self._stats.found.append(contract)
 
     async def _pause(self, seconds: float) -> None:
         """Wait ``seconds`` before the next cycle, or less if a stop is requested."""

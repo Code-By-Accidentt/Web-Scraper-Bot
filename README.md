@@ -48,6 +48,10 @@ bothers you.
 - **Turbo mode.** `/turbo <url>` renders a site every 2 s, optionally from a scheduled
   time, and announces every new token at once; an address that is not a token yet is
   checked every second.
+- **Auto-turbo.** When a page shows a launch countdown, a launch time with its time zone,
+  a countdown target in its scripts, or "CA: soon" / "presale is live" appears on it, the
+  site is checked faster from 10 minutes before that time to an hour after it, or until
+  its first token, with one message when that is planned and a summary at the end.
 - **Unverified mode.** `/unverified <url> on` announces every new address on a site at
   once and keeps re-checking it on-chain for a day.
 - **Live settings.** `/settings` explains every tunable knob, `/set` changes it without a
@@ -94,7 +98,7 @@ rebooter.py`. On Ubuntu 20.04 use Google Chrome (`BROWSER_CHANNEL=chrome`); see
 /list               sites with alert status, running state and last change
 /nonotifi <url>     mute change alerts for a site (contracts are still reported)   alias: /mute
 /notify <url>       un-mute change alerts                                         alias: /unmute
-/turbo <url> [minutes] [at HH:MM | in 10m]   turbo mode; /turbo stop <url> ends it; /turbo shows status
+/turbo <url> [minutes] [at HH:MM | in 10m]   turbo mode; /turbo stop <url> ends it or auto-turbo; /turbo shows both
 /unverified <url> on|off                     announce every new address at once, confirm later
 /settings [key]                              live settings with explanations
 /set <key> <value> [confirm]                 change one live setting

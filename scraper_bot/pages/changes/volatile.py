@@ -14,8 +14,8 @@ from collections.abc import Mapping
 from scraper_bot.models.pages import Node, Signature, VolatileEntry, VolatileMemory
 from scraper_bot.pages.changes.detector import shape
 
-_MAX_AGE = 24 * 3600.0  # seconds a shape stays known after it last ticked
-_LIMIT = 200  # shapes kept per page, the most recently seen ones
+_MAX_AGE = 24 * 3600.0  # how long we remember a shape after it last ticked (s)
+_LIMIT = 200  # most shapes kept per page (the ones seen longest ago go first)
 
 
 class VolatileShapes:
