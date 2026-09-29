@@ -15,7 +15,7 @@ from scraper_bot.storage.files import atomic_write_text
 
 log = logging.getLogger(__name__)
 
-# Tells the chat about a problem: key, title, detail and hint, as Notifier.report_later.
+# Tells the chat about a problem (key, title, detail, hint), such as Notifier.report_later.
 Report = Callable[[str, str, str, str], None]
 
 _SWEEP_EVERY = 1000
@@ -70,7 +70,7 @@ class AddressCache:
         self._known: dict[Address, str] = {}
         self._rejected: dict[Address, float] = {}
         self._since_sweep = 0
-        # Files whose last write failed; each failure is reported once until a write succeeds.
+        # Files whose last write failed. We report that once, until a write works again.
         self._unsaved: set[Path] = set()
 
     @property
@@ -343,7 +343,7 @@ def _rows(lines: list[bytes]) -> tuple[list[tuple[int, list[str]]], list[int]]:
     broken: list[int] = []
     for number, raw in enumerate(lines, 1):
         try:
-            line = raw.decode("utf-8-sig")  # -sig: a BOM left by an editor
+            line = raw.decode("utf-8-sig")  # -sig strips a BOM left by an editor
         except UnicodeDecodeError:
             broken.append(number)
             continue

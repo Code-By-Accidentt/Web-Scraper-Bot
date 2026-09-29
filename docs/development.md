@@ -10,7 +10,7 @@ playwright install chromium              # only for the opt-in browser tests
 ## Checks
 
 ```bash
-pytest -q                                # ~980 tests, offline, about 14 s
+pytest -q                                # ~1000 tests, offline, about 14 s
 ruff check . && ruff format --check .    # lint (E, F, W, I, B, UP, SIM, RUF) and formatting
 SCRAPER_BOT_BROWSER_TESTS=1 pytest -q tests/pages/fetching/test_fetcher_browser.py   # real Chromium
 ```

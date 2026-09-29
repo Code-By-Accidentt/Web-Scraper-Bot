@@ -10,11 +10,11 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 
-# A reported outage needs a failure this recent: an endpoint nobody asks lately is not down.
+# We only report an outage with a failure this recent. An endpoint nobody asked lately isn't down.
 _RECENT_FAILURE = 60.0
-# Failures further apart start a new outage; RPC_RETRY_DELAY can space checks minutes apart.
+# Failures further apart start a new outage. RPC_RETRY_DELAY can put minutes between checks.
 _NEW_OUTAGE_AFTER = 1800.0
-# An optional endpoint rests after this many failures in a row; probe gaps grow 2 s -> 30 s.
+# An optional endpoint rests after this many failures in a row. Probe gaps grow from 2 s to 30 s.
 _REST_AFTER = 2
 _FIRST_PROBE_GAP = 2.0
 _PROBE_EVERY = 30.0
@@ -31,10 +31,10 @@ class FailingEndpoint:
     name: str
     seconds: float  # failing for this long
     error: str  # its latest failure
-    optional: bool = False  # its failure holds up no verdict
+    optional: bool = False  # its failure doesn't hold up any verdict
 
 
-# Gets the endpoints failing for minutes and RPC_RETRY_DELAY; the Notifier sends a 🛑.
+# Gets the endpoints failing for minutes, and RPC_RETRY_DELAY. The Notifier sends a 🛑.
 StuckReporter = Callable[[Sequence[FailingEndpoint], float], None]
 
 

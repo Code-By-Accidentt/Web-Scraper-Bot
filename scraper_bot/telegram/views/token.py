@@ -10,8 +10,8 @@ from scraper_bot.telegram.markup import code, escape, link
 from scraper_bot.telegram.timefmt import format_duration, format_precise, format_utc_offset
 
 NO_PAIR_YET = "No DEX pair listed yet."
-# Seconds of history every RPC node keeps; past that, the oldest transaction a node still
-# has may be days younger than the token, so the age is only a lower bound.
+# Every RPC node keeps at least this much history (s). Past that, a node's oldest
+# transaction may be days younger than the token, so the age is only a lower bound.
 _HISTORY_SURELY_KEPT = 3600.0
 
 

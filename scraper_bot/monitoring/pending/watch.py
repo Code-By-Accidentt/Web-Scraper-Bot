@@ -39,6 +39,7 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
 from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pace import SitePace
 from scraper_bot.monitoring.pending.entry import (
     SLOW_INTERVAL,
     Dropped,
@@ -48,6 +49,7 @@ from scraper_bot.monitoring.pending.entry import (
     entry_to_dict,
 )
 from scraper_bot.monitoring.pending.old_news import OldNews
+from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.settings.env import Settings
 from scraper_bot.storage.files import atomic_write_text
 from scraper_bot.telegram.notifier import Notifier
@@ -72,8 +74,7 @@ _WATCHED_CHAINS = frozenset({Chain.ETHEREUM, Chain.SOLANA})  # a Sui package can
 _VISIBLE = frozenset({SightingSource.TEXT, SightingSource.LINK, SightingSource.API})
 _SOLANA = "Solana"  # the "network" of a Solana address in ``absent_on``
 
-Listener = Callable[[Address], None]
-# Gets each endpoint's failure, or None for an answer: the endpoint health of the validators.
+# Gets each endpoint's failure, or None when it answered, for the validators' endpoint health.
 HealthRecorder = Callable[[str, BaseException | None], None]
 
 
@@ -102,12 +103,15 @@ class PendingWatch:
         health: HealthRecorder | None = None,
         stale_absences: Collection[str] = (),
         new_networks: Collection[str] = (),
+        pace: SitePace | None = None,
+        tokens: SiteTokens | None = None,
     ) -> None:
         """Set up the RPC clients of every network; call :meth:`load`, then :meth:`run`.
 
-        ``turbo_interval`` returns the turbo pace in seconds. ``new_networks`` are the EVM
-        networks added since the last run, and ``stale_absences`` the networks switched off
-        and on again, whose saved absences are out of date.
+        ``turbo_interval`` returns the turbo pace in seconds, used for the sites ``pace``
+        speeds up; the tokens found are published to ``tokens``. ``new_networks`` are the
+        EVM networks added since the last run, and ``stale_absences`` the networks switched
+        off and on again, whose saved absences are out of date.
         """
         timeout = settings.rpc_timeout
         self._evm = [
@@ -128,9 +132,10 @@ class PendingWatch:
         self._tick = tick
         self._entries: dict[Address, PendingEntry] = {}
         self._dropped: dict[Address, Dropped] = {}
-        self._turbo_sites: set[str] = set()
-        self._listeners: dict[str, list[Listener]] = {}
-        # One queue per chain family: EVM confirmations that hang never hold up a Solana mint.
+        self._pace = pace or SitePace()
+        self._pace.on_boost(self._hurry_site)
+        self._tokens = tokens or SiteTokens()
+        # One queue per chain family, so a hanging EVM confirmation never holds up a Solana mint.
         self._confirming = {
             Chain.ETHEREUM: asyncio.Semaphore(CONFIRMING_AT_ONCE),
             Chain.SOLANA: asyncio.Semaphore(CONFIRMING_AT_ONCE),
@@ -169,10 +174,10 @@ class PendingWatch:
         if address.chain not in _WATCHED_CHAINS:
             return False
         if result.kind is not AddressKind.UNKNOWN and result.kind not in MAY_APPEAR:
-            return False  # a contract, a wallet, an LP pair, a program: never a token later
+            return False  # a contract, wallet, LP pair or program won't become a token later
         if result.status not in {
             ValidationStatus.REJECTED,
-            ValidationStatus.ALREADY_REJECTED,  # a cached verdict: the first check will tell
+            ValidationStatus.ALREADY_REJECTED,  # a cached verdict, so let our first check decide
             ValidationStatus.UNAVAILABLE,
         }:
             return False
@@ -180,7 +185,7 @@ class PendingWatch:
         urgent = fast or hinted
         if self._join(address, site_url, page_url, urgent):
             return False
-        # A missing Solana account needs no further look; an EVM address still does (nonce).
+        # A missing Solana account counts as classified, but an EVM address needs a nonce check.
         known_absent = address.chain is Chain.SOLANA and result.kind in MAY_APPEAR
         entry = self._admit(address, site_url, page_url, sighting, urgent, known_absent, False)
         if entry is not None and known_absent:
@@ -197,16 +202,17 @@ class PendingWatch:
         if address.chain in _WATCHED_CHAINS and not self._join(address, site_url, page_url, True):
             self._admit(address, site_url, page_url, sighting, True, False, True)
 
-    def announced(self, site_url: str, address: Address) -> None:
-        """Note that the regular monitor announced a token of ``site_url``.
+    def announced(self, site_url: str, address: Address) -> frozenset[str]:
+        """Stop watching a token the regular monitor of ``site_url`` announced.
 
-        The address leaves the watch, and the turbo sessions of every site showing it hear
-        about it.
+        Return the other sites that showed the address, so their turbo sessions and
+        auto-turbo windows can hear about it too.
         """
         entry = self._entries.get(address)
-        if entry is not None:
-            self._remove(entry)
-        self._tell({site_url, *(entry.sites if entry else ())}, address)
+        if entry is None:
+            return frozenset()
+        self._remove(entry)
+        return frozenset(entry.sites) - {site_url}
 
     def first_check_paused(self, site_url: str, results: Iterable[ValidationResult]) -> None:
         """Note what the first check that just paused ``site_url`` could not confirm.
@@ -236,23 +242,12 @@ class PendingWatch:
         self._old_news.queue(site_url, contract, self._clock())
         return True
 
-    def start_turbo(self, site_url: str, listener: Listener) -> None:
-        """Check the site's addresses at the turbo pace and report its tokens to ``listener``."""
-        self._turbo_sites.add(site_url)
-        self._listeners.setdefault(site_url, []).append(listener)
+    def _hurry_site(self, site_url: str) -> None:
+        """Check the addresses of a site that was just sped up at once, not after a slow pause."""
         now = self._clock()
         for entry in self._entries.values():
             if site_url in entry.sites:
-                entry.next_check = min(entry.next_check, now)  # not after a 30 s slow pause
-
-    def stop_turbo(self, site_url: str, listener: Listener) -> None:
-        """Return the site's addresses to their normal pace and stop telling ``listener``."""
-        self._turbo_sites.discard(site_url)
-        listeners = self._listeners.get(site_url, [])
-        if listener in listeners:
-            listeners.remove(listener)
-        if not listeners:
-            self._listeners.pop(site_url, None)
+                entry.next_check = min(entry.next_check, now)
 
     def forget_site(self, site_url: str) -> None:
         """Forget a removed site; its addresses stay watched only if another site shows them."""
@@ -277,7 +272,7 @@ class PendingWatch:
                 if self._entries or self._old_news.waiting:
                     await self.check_due(chain)
                 now = self._clock()
-                # A clock stepped back must not hold saves off until it catches up.
+                # If the clock jumps back, don't hold off saves until it catches up.
                 if self._dirty and not 0 <= now - self._saved_at < _SAVE_EVERY:
                     self.save()
             except asyncio.CancelledError:
@@ -307,7 +302,7 @@ class PendingWatch:
                 log.info("gave up on %s %s after a day", address.chain.value, address)
                 self._drop(entry, now, hard=False)
             elif entry.next_check > now + SLOW_INTERVAL:
-                entry.next_check = now  # the clock stepped back: do not wait out the step
+                entry.next_check = now  # the clock jumped back, so don't wait out the jump
         due = sorted(
             (e for e in self._entries.values() if e.next_check <= now and not self._paused(e)),
             key=lambda e: (not e.fast, e.next_check),
@@ -357,7 +352,7 @@ class PendingWatch:
         EIP-7702 delegation) are dropped; the rest are marked absent and rescheduled.
         """
         appeared: list[tuple[PendingEntry, tuple[str, ...] | None]] = []
-        # Code an optional network reported late is confirmed now, without another look.
+        # If an optional network reported code late, confirm it now without another look.
         hurried = [e for e in entries if e.late]
         for entry in hurried:
             where, entry.late = tuple(sorted(entry.late)), set()
@@ -465,7 +460,7 @@ class PendingWatch:
             if has_code(code):
                 self.hurry(entry.address, name)
             elif name not in entry.absent_on or entry.absent_on[name] < sent_at:
-                # Nothing there yet: what tells a deployment there from old news later.
+                # Nothing there yet. Later this is how we tell a deployment from old news.
                 entry.absent_on[name] = sent_at
                 self._dirty = True
 
@@ -535,11 +530,11 @@ class PendingWatch:
         leaves the watch, and the regular monitor judges it.
         """
         if entry.baseline and not any(name in entry.absent_on for name in where):
-            # Removed, not dropped: another turbo session may still offer it.
+            # Remove it, don't drop it, since another turbo session may still offer it.
             log.info("%s %s: old news when turbo started", entry.address.chain.value, entry.address)
             self._remove(entry)
             return
-        # Solana has one "network": None validates it the usual way.
+        # Solana has only one "network", so pass None and validate it the usual way.
         appeared.append((entry, None if where == (_SOLANA,) else where))
 
     def _absent(
@@ -551,7 +546,7 @@ class PendingWatch:
         """
         for name in where:
             if name not in entry.absent_on:
-                self._dirty = True  # what a restart needs to tell a deployment from old news
+                self._dirty = True  # a restart needs this to tell a deployment from old news
             entry.absent_on[name] = now
         if answered and not entry.classified:
             entry.classified = True
@@ -573,7 +568,7 @@ class PendingWatch:
         own = results[0]
         tokens = [result for result in results if result.contract is not None]
         if tokens:
-            # Announce even if the entry left meanwhile: the token is known now, no one else will.
+            # Announce even if the entry is gone by now. The token is known, so no one else will.
             self._remove(entry)
             for result in tokens:
                 contract = result.contract
@@ -592,13 +587,13 @@ class PendingWatch:
                         sighting=entry.sighting,
                         timeline=self._timeline(entry, networks, via=result.via is not None),
                     )
-                self._tell(entry.sites, contract.address)
+                self._tokens.publish(entry.sites, contract.address, contract.network)
             return
         if entry.address not in self._entries:
-            return  # removed meanwhile (/remove, announced by the monitor)
+            return  # removed in the meantime (/remove, or the monitor announced it)
         if own.status is ValidationStatus.ALREADY_KNOWN:
             self._remove(entry)
-            self._tell(entry.sites, own.address)
+            self._tokens.publish(entry.sites, own.address)
             return
         if own.status is ValidationStatus.UNAVAILABLE or own.kind in MAY_APPEAR:
             self._reschedule(entry, now)
@@ -613,7 +608,7 @@ class PendingWatch:
         Without such a check, or for a token found behind an LP pair (``via``), it only
         says since when the page showed the address.
         """
-        found_at = self._clock()  # once the node answered: the tick may predate the deployment
+        found_at = self._clock()  # not the tick's time, which may come before the deployment
         where = networks or (_SOLANA,)
         misses = [entry.absent_on[name] for name in where if name in entry.absent_on]
         if not misses or via:
@@ -639,12 +634,6 @@ class PendingWatch:
         if not self._old_news.covers(site_url, addresses, optional=optional, now=self._clock()):
             return False
         return entry is None or contract.network not in entry.absent_on
-
-    def _tell(self, sites: Iterable[str], address: Address) -> None:
-        """Tell the turbo sessions of ``sites`` that ``address`` is a token."""
-        for site in list(sites):
-            for listener in list(self._listeners.get(site, ())):
-                listener(address)
 
     def _join(self, address: Address, site_url: str, page_url: str, urgent: bool) -> bool:
         """Add the site to an address already watched; return False if it is not watched.
@@ -718,7 +707,7 @@ class PendingWatch:
             return False
         oldest = min(slow, key=lambda e: e.first_seen)
         if site_full and len(self._entries) < TOTAL_LIMIT:
-            self._detach(oldest, site_url)  # other sites showing it keep watching it
+            self._detach(oldest, site_url)  # it stays watched for other sites that show it
         else:
             self._remove(oldest)
         return True
@@ -740,7 +729,7 @@ class PendingWatch:
         if entry.late:
             entry.next_check = now
             return
-        turbo = self._turbo_interval() if entry.sites.keys() & self._turbo_sites else None
+        turbo = self._turbo_interval() if self._sped_up(entry) else None
         entry.next_check = now + check_interval(entry, now, turbo)
 
     def _drop(
@@ -774,10 +763,14 @@ class PendingWatch:
             self._dirty = True
 
     def _paused(self, entry: PendingEntry) -> bool:
-        """Return True while every site showing the entry is paused and none is in turbo."""
-        if entry.sites.keys() & self._turbo_sites:
+        """Return True while every site showing the entry is paused and none is sped up."""
+        if self._sped_up(entry):
             return False
         return all(self._is_paused(site) for site in entry.sites)
+
+    def _sped_up(self, entry: PendingEntry) -> bool:
+        """True while a turbo session or an auto-turbo window speeds up a site showing the entry."""
+        return any(self._pace.pending_fast(site) for site in entry.sites)
 
     def load(self) -> None:
         """Load the entries, dropped addresses and old news of an earlier run.
@@ -790,7 +783,7 @@ class PendingWatch:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             now = self._clock()
-            # Version 1 saved no absences per network: its baselines would all be old news.
+            # Version 1 didn't save absences per network, so its baselines would all be old news.
             old = int(data.get("version", 1)) < 2
             entries = [entry_from_dict(raw, forget_baseline=old) for raw in data.get("entries", [])]
             dropped = {
@@ -823,7 +816,7 @@ class PendingWatch:
         for entry in evm:
             entry.baseline = True
             for name in self._stale_absences:
-                # Seen absent there before the network was switched off: stale news.
+                # Seen absent there before the network was switched off, so it's out of date.
                 entry.absent_on.pop(name, None)
         self._dropped = {
             address: dropped
@@ -847,7 +840,7 @@ class PendingWatch:
         payload = {
             "version": _STORE_VERSION,
             "entries": [entry_to_dict(entry) for entry in self._entries.values()],
-            # wallets and non-tokens; "expired" holds addresses only given up on
+            # wallets and non-tokens, while "expired" holds the ones we only gave up on
             "dropped": {address_key(a): d.until for a, d in self._dropped.items() if d.hard},
             "expired": {address_key(a): d.until for a, d in self._dropped.items() if not d.hard},
             "old_news": self._old_news.to_dict(),

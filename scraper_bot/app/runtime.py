@@ -25,6 +25,7 @@ from scraper_bot.models.addresses import Chain
 from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
 from scraper_bot.monitoring.monitor_manager import MonitorManager
+from scraper_bot.monitoring.pace import SitePace
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.site_monitor import (
     AutoPauseCallback,
@@ -32,6 +33,8 @@ from scraper_bot.monitoring.site_monitor import (
     PersistCallback,
     SiteMonitor,
 )
+from scraper_bot.monitoring.tokens import SiteTokens
+from scraper_bot.monitoring.turbo.auto import AutoTurbo
 from scraper_bot.monitoring.turbo.manager import TurboManager
 from scraper_bot.monitoring.turbo.session import LimitsSource, TurboSession
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
@@ -66,8 +69,8 @@ PENDING_FILE = "pending.json"  # addresses watched until they become a token
 OUTBOX_FILE = "outbox.json"  # token alerts and documents on their way to Telegram
 IGNORE_FILE = "ignore.txt"  # the operator's own stop-list, one address per line
 NETWORKS_FILE = "evm_networks.txt"  # the EVM networks the caches were built with
-SHUTDOWN_STEP = 8.0  # seconds for each shutdown step that may talk to Telegram
-RPC_STATUS_AFTER = 60.0  # seconds an RPC endpoint must fail before /status names it
+SHUTDOWN_STEP = 8.0  # time limit for each shutdown step that may talk to Telegram (s)
+RPC_STATUS_AFTER = 60.0  # how long an RPC endpoint must fail before /status names it (s)
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -92,7 +95,7 @@ class Runtime:
     validator: ContractValidator
     warmer: ConnectionWarmer
     pending: PendingWatch
-    # runs once the start went through: saves the EVM networks the caches now match
+    # runs after a successful start and saves the EVM networks the caches now match
     started_hook: Callable[[], None] | None = None
     _pending_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
@@ -196,7 +199,7 @@ def build_runtime(
     added = added_networks(networks_file, current, existing_data=_has_data(cfg))
     cache = _load_address_cache(cfg, prefs, legacy, notifier.report_later)
     if added:
-        # A rejection made without these networks may be a token on one of them.
+        # An address rejected before we had these networks may be a token on one of them.
         forgotten = cache.forget_rejected(Chain.ETHEREUM)
         log.info(
             "EVM network(s) added: %s; %d cached EVM rejection(s) forgotten",
@@ -233,6 +236,8 @@ def build_runtime(
     deriver = SubUrlDeriver(cfg.sub_url_patterns)
     # One registry for every site and mode, so each token alerts only once.
     registry = AlertRegistry(cache)
+    pace = SitePace()
+    tokens = SiteTokens(known_network=cache.known_network)
     pending = PendingWatch(
         http,
         cfg,
@@ -241,19 +246,22 @@ def build_runtime(
         notifier=notifier,
         path=cfg.data_dir / PENDING_FILE,
         turbo_interval=lambda: prefs.turbo_recheck_interval,
-        # manager is built below. A turbo-only site is never paused: its launch may come later.
+        # manager is built below. A turbo-only site is never paused, as its launch may come later.
         is_paused=lambda url: manager.is_paused(url),
         sleep=sleep or asyncio.sleep,
         health=validator.record,
         new_networks=added,
-        # A re-enabled network's old absences are stale. With no networks file yet every
-        # network counts as added, but the absences an earlier release recorded are real.
+        # If a network was switched off and back on, its old absences are stale. With no networks
+        # file yet, every network counts as added, but absences an earlier release saved are real.
         stale_absences=added if networks_known else frozenset(),
+        pace=pace,
+        tokens=tokens,
     )
-    # A token that Arc or Robinhood Chain reports too late is confirmed at the next tick.
+    # If Arc or Robinhood Chain reports a token too late, we confirm it at the next tick.
     validator.on_late_token = pending.hurry
+    auto = AutoTurbo(tuning=prefs, notifier=notifier, pace=pace, tokens=tokens)
     light_http = HttpTransport(probe_http or http)
-    # A browser that can fetch() from a tab kept on a site asks the sites that refuse httpx.
+    # If the browser can fetch() from a tab kept on a site, it asks the sites that refuse httpx.
     light_browser: LightTransport | None = (
         BrowserTransport(fetcher) if hasattr(fetcher, "tab_fetch") else None  # type: ignore[arg-type]
     )
@@ -264,7 +272,7 @@ def build_runtime(
         render_soon: Callable[[str], None],
         is_blocked: Callable[[], bool],
     ) -> LightPoller:
-        """Build the light poller of one site; its pace follows turbo sessions of the site."""
+        """Build the light poller of one site; turbo and auto-turbo speed its polls up."""
         return LightPoller(
             site_url,
             http=light_http,
@@ -276,8 +284,7 @@ def build_runtime(
             observe=observe,
             request_render=render_soon,
             is_blocked=is_blocked,
-            # turbo is built below; a session of this site speeds its polls up.
-            turbo_active=lambda: any(session.url == site_url for session in turbo.active()),
+            turbo_active=lambda: pace.light_fast(site_url),
             block_detector=block_detector,
             sleep=sleep,
         )
@@ -311,6 +318,9 @@ def build_runtime(
             page_load_timeout=cfg.page_load_timeout,
             block_detector=block_detector,
             light=build_light,
+            auto=auto,
+            pace=pace,
+            tokens=tokens,
         )
 
     def build_turbo(
@@ -331,8 +341,15 @@ def build_runtime(
             pending=pending,
             registry=registry,
             normalizer=normalizer,
+            pace=pace,
+            tokens=tokens,
             sleep=sleep,
         )
+
+    def forget_site(url: str) -> None:
+        """Drop what the pending watch and the auto-turbo keep about a removed site."""
+        pending.forget_site(url)
+        auto.forget(url)
 
     turbo = TurboManager(
         tuning=prefs,
@@ -340,6 +357,7 @@ def build_runtime(
         prober=prober,
         session_factory=build_turbo,
         notifier=notifier,
+        auto=auto,
     )
     manager = MonitorManager(
         state_store=StateStore(cfg.data_dir / "state.json"),
@@ -348,7 +366,7 @@ def build_runtime(
         monitor_factory=build_monitor,
         legacy_importer=legacy,
         notifier=notifier,
-        on_removed=pending.forget_site,
+        on_removed=forget_site,
     )
     status = StatusReporter(
         version=__version__,

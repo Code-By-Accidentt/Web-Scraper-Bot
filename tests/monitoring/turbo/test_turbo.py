@@ -17,6 +17,8 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.models.sightings import Sighting, Timeline
 from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.pace import SitePace
+from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.monitoring.turbo.manager import (
     ScheduledTurbo,
     TurboAlreadyRunning,
@@ -62,8 +64,6 @@ class FakePending:
     def __init__(self) -> None:
         self.offers: list[tuple[Address, str, bool]] = []
         self.baseline: list[tuple[Address, str]] = []
-        self.listeners: dict[str, Callable[[Address], None]] = {}
-        self.stopped: list[str] = []
 
     def offer(
         self,
@@ -79,13 +79,6 @@ class FakePending:
 
     def offer_baseline(self, site_url: str, page_url: str, sighting: Sighting) -> None:
         self.baseline.append((sighting.address, page_url))
-
-    def start_turbo(self, site_url: str, listener: Callable[[Address], None]) -> None:
-        self.listeners[site_url] = listener
-
-    def stop_turbo(self, site_url: str, listener: Callable[[Address], None]) -> None:
-        self.listeners.pop(site_url, None)
-        self.stopped.append(site_url)
 
 
 class Harness:
@@ -107,6 +100,8 @@ class Harness:
         self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
         self.cache.load()
         self.registry = AlertRegistry(self.cache)
+        self.pace = SitePace()
+        self.tokens = SiteTokens()
         self.now = 1_000.0
         self.session = TurboSession(
             ROOT,
@@ -121,6 +116,8 @@ class Harness:
             duration=duration,
             pending=self.pending,  # type: ignore[arg-type]
             registry=self.registry,
+            pace=self.pace,
+            tokens=self.tokens,
             clock=time.time if real_clock else (lambda: self.now),
             sleep=sleep,
         )
@@ -156,7 +153,7 @@ async def test_a_new_token_is_announced_and_ends_the_session(tmp_path) -> None:
     assert h.notifier.turbo_started_calls == [(ROOT, 1, 0.01, 1.0, 1)]
     assert h.notifier.turbo_finished_calls == [(ROOT, "found 1 confirmed contract(s)", 1)]
     assert h.validator.negative_cache_calls == [False]
-    assert h.pending.stopped == [ROOT] and h.pending.listeners == {}
+    assert not h.pace.light_fast(ROOT)  # the site is back to its usual pace
 
 
 async def test_a_new_address_that_is_not_a_token_yet_waits_in_the_pending_watch(
@@ -168,7 +165,7 @@ async def test_a_new_address_that_is_not_a_token_yet_waits_in_the_pending_watch(
     await wait_for_cycles(h.session, 3)
     assert h.pending.offers == [(ADDRESS, ROOT, True)]  # handed over at the turbo pace
     assert h.session.stats.pending == 1 and h.notifier.contracts == []
-    h.pending.listeners[ROOT](ADDRESS)  # the watch saw it deployed and announced it
+    h.tokens.publish({ROOT}, ADDRESS, "Base")  # the watch saw it deployed and announced it
     stats = await asyncio.wait_for(task, timeout=2)
     assert stats.stop_reason == "found 1 confirmed contract(s)"
     assert len(h.validator.calls) == 1  # the session itself checked it once
@@ -568,6 +565,7 @@ class RealSessions:
         self.validator = FakeValidator()
         self.notifier = FakeNotifier()
         self.pending = FakePending()
+        self.pace = SitePace()
         self.cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
         self.cache.load()
 
@@ -587,6 +585,7 @@ class RealSessions:
             duration=duration,
             pending=self.pending,  # type: ignore[arg-type]
             registry=AlertRegistry(),
+            pace=self.pace,
         )
 
 
@@ -609,7 +608,7 @@ async def test_real_session_is_cancelled_on_shutdown(tmp_path) -> None:
     assert factory.notifier.turbo_finished_calls == [(ROOT, "bot is shutting down", 0)]
     assert manager.active() == [] and manager.scheduled() == []
     assert factory.notifier.problems == []  # a cancellation is not a crash
-    assert factory.pending.listeners == {}  # the watch no longer reports to the session
+    assert not factory.pace.light_fast(ROOT)  # the site is back to its usual pace
 
 
 class CrashingSession(StubTurboSession):

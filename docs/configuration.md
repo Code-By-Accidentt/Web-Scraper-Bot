@@ -58,9 +58,12 @@ needs a restart.
 | `TURBO_STOP_AFTER` | 1 | Confirmed contracts that end a session. 0 = only the timer or `/turbo stop`. | `turbo_stop_after` |
 | `TURBO_MAX_SITES` | 1 | Sites in turbo (running or scheduled) at the same time. | `turbo_max_sites` |
 | `TURBO_MAX_PAGES` | 4 | Pages rendered per cycle, the root page included. | `turbo_max_pages` |
-| `LIGHT_TURBO_INTERVAL` | 0.3 | The light mode's pace while a turbo session runs for the site (minimum 0.1). Below 0.3 s asks for `confirm`. | `light_turbo_interval` |
+| `LIGHT_TURBO_INTERVAL` | 0.3 | The light mode's pace while a turbo session or an auto-turbo window runs for the site (minimum 0.1). Below 0.3 s asks for `confirm`. | `light_turbo_interval` |
 | `TURBO_RECHECK_INTERVAL` | 1 | Seconds between on-chain checks of a turbo site's addresses that are not a token yet (the pending watch). Elsewhere an address the page names as the CA is checked every second for 15 min, then every 5 s up to an hour, then every 30 s; any other address every 30 s. | `turbo_recheck_interval` |
 | `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot. The pause doubles per blocked round up to this value; a longer `Retry-After` from the site is honoured as sent. Meanwhile each round first sends one plain GET to the root page and renders nothing while that is refused (every fourth blocked round renders anyway). | `block_max_backoff` |
+| `AUTO_TURBO` | true | Speed a site up by itself around a launch time one of its pages shows: a countdown with launch words next to it, a launch time with its time zone, a countdown target in its scripts or attributes, or a launch phrase ("CA: soon", "presale is live") that appears (see [commands.md](commands.md#auto-turbo)). Off only stops new windows. | `auto_turbo` |
+| `AUTO_TURBO_BEFORE_MINUTES` / `AUTO_TURBO_AFTER_MINUTES` | 10 / 60 | The window: from this long before the launch time (at once when it is closer) to this long after it, or until the site's first token (`TURBO_STOP_AFTER`). Meanwhile the site's rounds run every `TURBO_INTERVAL`, its light mode every `LIGHT_TURBO_INTERVAL` and its addresses every `TURBO_RECHECK_INTERVAL`. | `auto_turbo_before_minutes`, `auto_turbo_after_minutes` |
+| `AUTO_TURBO_MAX_SITES` | 3 | Sites with an auto-turbo window (waiting or running) at once, apart from `TURBO_MAX_SITES`; a launch time on one more site is only reported. Above 3 asks for `confirm`. | `auto_turbo_max_sites` |
 
 ## Unverified mode
 

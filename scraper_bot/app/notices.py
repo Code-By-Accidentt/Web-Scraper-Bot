@@ -11,7 +11,7 @@ from scraper_bot.settings.defaults import ChangedDefault
 from scraper_bot.storage.files import atomic_write_text
 from scraper_bot.telegram.notifier import Notifier
 
-OUTDATED_NOTICE_FILE = "outdated_defaults.txt"  # the old .env values last reported
+OUTDATED_NOTICE_FILE = "outdated_defaults.txt"  # the old .env values we last told the chat about
 SANDBOX_NOTICE_FILE = "no_sandbox_notice.txt"  # kept while the chat knows the sandbox is off
 SANDBOX_HINT = (
     "Pages are then isolated only by the bot's own user account. The sandbox does not start "
@@ -46,7 +46,7 @@ async def tell_about_sandbox(notifier: Notifier, browser: SandboxState, marker: 
             marker.unlink(missing_ok=True)
         return
     if browser.sandbox_error is None or marker.is_file():
-        return  # None: switched off in BROWSER_ARGS on purpose
+        return  # no sandbox_error means BROWSER_ARGS turned it off on purpose
     if await notifier.problem(
         "sandbox", "Chromium runs without its sandbox", browser.sandbox_error, hint=SANDBOX_HINT
     ):

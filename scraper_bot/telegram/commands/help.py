@@ -16,7 +16,7 @@ COMMAND_HELP: tuple[tuple[str, str], ...] = (
         "/turbo <url> [minutes] [at HH:MM | in 10m]",
         "render every few seconds until its token appears",
     ),
-    ("/turbo stop <url>", "end turbo mode; /turbo alone shows turbo status"),
+    ("/turbo stop <url>", "end turbo mode or auto-turbo; /turbo alone shows both"),
     ("/unverified <url> on|off", "announce every new address at once, confirm later"),
     ("/settings [key]", "live settings with explanations; /set <key> <value> changes one"),
     ("/status", "bot health, last round per site, cache sizes"),

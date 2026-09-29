@@ -177,6 +177,7 @@ CAUTION_BOUNDARIES: dict[str, tuple[str, str]] = {
     "turbo_max_sites": ("2", "1"),
     "turbo_max_pages": ("9", "8"),
     "block_max_backoff": ("59.9", "60"),
+    "auto_turbo_max_sites": ("4", "3"),
 }
 
 

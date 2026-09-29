@@ -52,17 +52,17 @@ class ValidationStatus(Enum):
 class AddressKind(Enum):
     """What the chain says an address is, in more detail than "a token or not"."""
 
-    TOKEN = "token"  # ERC-20, SPL / Token-2022 mint or Sui coin: the only kind announced
-    NO_CODE = "no_code"  # EVM: no code on the networks that answered; a wallet or not deployed yet
+    TOKEN = "token"  # ERC-20, SPL / Token-2022 mint or Sui coin, the only kind we announce
+    NO_CODE = "no_code"  # EVM: no code on networks that answered, so a wallet or not deployed yet
     WALLET = "wallet"  # EVM: an EIP-7702 delegated wallet (its "code" is 0xef0100 + address)
-    PAIR = "pair"  # an LP pair or pool; the tokens it holds are in ``resolved``
+    PAIR = "pair"  # an LP pair or pool, with the tokens it holds in ``resolved``
     VAULT = "vault"  # ERC-4626 vault shares: a token, but never a launch
-    STABLE_COPY = "stable_copy"  # a token with a stablecoin's or wrapped coin's symbol: a copy
+    STABLE_COPY = "stable_copy"  # a token copying a stablecoin's or wrapped coin's symbol
     NOT_TOKEN = "not_token"  # a contract, program or account that is not a token
     MISSING = "missing"  # Solana: no account at this address yet
     NOT_YET_MINTED = "not_yet_minted"  # Solana: a decimals-0 mint with nothing minted yet
     NFT = "nft"  # Solana: a decimals-0 mint with a supply of exactly one
-    UNKNOWN = "unknown"  # a cached verdict or no verdict at all
+    UNKNOWN = "unknown"  # we only have a cached verdict, or none at all
 
 
 # Kinds that may still become a token later, so the address is worth watching.
@@ -78,7 +78,7 @@ class ValidationResult:
     network: str | None = None
     kind: AddressKind = AddressKind.UNKNOWN
     resolved: tuple[Address, ...] = ()  # PAIR: its tokens (stop-listed ones left out)
-    via: Address | None = None  # this token was found through that LP pair
+    via: Address | None = None  # the LP pair we found this token through
 
     @property
     def contract(self) -> ConfirmedContract | None:
@@ -88,7 +88,7 @@ class ValidationResult:
         return None
 
 
-LABEL_LIMIT = 64  # characters kept of a token name or symbol
+LABEL_LIMIT = 64  # how many characters of a token name or symbol we keep
 
 
 def clean_label(text: str) -> str | None:
@@ -125,7 +125,7 @@ class ChainVerdict:
     kind: AddressKind
     network: str | None = None  # where the token, LP pair or other contract was found
     sides: tuple[str, ...] = ()  # PAIR: the tokens it holds, stop-listed ones left out
-    # optional networks that did not answer (failed, slow, resting): the verdict may change
+    # optional networks that didn't answer (failed, slow or resting), so the verdict may change
     missing: frozenset[str] = frozenset()
     symbol: str | None = None  # STABLE_COPY: the symbol it copies, e.g. "USDC.e"
 

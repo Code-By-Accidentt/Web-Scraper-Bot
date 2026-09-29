@@ -27,11 +27,11 @@ _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 # How public nodes report a rate limit inside an HTTP 200 answer.
 _RATE_LIMIT_CODES = frozenset({-32005, -32029, 429})
 _RATE_LIMIT_PHRASES = ("rate limit", "too many requests", "limit exceeded")
-BATCH_LIMIT = 50  # calls per HTTP request; public nodes refuse much larger batches
-SINGLE_CALLS_FOR = 600.0  # seconds a node that refused a batch gets single calls
+BATCH_LIMIT = 50  # calls per HTTP request (public nodes refuse much bigger batches)
+SINGLE_CALLS_FOR = 600.0  # how long a node that refused a batch gets single calls (s)
 # HTTP answers to a batch that mean "no batches here", not "this call is wrong".
 _BATCH_REFUSED_STATUSES = frozenset({400, 405, 413, 415, 422, 501})
-# Per HTTP pool: host -> clock time its 429 pause ends, shared by every client on the pool.
+# Per HTTP pool: host -> clock time its 429 pause ends. Every client on that pool shares it.
 _COOLDOWNS: weakref.WeakKeyDictionary[httpx.AsyncClient, dict[str, float]] = (
     weakref.WeakKeyDictionary()
 )
@@ -55,8 +55,8 @@ class RpcCallError(RpcError):
 class RetryPolicy:
     """How a client retries quick failures and backs off from a host after an HTTP 429."""
 
-    delays: tuple[float, ...] = (0.25, 1.0)  # pause before each retry; one retry per entry
-    # Cap on a pause taken from Retry-After; the host's 429 cooldown may still be longer.
+    delays: tuple[float, ...] = (0.25, 1.0)  # pause before each retry, one retry per entry
+    # Cap on a pause taken from Retry-After. The host's 429 cooldown can still be longer.
     max_retry_after: float = 3.0
     cooldown_cap: float = 30.0  # longest pause for a host after an HTTP 429
 
@@ -248,7 +248,7 @@ class JsonRpcClient:
         timeout = max(deadline - self._clock(), 0.1)
         try:
             response = await self._http.post(self._url, json=payload, timeout=timeout)
-        except httpx.TimeoutException as exc:  # the budget is spent: no retry
+        except httpx.TimeoutException as exc:  # the budget is spent, so no retry
             raise self._transport_error(method, exc) from exc
         except httpx.TransportError as exc:  # refused, reset, HTTP/2 protocol error
             raise _Retryable(self._transport_error(method, exc)) from exc
@@ -273,7 +273,7 @@ class JsonRpcClient:
         except ValueError as exc:
             raise RpcError(f"{method} via {self._host}: invalid JSON") from exc
         if isinstance(payload, list) and isinstance(data, dict):
-            # One error for the whole batch: a rate limit, or else the node refuses such batches.
+            # One error for the whole batch: a rate limit, or the node won't take such batches.
             error = data.get("error")
             if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
                 raise _Retryable(RpcError(f"{method} via {self._host}: rate limited"))

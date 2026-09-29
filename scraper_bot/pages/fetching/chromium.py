@@ -39,29 +39,30 @@ _T = TypeVar("_T")
 _SCANNED_RESOURCE_TYPES = frozenset({"document", "script", "xhr", "fetch", "other"})
 _SCANNED_CONTENT_TYPES = ("javascript", "ecmascript", "json", "text/", "xml")
 _PER_RESPONSE_LIMIT = 3 * 1024 * 1024
-# Words in a launch error that mean the sandbox failed ("No usable sandbox!", namespaces).
+# A launch error with one of these words means the sandbox failed ("No usable sandbox!").
 _SANDBOX_TROUBLE = ("sandbox", "namespace", "zygote", "setuid")
-# What every call raises (a plain Exception, not a Playwright error) once the driver is gone.
+# Once the driver is gone, every call raises this. It's a plain Exception, not a
+# Playwright error.
 _DRIVER_GONE = "connection closed while reading from the driver"
 _CLOSE_TIMEOUT = 5.0  # seconds a tab, the browser or the driver gets to close
-RECYCLE_AFTER = 3600.0  # seconds one Playwright driver serves before a fresh one replaces it
-RECYCLE_RENDERS = 10_000  # renders one Playwright driver serves before a fresh one replaces it
+RECYCLE_AFTER = 3600.0  # seconds before we swap the Playwright driver for a fresh one
+RECYCLE_RENDERS = 10_000  # or this many renders, whichever comes first
 _RECYCLE_WAIT = 30.0  # seconds a scheduled restart waits for the renders in flight
-# With automation hidden: what the browser and the HTTP clients say about the reader.
+# With automation hidden, the browser and the HTTP clients tell sites the reader's language.
 LOCALE = "en-US"
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 _BLINK_FEATURES = "--disable-blink-features="
-_AUTOMATION_FEATURE = "AutomationControlled"  # disabled, navigator.webdriver reads false
-STATE_FILE = "browser_state.json"  # cookies and local storage kept between browsers
+_AUTOMATION_FEATURE = "AutomationControlled"  # turned off so navigator.webdriver reads false
+STATE_FILE = "browser_state.json"  # cookies and local storage that survive a browser restart
 _STATE_EVERY = 300.0  # seconds between saves of the browser state
 _STATE_READ_TIMEOUT = 2.0  # seconds the browser gets to hand over its state
 _STATE_MAX_CHARS = 2 * 1024 * 1024  # a bigger state is saved with its cookies only
 _MAX_API_CALLS = 100  # JSON API calls noted per render
-# The light mode's fetch() from a tab: kept tabs ("anchors") wait on a light document of
-# their site's origin, so the requests carry the browser's cookies, headers and TLS.
+# Light mode's fetch() from a tab. We keep a tab ("anchor") open on a light document of
+# each site's origin, so its requests carry the browser's cookies, headers and TLS.
 _ANCHOR_PATH = "/robots.txt"
 _MAX_ANCHORS = 8
-_TAB_FETCH_LIMIT = 3 * 1024 * 1024  # characters of an answer handed over
+_TAB_FETCH_LIMIT = 3 * 1024 * 1024  # characters of an answer we pass back to Python
 _TAB_FETCH_JS = """
 async ([url, limit]) => {
   const response = await fetch(url, {cache: "no-cache", credentials: "include"});
@@ -249,14 +250,14 @@ class PlaywrightFetcher:
         self._state_path = settings.data_dir / STATE_FILE
         self._state_saved = 0.0  # when the browser state was last saved, on ``clock``
         self._saving: asyncio.Task[None] | None = None
-        self.user_agent: str | None = None  # what the browser sends; None: its own
-        # Called with the User-Agent after every launch, so HTTP clients can send the same.
+        self.user_agent: str | None = None  # User-Agent the browser sends, None if left as is
+        # Gets the User-Agent after each launch that sets one, so HTTP clients can send the same.
         self.on_user_agent: Callable[[str], None] | None = None
         self._sandbox = "--no-sandbox" not in self._args
-        self.sandbox_error: str | None = None  # why the sandbox was dropped; None if it was not
+        self.sandbox_error: str | None = None  # why we dropped the sandbox, None if we didn't
         self._launched = False
         self._stopped = False
-        # Called when a relaunch drops the sandbox; the first start is reported by the app.
+        # Called when a relaunch drops the sandbox (the app reports the first start itself).
         self.on_sandbox_lost: Callable[[str], None] | None = None
         self._up_since = 0.0  # when the running driver started, on ``clock``
         self._renders = 0  # renders since then
@@ -365,7 +366,7 @@ class PlaywrightFetcher:
             self._taps[page] = _EarlyTap(on_text)
         responses: list[pw.Response] = []
         if deep_scan:
-            # Playwright wraps the handler; a builtin like responses.append breaks it.
+            # Playwright wraps the handler, and a builtin like responses.append breaks that.
             page.on("response", lambda response: responses.append(response))
         api_calls: list[str] = []
         page.on("response", lambda response: _note_api_call(api_calls, response))
@@ -388,7 +389,7 @@ class PlaywrightFetcher:
                     raise
                 return FetchResult(url, None, error=self._brief(exc))
             if tuning.network_idle_timeout > 0:
-                # A page that keeps polling never goes idle; the settle delay covers it.
+                # A page that keeps polling never goes idle. The settle delay covers that case.
                 with contextlib.suppress(pw.TimeoutError):
                     await page.wait_for_load_state(
                         "networkidle", timeout=tuning.network_idle_timeout * 1000
@@ -403,7 +404,7 @@ class PlaywrightFetcher:
                     else ((), ())
                 )
             except TimeoutError:
-                # A script that never yields (an endless loop) keeps the page from answering.
+                # A script stuck in an endless loop keeps the page from answering.
                 return FetchResult(
                     url,
                     None,
@@ -535,8 +536,8 @@ class PlaywrightFetcher:
         with contextlib.suppress(pw.Error):
             take(str(await _within(seconds, page.evaluate(_SHADOW_ROOTS_JS)) or ""))
         dom = len(texts)
-        # URL order, not arrival order: every render fills the budget with the same bodies,
-        # so an address skipped once does not turn up later as "new".
+        # Sort by URL, not by arrival, so every render fills the budget with the same bodies
+        # and an address we skipped once doesn't show up later as "new".
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(seconds):
                 for response in sorted(responses, key=lambda item: item.url):
@@ -710,7 +711,7 @@ class PlaywrightFetcher:
             context = await self._open_context(browser, user_agent)
             context.on("page", self._tabs.on_page)
             await context.route("**/*", self._route)
-            # The binding first: the observer calls it from the first node the page parses.
+            # The binding goes first, because the observer calls it from the first node parsed.
             await context.expose_binding(EARLY_BINDING, self._on_early)
             await context.add_init_script(OBSERVER_JS)
         except BaseException:

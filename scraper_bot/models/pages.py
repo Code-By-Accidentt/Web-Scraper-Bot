@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from scraper_bot.models.addresses import Address
+from scraper_bot.models.launch import LaunchClues
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +156,7 @@ class PageCheckOutcome:
     signature: Signature | None = None
     api_calls: tuple[str, ...] = ()
     ticking: bool = False
+    launch: LaunchClues | None = None  # what the render says about a coming launch
 
 
 def shorten(text: str, limit: int) -> str:

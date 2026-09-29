@@ -19,9 +19,9 @@ from pathlib import Path
 
 import psutil
 
-STOP_GRACE = 30.0  # seconds a stopping bot gets to send its last alerts and close the browser
-QUICK_EXIT = 60.0  # seconds; a bot that exits sooner after starting is failing at start
-# Pauses in seconds before restarting a bot that keeps failing at start; the last repeats.
+STOP_GRACE = 30.0  # how long a stopping bot gets to send its last alerts and close the browser (s)
+QUICK_EXIT = 60.0  # a bot that exits within this many seconds of starting is failing at start
+# Pauses in seconds before restarting a bot that keeps failing at start. The last one repeats.
 RESTART_PAUSES = (5.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0)
 # Exit codes a restart cannot cure (see scraper_bot/app/cli.py).
 NEEDS_A_HUMAN = {2: "configuration error or rejected token", 3: "the browser could not start"}

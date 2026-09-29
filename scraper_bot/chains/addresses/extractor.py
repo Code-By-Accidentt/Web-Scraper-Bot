@@ -9,13 +9,13 @@ from typing import ClassVar, TypeVar
 from scraper_bot.chains.addresses.formats import MOVE_IDENT, canonical_address, sui_package
 from scraper_bot.models.addresses import Address, Chain
 
-# No match may be glued to other alphanumerics: those are hash fragments or minified names.
-# ``::`` after 40 hex digits makes a short Sui coin type, not an EVM address.
+# A match glued to other letters or digits is part of a hash or a minified name, so we skip it.
+# ``::`` right after 40 hex digits means a short Sui coin type, not an EVM address.
 EVM_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{40}(?![0-9A-Za-z]|::)")
 _BASE58 = "1-9A-HJ-NP-Za-km-z"
 SOLANA_ADDRESS_RE = re.compile(rf"(?<![0-9A-Za-z])[{_BASE58}]{{32,44}}(?![0-9A-Za-z])")
-# Base64 data: URIs (also JSON-escaped, image\/png) are full of base58-looking runs. The
-# parameter list is capped: an open one let every "data:" rescan the rest of the text.
+# Base64 data: URIs (JSON-escaped ones too, image\/png) are full of runs that look like base58.
+# The parameter list is capped at 8: without a cap, every "data:" rescanned the rest of the text.
 _DATA_URI_RE = re.compile(
     r"data:[\w.+-]+\\?/[\w.+-]+(?:;[\w.+-]+=[^;,\s\"'<>]*){0,8};base64,[A-Za-z0-9+/=\\_-]*",
     re.IGNORECASE,
@@ -23,7 +23,7 @@ _DATA_URI_RE = re.compile(
 SUI_COIN_TYPE_RE = re.compile(
     rf"(?<![0-9A-Za-z_])0x[0-9a-fA-F]{{1,64}}::{MOVE_IDENT}::{MOVE_IDENT}(?![0-9A-Za-z_:])"
 )
-# Ethereum tx hashes are 64 hex too, so bare Sui ids count only on pages that mention Sui.
+# Ethereum tx hashes are 64 hex digits too, so bare Sui ids only count on pages that mention Sui.
 SUI_ADDRESS_RE = re.compile(r"(?<![0-9A-Za-z])0x[0-9a-fA-F]{64}(?![0-9A-Za-z])")
 SUI_CONTEXT_RE = re.compile(r"\bsui\b|suiscan|suivision|cetus|bluefin|turbos|movepump", re.I)
 
@@ -61,7 +61,7 @@ class AddressExtractor:
         if sui_context is None:
             sui_context = SUI_CONTEXT_RE.search(text) is not None
         if "base64," in text or "BASE64," in text or "Base64," in text:
-            # Blanked out, not cut out: offsets and the context around matches stay the same.
+            # Blank them out, don't cut them, so offsets and the text around matches stay put.
             text = _DATA_URI_RE.sub(lambda match: " " * len(match.group(0)), text)
         found: list[tuple[Address, int]] = []
         for chain in self._chains:

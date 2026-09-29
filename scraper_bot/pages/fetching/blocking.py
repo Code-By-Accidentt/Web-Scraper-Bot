@@ -13,7 +13,7 @@ from scraper_bot.models.pages import BlockSignal
 from scraper_bot.pages.fetching.result import FetchResult
 
 _BLOCK_STATUSES = frozenset({401, 403, 407, 429, 503})
-# Added to a block's reason when the protection itself is not recognised.
+# Phrases added to a block's reason when we can't tell which protection it is.
 _CHALLENGE_MARKERS = (
     "just a moment",
     "attention required",
@@ -28,7 +28,8 @@ _CHALLENGE_MARKERS = (
     "cf-chl",
     "vercel security checkpoint",
 )
-# Title starts that mark a 2xx page as a challenge; a real page may mention a captcha later.
+# Title starts that mark a 2xx page as a challenge. Only the start counts, since a real page
+# may mention a captcha further on.
 _CHALLENGE_TITLES = (
     "just a moment",
     "attention required",
@@ -44,8 +45,8 @@ _CHALLENGE_TITLES = (
     "pardon our interruption",
     "vercel security checkpoint",
 )
-# A whole title part that is a challenge phrase ("site | Access Denied"). A bare word is not
-# enough: "Verification | Launchpad" and "Challenge | Meme Arena" are real pages.
+# A whole title part that's a challenge phrase ("site | Access Denied"). A bare word isn't
+# enough, since "Verification | Launchpad" and "Challenge | Meme Arena" are real pages.
 _CHALLENGE_PART_RE = re.compile(
     r"(?:security|human|bot|browser) (?:check|captcha|challenge|verification)"
     r"|captcha (?:check|challenge|verification)"
@@ -55,12 +56,13 @@ _CHALLENGE_PART_RE = re.compile(
     r"|access denied|attention required!?|just a moment\.*|one more step|ddos protection"
 )
 _TITLE_SEPARATORS_RE = re.compile(r"\s+[|\-–—:·]\s+|\s*[|·]\s*")
-# (name, header signs, page signs); a header sign is "header" or "header=value prefix".
-# The first match wins, so the bare CDNs come last: they front normal pages too.
+# Each entry is (name, header signs, page signs), and a header sign is "header" or
+# "header=value prefix". The first match wins, and the plain CDNs come last because they
+# sit in front of normal pages too.
 _PROTECTIONS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     (
-        # Interstitial-only markers: challenge-platform scripts and cf-chl-widget ids sit
-        # on normal pages too.
+        # Only marks of the interstitial itself. Challenge-platform scripts and cf-chl-widget
+        # ids show up on normal pages too, so they're not here.
         "Cloudflare challenge",
         ("cf-mitigated=challenge",),
         ("_cf_chl_opt", "orchestrate/chl_page", "orchestrate/managed", "challenge-error-text"),
@@ -78,8 +80,9 @@ _PROTECTIONS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("Akamai", ("server=akamaighost",), ()),
     ("Cloudflare", ("cf-ray", "server=cloudflare"), ("| cloudflare</title>", "cf-error-details")),
 )
-# Widgets a person must solve: (name, substring checked first, pattern). Invisible ones
-# (size=invisible, checkbox-invisible) are left out; bounded runs keep hostile HTML cheap.
+# Widgets a person has to solve, as (name, substring checked first, pattern). Invisible
+# ones (size=invisible, checkbox-invisible) are left out. The length caps in the patterns
+# keep hostile HTML cheap to scan.
 _CAPTCHA_WIDGETS = (
     (
         "reCAPTCHA",

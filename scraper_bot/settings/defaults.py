@@ -43,7 +43,7 @@ class ChangedDefault:
     current: str
 
 
-# A .env copied from an older .env.example pins its old defaults; start-up reports them.
+# A .env copied from an older .env.example pins its old defaults, and we report them at start.
 CHANGED_DEFAULTS: tuple[ChangedDefault, ...] = (
     # 2.1: api.mainnet-beta answered 60 of 100 parallel calls with HTTP 429
     ChangedDefault("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", DEFAULT_SOLANA_RPC_URL),

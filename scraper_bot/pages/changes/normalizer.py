@@ -13,7 +13,8 @@ from lxml import html as lxml_html
 
 from scraper_bot.models.pages import Node, Signature
 
-# Subtrees with nothing worth comparing; a canvas's size is set by JS and differs per render.
+# Subtrees with nothing worth comparing. A canvas gets its size from JS, and that differs
+# from render to render.
 DROP_TAGS = frozenset(
     {
         "script",
@@ -52,11 +53,11 @@ TRACKING_PARAMS = frozenset(
     }
 )
 
-# Attributes kept per element, the first in document order. A script can set thousands on
-# one element, and lxml needs quadratic time to parse and to read that many.
+# We keep this many attributes per element, the first ones in document order. A script can
+# set thousands on one element, and lxml takes quadratic time to parse and read that many.
 MAX_ATTRIBUTES = 200
 _NAME = r"[^\s\"'<>/=]"
-# A start tag with more attributes than that, written the way Chromium writes them.
+# A start tag with more attributes than that, in the name="value" form Chromium writes.
 _ATTRIBUTE_FLOOD_RE = re.compile(
     rf'(<[A-Za-z]{_NAME}*(?:\s+{_NAME}+="[^"]*"){{{MAX_ATTRIBUTES}}})(?:\s+{_NAME}+="[^"]*")+'
 )
@@ -64,7 +65,7 @@ _ATTRIBUTE_FLOOD_RE = re.compile(
 _WS_RE = re.compile(r"\s+")
 # Zero-width spaces and joiners, direction marks, the word joiner and the BOM.
 _INVISIBLE_RE = re.compile(r"[​-‏⁠﻿]")
-# Pages are parsed in worker threads; an lxml parser must not be shared between threads.
+# Pages get parsed in worker threads, and an lxml parser can't be shared between threads.
 _PARSERS = threading.local()
 
 
@@ -72,12 +73,27 @@ def _parser() -> lxml_html.HTMLParser:
     """Return this thread's HTML parser, creating it on first use."""
     parser = getattr(_PARSERS, "parser", None)
     if parser is None:
-        # huge_tree: without it libxml2 silently drops everything after a text node over 10 MB.
+        # Without huge_tree, libxml2 quietly drops everything after a text node over 10 MB.
         parser = lxml_html.HTMLParser(
             encoding="utf-8", remove_comments=True, remove_pis=True, huge_tree=True
         )
         _PARSERS.parser = parser
     return parser
+
+
+def parse_document(html: str) -> lxml_html.HtmlElement | None:
+    """Return the document root, or None when the HTML is empty or cannot be parsed.
+
+    Start tags with more than :data:`MAX_ATTRIBUTES` attributes lose the rest first.
+    """
+    text = html.replace("\x00", "").strip()
+    if not text:
+        return None
+    text = _ATTRIBUTE_FLOOD_RE.sub(r"\1", text)
+    try:
+        return lxml_html.document_fromstring(text.encode("utf-8"), parser=_parser())
+    except (etree.ParserError, etree.XMLSyntaxError, ValueError, TypeError):
+        return None
 
 
 class HtmlNormalizer:
@@ -97,7 +113,7 @@ class HtmlNormalizer:
 
         The subtrees in :data:`DROP_TAGS` (scripts, styles, frames, ...) are dropped first.
         """
-        root = self._parse(html)
+        root = parse_document(html)
         if root is None:
             return ()
         for element in list(root.iter(*DROP_TAGS)):
@@ -112,21 +128,6 @@ class HtmlNormalizer:
                 nodes.append(node)
         return tuple(nodes)
 
-    @staticmethod
-    def _parse(html: str) -> lxml_html.HtmlElement | None:
-        """Return the document root, or None when the HTML is empty or cannot be parsed.
-
-        Start tags with more than :data:`MAX_ATTRIBUTES` attributes lose the rest first.
-        """
-        text = html.replace("\x00", "").strip()
-        if not text:
-            return None
-        text = _ATTRIBUTE_FLOOD_RE.sub(r"\1", text)
-        try:
-            return lxml_html.document_fromstring(text.encode("utf-8"), parser=_parser())
-        except (etree.ParserError, etree.XMLSyntaxError, ValueError, TypeError):
-            return None
-
     def _node(self, element: lxml_html.HtmlElement) -> Node | None:
         """Return the node for one element, or None when it has no attributes and no own text.
 
@@ -134,7 +135,7 @@ class HtmlNormalizer:
         """
         attrib = element.attrib
         if len(attrib) > MAX_ATTRIBUTES:
-            # Read lazily: lxml looks every value up from the first attribute on.
+            # Read them lazily, since lxml finds each value by walking from the first attribute.
             items = list(islice(attrib.iteritems(), MAX_ATTRIBUTES))
         else:
             items = attrib.items()
@@ -180,7 +181,7 @@ class HtmlNormalizer:
             return url
         try:
             parts = urlsplit(url)
-        except ValueError:  # "https://[YOUR_HOST]/x?y": not a URL, just text to compare
+        except ValueError:  # "https://[YOUR_HOST]/x?y" isn't a real URL, just text to compare
             return url
         kept = [
             (name, val)

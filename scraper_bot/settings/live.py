@@ -55,6 +55,10 @@ class Tuning(Protocol):
     turbo_max_pages: int
     turbo_recheck_interval: float
     block_max_backoff: float
+    auto_turbo: bool
+    auto_turbo_before: float
+    auto_turbo_after: float
+    auto_turbo_max_sites: int
 
 
 class PreferenceError(ValueError):
@@ -241,7 +245,7 @@ class Preferences:
             kind = "an integer" if spec.kind == "int" else "a number"
             raise PreferenceError(f"{spec.key} takes {kind}, got {raw!r}") from exc
         if spec.kind == "float" and not math.isfinite(value):
-            # nan compares false against every bound and would poison the delays.
+            # nan compares false to everything, so it would pass the limits and poison the delays.
             raise PreferenceError(f"{spec.key} takes a finite number, got {raw!r}")
         if spec.minimum is not None and value < spec.minimum:
             raise PreferenceError(

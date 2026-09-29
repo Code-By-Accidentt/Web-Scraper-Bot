@@ -25,7 +25,7 @@ class Sighting:
     address: Address
     source: SightingSource
     context: str = ""  # up to 60 characters before the address, other addresses masked
-    hinted: bool = False  # the words before it name it: CA, contract, mint, token, pump.fun/...
+    hinted: bool = False  # a hint word comes before it: CA, contract, mint, token, pump.fun/...
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +41,7 @@ class Observation:
     sightings: tuple[Sighting, ...]
     # verdicts for the sightings' addresses, then for the tokens behind LP pairs (``via``)
     results: tuple[ValidationResult, ...]
-    # when the render began: what the page shows is from between this and ``seen_at``
+    # when the render began, so the content shown is from between this and ``seen_at``
     started_at: float | None = None
     read: bool = True
 
@@ -51,6 +51,6 @@ class Timeline:
     """When a token showed up, for the ⏱ line of its alert (epoch seconds)."""
 
     found_at: float  # the check that confirmed it
-    missing_at: float | None = None  # the check before: the address was not there yet
+    missing_at: float | None = None  # the check before, when the address wasn't there yet
     on_page_since: float | None = None  # first seen on the page, when that was earlier
     deployed: bool = False  # confirmed by the pending watch

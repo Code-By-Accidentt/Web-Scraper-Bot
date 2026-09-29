@@ -31,7 +31,7 @@ HTTP_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/128.0.0.0 Safari/537.36"
 )
-KEEPALIVE = 60.0  # seconds an idle HTTP connection is kept for reuse
+KEEPALIVE = 60.0  # how long an idle HTTP connection stays open for reuse (s)
 
 
 class Application:
@@ -51,7 +51,7 @@ class Application:
         cfg = self._settings
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
         self._prefs.load()
-        # httpx drops idle connections after 5 s; KEEPALIVE lets the 30 s warm-up keep RPC open.
+        # httpx drops idle connections after 5 s. KEEPALIVE lets the 30 s warm-up keep them open.
         limits = httpx.Limits(
             max_connections=64, max_keepalive_connections=32, keepalive_expiry=KEEPALIVE
         )

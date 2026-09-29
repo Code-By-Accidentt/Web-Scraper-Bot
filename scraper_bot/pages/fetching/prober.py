@@ -9,7 +9,7 @@ import httpx
 from scraper_bot.chains.rpc.client import parse_retry_after
 from scraper_bot.pages.fetching.result import FetchResult
 
-_PEEK_BYTES = 64 * 1024  # enough for a challenge page's title and its protection's marks
+_PEEK_BYTES = 64 * 1024  # enough for a challenge page's title and the signs of its protection
 
 
 @dataclass(frozen=True, slots=True)

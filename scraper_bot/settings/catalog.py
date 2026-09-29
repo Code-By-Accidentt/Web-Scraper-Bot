@@ -16,16 +16,16 @@ class PreferenceSpec:
     The user types values in ``unit``; ``scale`` turns them into the base unit Settings uses.
     """
 
-    key: str  # user-facing name, e.g. rejected_ttl_hours
+    key: str  # the name the user types, e.g. rejected_ttl_hours
     attr: str  # Settings attribute holding the base-unit value, e.g. rejected_ttl
     section: str
-    kind: str  # bool | int | float
+    kind: str  # "bool", "int" or "float"
     label: str
     description: str
     minimum: float | None = None
     maximum: float | None = None
     unit: str = ""
-    scale: float = 1.0  # base value = user value * scale (hours -> seconds = 3600)
+    scale: float = 1.0  # base value = user value * scale, e.g. 3600 for hours to seconds
     caution: Caution | None = None  # returns a warning for a risky value, else None
 
     def format(self, value: Any) -> str:
@@ -353,7 +353,7 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         "turbo",
         "float",
         "Light mode in turbo: seconds between polls",
-        "The light mode's pace while a turbo session runs for the site.",
+        "The light mode's pace while a turbo session or an auto-turbo window runs for the site.",
         0.1,
         60,
         "s",
@@ -449,6 +449,58 @@ PREFERENCES: tuple[PreferenceSpec, ...] = (
         3600,
         "s",
         caution=_below(60, "Backing off less than a minute rarely lets a block expire."),
+    ),
+    PreferenceSpec(
+        "auto_turbo",
+        "auto_turbo",
+        "turbo",
+        "bool",
+        "Auto-turbo around a launch time",
+        "When a page shows a launch time (a countdown with launch words next to it, a date "
+        "with its time zone, a countdown target in its scripts) or a phrase such as "
+        '"CA: soon" or "presale is live" appears on it, the site is checked faster around '
+        "that time: rounds every turbo_interval, light polls every light_turbo_interval, its "
+        "addresses every turbo_recheck_interval. Off only stops new windows.",
+    ),
+    PreferenceSpec(
+        "auto_turbo_before_minutes",
+        "auto_turbo_before",
+        "turbo",
+        "float",
+        "Auto-turbo: start before the launch time",
+        "The faster checks start this long before the time the page shows (at once when it "
+        "is closer).",
+        0,
+        1440,
+        "min",
+        scale=60,
+    ),
+    PreferenceSpec(
+        "auto_turbo_after_minutes",
+        "auto_turbo_after",
+        "turbo",
+        "float",
+        "Auto-turbo: go on after the launch time",
+        "The faster checks end this long after the time the page shows, or at the site's "
+        "first token (turbo_stop_after), whichever comes first.",
+        1,
+        1440,
+        "min",
+        scale=60,
+    ),
+    PreferenceSpec(
+        "auto_turbo_max_sites",
+        "auto_turbo_max_sites",
+        "turbo",
+        "int",
+        "Auto-turbo: sites at the same time",
+        "How many sites may have an auto-turbo window (waiting or running) at once; a launch "
+        "time found on one more site is only reported.",
+        1,
+        10,
+        caution=_above(
+            3, "Every site in auto-turbo renders its pages every turbo_interval seconds."
+        ),
     ),
 )
 
