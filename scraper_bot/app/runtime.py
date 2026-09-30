@@ -218,7 +218,7 @@ def build_runtime(
         retry_delay=cfg.rpc_retry_delay,
         on_stuck=notifier.rpc_endpoints_stuck,
     )
-    snapshots = SnapshotStore(cfg.data_dir / "snapshots")
+    snapshots = SnapshotStore(cfg.data_dir / "snapshots", report=notifier.report_later)
     extractor = AddressExtractor(stoplist=stoplist)
     block_detector = BlockDetector()
     normalizer = HtmlNormalizer(cfg.ignored_attributes)
@@ -301,6 +301,8 @@ def build_runtime(
             persist=persist,
             tuning=prefs,
             registry=registry,
+            pending=pending,
+            tokens=tokens,
         )
         return SiteMonitor(
             site,
@@ -391,7 +393,9 @@ def build_runtime(
         turbo=turbo,
         commands=commands,
         listener=TelegramListener(telegram, commands),
-        heartbeat=Heartbeat(cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval),
+        heartbeat=Heartbeat(
+            cfg.data_dir / HEARTBEAT_FILE, cfg.heartbeat_interval, report=notifier.report_later
+        ),
         notifier=notifier,
         validator=validator,
         warmer=ConnectionWarmer(http, cfg, record=validator.record),

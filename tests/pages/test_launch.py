@@ -98,6 +98,12 @@ def flow(number: int) -> str:
             [],
         ),
         ("<p>Trading opens at 10:00 AM EST</p>", [], [utc(EASTERN)], []),
+        (  # a long s reads as an "s"
+            "<p>Trading starts in 5\u017f</p><p>Launch: \u017fep 30, 15:00 UTC</p>",
+            [(5, 1)],
+            [utc(15)],
+            [],
+        ),
         ("<p>Launch Oct 30, 15:00 UTC</p>", [], [], []),  # further than a day ahead
         # countdown targets in scripts and attributes
         (

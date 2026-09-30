@@ -64,7 +64,7 @@ async def test_every_endpoint_is_pinged_each_interval(tmp_path: Path) -> None:
     assert len(seen) == 10  # five endpoints, two rounds, no retries
 
 
-async def test_only_failures_feed_the_endpoint_health(tmp_path: Path) -> None:
+async def test_answers_and_failures_feed_the_endpoint_health(tmp_path: Path) -> None:
     seen: list[tuple[str, str]] = []
     recorded: list[tuple[str, bool]] = []
 
@@ -80,5 +80,11 @@ async def test_only_failures_feed_the_endpoint_health(tmp_path: Path) -> None:
         )
         with pytest.raises(asyncio.CancelledError):
             await warmer.run()
-    # A ping that works says nothing about the heavier calls of a check: not recorded.
-    assert recorded == [("Solana", False)]
+    # An answer ends a glitch, so two glitches far apart never read as one long outage.
+    assert sorted(recorded) == [
+        ("Arbitrum", True),
+        ("Base", True),
+        ("Ethereum", True),
+        ("Solana", False),
+        ("Sui", True),
+    ]

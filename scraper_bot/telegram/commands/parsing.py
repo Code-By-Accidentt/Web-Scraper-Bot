@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 _DELAY_RE = re.compile(r"^(\d+)([mh])$", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_MAX_DELAY = 7 * 86_400  # the latest start "/turbo … in" takes, in seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +27,8 @@ class TurboRequest:
 def parse_turbo_request(tokens: Sequence[str], now: float) -> TurboRequest:
     """Parse the words ``<url> [minutes] [at HH:MM | in 10m]`` of a /turbo command.
 
-    Raises ValueError with a message for the user when an argument does not fit.
+    Raises ValueError with a message for the user when an argument does not fit, or when
+    the start is more than 7 days away.
     """
     url, rest = tokens[0], list(tokens[1:])
     minutes: float | None = None
@@ -48,7 +50,10 @@ def parse_turbo_request(tokens: Sequence[str], now: float) -> TurboRequest:
             if not match:
                 raise ValueError("the delay must look like 10m or 2h")
             unit = 60 if match.group(2).lower() == "m" else 3600
-            start_at = now + int(match.group(1)) * unit
+            delay = int(match.group(1)) * unit
+            if delay > _MAX_DELAY:
+                raise ValueError("the delay can be at most 7 days (168h)")
+            start_at = now + delay
             index += 2
         else:
             raise ValueError(f"unexpected argument {rest[index]!r}")

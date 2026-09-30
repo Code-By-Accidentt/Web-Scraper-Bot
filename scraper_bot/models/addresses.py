@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 
 
@@ -28,10 +28,15 @@ class Address:
 
 @dataclass(frozen=True, slots=True)
 class ConfirmedContract:
-    """An address an RPC node confirmed to be a contract, an SPL mint or a Sui coin/package."""
+    """An address an RPC node confirmed to be a contract, an SPL mint or a Sui coin/package.
+
+    The coin type found behind a bare Sui package rides along for the alert's links and
+    details; it is not part of the contract's identity.
+    """
 
     address: Address
     network: str
+    coin_type: str | None = field(default=None, compare=False)
 
 
 class ValidationStatus(Enum):
@@ -79,12 +84,13 @@ class ValidationResult:
     kind: AddressKind = AddressKind.UNKNOWN
     resolved: tuple[Address, ...] = ()  # PAIR: its tokens (stop-listed ones left out)
     via: Address | None = None  # the LP pair we found this token through
+    coin_type: str | None = None  # Sui: the coin found behind a bare package id
 
     @property
     def contract(self) -> ConfirmedContract | None:
         """The confirmed contract, or None unless the status is CONFIRMED with a network."""
         if self.status is ValidationStatus.CONFIRMED and self.network:
-            return ConfirmedContract(self.address, self.network)
+            return ConfirmedContract(self.address, self.network, self.coin_type)
         return None
 
 
@@ -128,6 +134,7 @@ class ChainVerdict:
     # optional networks that didn't answer (failed, slow or resting), so the verdict may change
     missing: frozenset[str] = frozenset()
     symbol: str | None = None  # STABLE_COPY: the symbol it copies, e.g. "USDC.e"
+    coin_type: str | None = None  # Sui: the coin found behind a bare package id
 
     @property
     def partial(self) -> bool:

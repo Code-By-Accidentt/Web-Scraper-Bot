@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from dataclasses import dataclass
 
 import httpx
@@ -19,17 +20,24 @@ class ProbeResult:
     url: str
     status: int | None
     error: str | None = None
+    unreachable: bool = False  # the host name did not resolve, or the host refused to connect
 
     @property
     def worth_rendering(self) -> bool:
         """False only when the page certainly does not exist.
 
-        Network failures and 404/410 answers are conclusive. Anything else (403 from a bot
-        shield, 405 for HEAD, 5xx) is left to the browser.
+        A 404 or 410 answer, a host name that does not resolve and a refused connection are
+        conclusive. Anything else (403 from a bot shield, 405 for HEAD, 5xx, a timeout, a
+        certificate the browser accepts anyway) is left to the browser.
         """
         if self.error is not None:
-            return False
+            return not self.unreachable
         return self.status not in {404, 410}
+
+    @property
+    def gone(self) -> bool:
+        """True when the server answered that the page does not exist (404 or 410)."""
+        return self.error is None and self.status in {404, 410}
 
 
 class HttpProber:
@@ -58,7 +66,8 @@ class HttpProber:
                     status = streamed.status_code
             return ProbeResult(url, status)
         except httpx.HTTPError as exc:
-            return ProbeResult(url, None, error=f"{type(exc).__name__}: {exc}"[:200])
+            error = f"{type(exc).__name__}: {exc}"[:200]
+            return ProbeResult(url, None, error=error, unreachable=_unreachable(exc))
 
     async def peek(self, url: str) -> FetchResult:
         """Ask for ``url`` with one GET and return its status, headers and first 64 KB.
@@ -88,3 +97,17 @@ class HttpProber:
                 )
         except httpx.HTTPError as exc:
             return FetchResult(url, None, error=f"{type(exc).__name__}: {exc}"[:200])
+
+
+def _unreachable(error: BaseException) -> bool:
+    """True when ``error`` comes from a host name that does not resolve or a refused connection.
+
+    httpx wraps the socket's own error, so we follow the causes down to it. When the host
+    has several addresses, every attempt must have been refused.
+    """
+    if isinstance(error, socket.gaierror | ConnectionRefusedError):
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        return all(_unreachable(attempt) for attempt in error.exceptions)
+    cause = error.__cause__ or error.__context__
+    return cause is not None and _unreachable(cause)

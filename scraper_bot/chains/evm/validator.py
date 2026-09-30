@@ -29,7 +29,17 @@ from scraper_bot.settings.live import Tuning
 log = logging.getLogger(__name__)
 
 
-_REVERT_MARKERS = ("revert", "invalid opcode", "out of gas", "vm execution")
+_REVERT_MARKERS = (
+    "revert",
+    "invalid opcode",
+    "out of gas",
+    "vm execution",
+    # How geth words the other ways a call can fail inside the EVM.
+    "invalid jump destination",
+    "stack underflow",
+    "stack limit reached",
+    "return data out of bounds",
+)
 # With this many requests already in the background, a lookup waits for all its networks.
 _MAX_BACKGROUND = 64
 # Seconds optional networks get after the required ones answer. A healthy one takes about 50 ms.
@@ -248,8 +258,8 @@ class EvmContractValidator:
 
         With ``require_erc20`` off any bytecode counts as a token.
         """
-        code = await client.call("eth_getCode", [address, "latest"])
-        if not isinstance(code, str) or not has_code(code):
+        code = _hex(await client.call("eth_getCode", [address, "latest"]))
+        if not has_code(code):
             return ChainVerdict(AddressKind.NO_CODE)
         if is_delegated_wallet(code):
             return ChainVerdict(AddressKind.WALLET)
@@ -260,10 +270,11 @@ class EvmContractValidator:
     async def _classify(self, client: JsonRpcClient, address: str) -> ChainVerdict:
         """Tell a token, LP pair, vault, copy or other contract apart with six read-only calls.
 
-        Empty results and EVM reverts are answers ("no such function"). A rate limit or
-        timeout is raised instead, so the network counts as failed rather than a real token
-        being rejected and cached for hours. symbol() only tells a copy of a stablecoin or
-        wrapped coin, so a symbol that fails or cannot be read never stops a token.
+        Empty results and EVM reverts are answers ("no such function"). A rate limit, a
+        timeout or a null answer is raised instead, so the network counts as failed rather
+        than a real token being rejected and cached for hours. symbol() only tells a copy of
+        a stablecoin or wrapped coin, so a symbol that fails or cannot be read never stops a
+        token.
 
         eth_getCode is asked again in the same batch, so every answer comes from one node
         (or one block number when the node takes no batches). Behind a load balancer the
@@ -282,7 +293,9 @@ class EvmContractValidator:
         )
         code, supply, decimals, token0, token1, asset, symbol = answers
         for answer in (code, supply, decimals, token0, token1, asset):
-            if isinstance(answer, BaseException) and not _is_revert(answer):
+            if not isinstance(answer, BaseException):
+                _hex(answer)
+            elif not _is_revert(answer):
                 raise answer
         if not has_code(code):
             return ChainVerdict(AddressKind.NO_CODE)  # node is behind: watch it, don't rule it out
@@ -305,6 +318,17 @@ class EvmContractValidator:
     def _quote(self, address: str) -> bool:
         """Return True for a stop-listed pair side (WETH, USDC, ...), which is never the launch."""
         return self._stoplist is not None and self._stoplist.contains_evm(address)
+
+
+def _hex(answer: object) -> str:
+    """Return an eth_getCode or eth_call answer, or raise RpcError when it is not text.
+
+    Those calls always answer with hex. Null or a number means a broken upstream, which must
+    not read as "no code" or "not a token" and be cached for hours.
+    """
+    if not isinstance(answer, str):
+        raise RpcError(f"a node answered {answer!r:.40} instead of hex data")
+    return answer
 
 
 def _is_revert(error: BaseException) -> bool:

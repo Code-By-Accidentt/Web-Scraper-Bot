@@ -9,7 +9,8 @@ from __future__ import annotations
 import html
 import re
 
-_TAG_RE = re.compile(r"</?(?:code|pre)>|<a href=\"[^\"]*\">|</a>")
+TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*>")  # any opening or closing tag
+_LINK_RE = re.compile(r'<a href="([^"]*)">([^<]*)</a>')  # what link() writes
 
 
 def escape(value: object) -> str:
@@ -33,5 +34,14 @@ def link(text: object, url: str) -> str:
 
 
 def strip_markup(text: str) -> str:
-    """Return the plain-text form of an HTML message: tags removed, entities decoded."""
-    return html.unescape(_TAG_RE.sub("", text))
+    """Return the plain-text form of an HTML message: tags removed, entities decoded.
+
+    A link keeps its address as ``label (url)``, so the plain fallback still leads there.
+    """
+    return html.unescape(TAG_RE.sub("", _LINK_RE.sub(_plain_link, text)))
+
+
+def _plain_link(match: re.Match[str]) -> str:
+    """Return a link as ``label (url)``, or only the url when that is the label anyway."""
+    url, label = match.group(1), match.group(2)
+    return url if html.unescape(label) == html.unescape(url) else f"{label} ({url})"

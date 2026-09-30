@@ -76,12 +76,14 @@ class Snapshot:
     ``deep_seen`` holds the addresses the page's scripts and JSON already carried when the
     page was first deep-scanned (None: not recorded yet); such an address is ignored while
     it is only there. ``volatile`` remembers the shapes of elements seen ticking.
+    ``baseline`` marks a page's first snapshot until it is compared with a render once.
     """
 
     signature: Signature
     noise: NoiseMemory = field(default_factory=dict)
     deep_seen: frozenset[str] | None = None
     volatile: VolatileMemory = field(default_factory=dict)
+    baseline: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,11 +120,15 @@ class ChangeReport:
 
 @dataclass(frozen=True, slots=True)
 class BlockSignal:
-    """Evidence that the site is refusing the bot: a rate limit, a WAF challenge, an IP ban."""
+    """Evidence that the site is refusing the bot: a rate limit, a WAF challenge, an IP ban.
+
+    With ``outage`` it's the server being down instead (a bare 503, a refused connection).
+    """
 
     reason: str  # the answer: "HTTP 403", "challenge page with HTTP 200", a network error
     retry_after: float | None = None  # seconds, from a Retry-After header
     protection: str | None = None  # who refused, when recognisable: "Cloudflare challenge"
+    outage: bool = False
 
     def describe(self) -> str:
         """Return the reason, after the name of the protection when it is known."""

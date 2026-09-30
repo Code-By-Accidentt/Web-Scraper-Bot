@@ -116,6 +116,25 @@ def test_snapshot_keeps_the_deep_scan_memory_only_once_recorded(tmp_path: Path) 
     assert store.load("https://c.io").deep_seen is None
 
 
+def test_a_snapshot_that_cannot_be_written_stays_in_memory_and_is_reported_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reports: list[str] = []
+    store = SnapshotStore(tmp_path, report=lambda key, *_: reports.append(key))
+
+    def disk_full(path: Path, text: str) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("scraper_bot.storage.snapshots.atomic_write_text", disk_full)
+    snapshot = Snapshot((node("p", "text"),), baseline=True)
+    store.save("https://a.io", snapshot)
+    store.save("https://a.io", snapshot)
+    assert store.load("https://a.io") is snapshot and reports == ["snapshots"]
+    monkeypatch.undo()
+    store.save("https://a.io", snapshot)
+    assert store.load("https://a.io") == snapshot  # read back from its file, flag included
+
+
 def test_corrupt_snapshot_is_treated_as_missing(tmp_path: Path) -> None:
     store = SnapshotStore(tmp_path)
     store.path_for("https://a.io").write_text("garbage", encoding="utf-8")
@@ -322,6 +341,7 @@ def test_atomic_write_keeps_the_old_file_when_the_write_fails(
     monkeypatch.undo()
     assert path.read_text(encoding="utf-8") == before
     assert set(store.load()) == {"https://a.io"}
+    assert list(tmp_path.glob(".*.tmp")) == []  # the failed writes cleaned up after themselves
 
 
 def test_corrupt_legacy_notifications_file_means_alerts_on(tmp_path: Path) -> None:

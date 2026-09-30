@@ -12,7 +12,7 @@ from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.storage.snapshots import SnapshotStore
 from scraper_bot.storage.state import StateStore
-from scraper_bot.telegram.timefmt import format_duration, format_schedule
+from scraper_bot.telegram.timefmt import format_schedule
 from scraper_bot.telegram.views.status import StatusReporter
 from tests.conftest import FakeProber, FakeTuning, StubMonitor, StubTurboSession
 
@@ -22,24 +22,22 @@ class Browser:
         self.is_connected = connected
 
 
-def test_format_duration() -> None:
-    assert format_duration(5) == "5s"
-    assert format_duration(65) == "1m 5s"
-    assert format_duration(3_720) == "1h 2m"
-    assert format_duration(90_000) == "1d 1h"
-    assert format_duration(-3) == "0s"
-
-
-async def test_status_report_lists_sites_and_caches(tmp_path: Path) -> None:
+def make(tmp_path: Path, monitor_factory: Any = StubMonitor) -> tuple[MonitorManager, AddressCache]:
+    """Return a manager that never restarts a crashed monitor, and an empty address cache."""
     manager = MonitorManager(
         state_store=StateStore(tmp_path / "state.json"),
         snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(("https://app.{domain}",)),
-        monitor_factory=StubMonitor,
+        deriver=SubUrlDeriver(()),
+        monitor_factory=monitor_factory,
         restart_delay=0,
     )
     cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
     cache.load()
+    return manager, cache
+
+
+async def test_status_report_lists_sites_and_caches(tmp_path: Path) -> None:
+    manager, cache = make(tmp_path)
     clock_now = 10_000.0
     reporter = StatusReporter(
         version="9.9", manager=manager, cache=cache, browser=Browser(True), clock=lambda: clock_now
@@ -75,14 +73,7 @@ async def test_status_report_lists_sites_and_caches(tmp_path: Path) -> None:
 
 
 async def test_status_marks_disconnected_browser_and_starting_sites(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     reporter = StatusReporter(version="1", manager=manager, cache=cache, browser=Browser(False))
     await manager.start()
     try:
@@ -95,14 +86,7 @@ async def test_status_marks_disconnected_browser_and_starting_sites(tmp_path: Pa
 
 
 async def test_status_shows_block_state(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     reporter = StatusReporter(version="1", manager=manager, cache=cache, browser=Browser(True))
     await manager.start()
     try:
@@ -111,22 +95,17 @@ async def test_status_shows_block_state(tmp_path: Path) -> None:
         assert stats is not None
         stats.last_round_at = 1.0
         stats.block_level, stats.block_reason, stats.blocked_since = 2, "HTTP 403", 1.0
+        stats.down_reason, stats.down_since = "HTTP 503", 1.0
         text = reporter.render()
     finally:
         await manager.shutdown()
     assert "⚠️ BLOCKED? HTTP 403 since" in text
     assert "interval x4" in text
+    assert "⚠️ server down? HTTP 503 since" in text
 
 
 async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     clock_now = 10_000.0
     turbo = TurboManager(
         tuning=FakeTuning(turbo_max_sites=2),
@@ -158,7 +137,9 @@ async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None
         await turbo.shutdown()
     lines = text.splitlines()
     assert lines[2] == "Sites: 0 total, 0 running, 0 paused"
-    assert lines[3] == "🚀 Turbo https://a.io: 3 cycles, 1 confirmed, 2 pending, 10m 0s left"
+    assert lines[3] == (
+        "🚀 Turbo https://a.io: 3 cycles, 0 renders, 1 confirmed, 2 pending, 10m 0s left"
+    )
     assert lines[4] == (
         f"⏰ Turbo https://b.io: scheduled at {format_schedule(starts_at, clock_now)} for 5 min"
     )
@@ -166,14 +147,7 @@ async def test_status_lists_turbo_sessions_and_schedules(tmp_path: Path) -> None
 
 
 async def test_status_counts_pages_timing_out(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     reporter = StatusReporter(version="1", manager=manager, cache=cache, browser=Browser(True))
     await manager.start()
     try:
@@ -197,14 +171,7 @@ class CountingPending:
 
 
 async def test_status_says_how_many_addresses_wait_for_deployment(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     for count, shown in ((3, True), (0, False)):
         reporter = StatusReporter(
             version="1",
@@ -218,14 +185,7 @@ async def test_status_says_how_many_addresses_wait_for_deployment(tmp_path: Path
 
 
 async def test_status_names_rpc_endpoints_that_do_not_answer(tmp_path: Path) -> None:
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=StubMonitor,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
+    manager, cache = make(tmp_path)
     failing = [FailingEndpoint("Sui", 425.0, "sui_getObject via sui.rpc: HTTP 502")]
     reporter = StatusReporter(
         version="1", manager=manager, cache=cache, browser=Browser(True), rpc_health=lambda: failing
@@ -239,15 +199,7 @@ async def test_a_crashed_monitor_is_stopped_not_starting(tmp_path: Path) -> None
     def crashing(site: Any, persist: Any, on_auto_pause: Any) -> StubMonitor:
         return StubMonitor(site, persist, on_auto_pause, crash=True)
 
-    manager = MonitorManager(
-        state_store=StateStore(tmp_path / "state.json"),
-        snapshot_store=SnapshotStore(tmp_path / "snaps"),
-        deriver=SubUrlDeriver(()),
-        monitor_factory=crashing,
-        restart_delay=0,
-    )
-    cache = AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0)
-    cache.load()
+    manager, cache = make(tmp_path, crashing)
     reporter = StatusReporter(version="9.9", manager=manager, cache=cache, browser=Browser(True))
     await manager.start()
     try:

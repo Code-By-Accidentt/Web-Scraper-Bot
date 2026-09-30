@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+import sys
 import threading
+import unicodedata
 from collections.abc import Iterable
 from itertools import islice
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -63,8 +65,23 @@ _ATTRIBUTE_FLOOD_RE = re.compile(
 )
 
 _WS_RE = re.compile(r"\s+")
-# Zero-width spaces and joiners, direction marks, the word joiner and the BOM.
-_INVISIBLE_RE = re.compile(r"[​-‏⁠﻿]")
+# Candidates for characters that take no room on screen (Unicode's "format" characters: soft
+# hyphens, zero-width spaces and joiners, direction marks, the BOM, ...). It lists those below
+# U+10000 and takes every character above, so the search stays fast; _invisible() decides.
+_INVISIBLE_RE = re.compile(
+    r"[\u00ad\u0600-\u0605\u061c\u06dd\u070f\u0890\u0891\u08e2\u180e\u200b-\u200f"
+    r"\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff\ufff9-\ufffb\U00010000-\U0010ffff]"
+)
+# A <wbr> marks where a long word may wrap. It's no break in the text, but lxml would even
+# take the text after it for the <wbr>'s own.
+_WBR_RE = re.compile(r"</?wbr\b[^>]*>", re.IGNORECASE)
+# Character references that may stand for an invisible character: every numeric one, and the
+# named ones that do.
+_REFERENCE_RE = re.compile(
+    r"&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(shy|zwn?j|lrm|rlm|NoBreak|ZeroWidthSpace|"
+    r"Negative(?:VeryThin|Thin|Medium|Thick)Space|af|ApplyFunction|it|InvisibleTimes|ic|"
+    r"InvisibleComma));"
+)
 # Pages get parsed in worker threads, and an lxml parser can't be shared between threads.
 _PARSERS = threading.local()
 
@@ -81,15 +98,56 @@ def _parser() -> lxml_html.HTMLParser:
     return parser
 
 
+def clean_text(text: str) -> str:
+    """Return ``text`` without invisible characters and with whitespace collapsed."""
+    text = _INVISIBLE_RE.sub(_visible_character, text.replace("\xa0", " "))
+    return _WS_RE.sub(" ", text).strip()
+
+
+def unbroken(text: str) -> str:
+    """Return raw markup without what may split a word in it unseen, to find addresses in.
+
+    That is ``<wbr>`` tags and the characters :func:`clean_text` drops as invisible, also
+    written as character references (``&shy;``). A page may put them inside a long address.
+    """
+    text = _WBR_RE.sub("", text)
+    if "&" in text:
+        text = _REFERENCE_RE.sub(_visible_reference, text)
+    return _INVISIBLE_RE.sub(_visible_character, text)
+
+
+def _invisible(character: str) -> bool:
+    """True for a character that takes no room on screen: a Unicode "format" character."""
+    return unicodedata.category(character) == "Cf"
+
+
+def _visible_character(match: re.Match[str]) -> str:
+    """Return the character found, or "" when it is invisible."""
+    character = match.group(0)
+    return "" if _invisible(character) else character
+
+
+def _visible_reference(match: re.Match[str]) -> str:
+    """Return a character reference as it is, or "" when it stands for an invisible character."""
+    decimal, hexadecimal, name = match.groups()
+    if name is not None:
+        return ""
+    code = int(decimal) if decimal is not None else int(hexadecimal, 16)
+    if code <= sys.maxunicode and _invisible(chr(code)):
+        return ""
+    return match.group(0)
+
+
 def parse_document(html: str) -> lxml_html.HtmlElement | None:
     """Return the document root, or None when the HTML is empty or cannot be parsed.
 
-    Start tags with more than :data:`MAX_ATTRIBUTES` attributes lose the rest first.
+    Start tags with more than :data:`MAX_ATTRIBUTES` attributes lose the rest first, and
+    ``<wbr>`` tags go, so the text around one stays one text.
     """
     text = html.replace("\x00", "").strip()
     if not text:
         return None
-    text = _ATTRIBUTE_FLOOD_RE.sub(r"\1", text)
+    text = _WBR_RE.sub("", _ATTRIBUTE_FLOOD_RE.sub(r"\1", text))
     try:
         return lxml_html.document_fromstring(text.encode("utf-8"), parser=_parser())
     except (etree.ParserError, etree.XMLSyntaxError, ValueError, TypeError):
@@ -151,23 +209,17 @@ class HtmlNormalizer:
             return None
         return Node(element.tag.lower(), tuple(attrs), text)
 
-    @classmethod
-    def _own_text(cls, element: lxml_html.HtmlElement) -> str:
+    @staticmethod
+    def _own_text(element: lxml_html.HtmlElement) -> str:
         """Return the cleaned text that sits directly in the element, not in its children."""
         pieces = [element.text or ""]
         pieces.extend(child.tail or "" for child in element)
-        return cls._clean_text(" ".join(pieces))
-
-    @staticmethod
-    def _clean_text(text: str) -> str:
-        """Return ``text`` without invisible characters and with whitespace collapsed."""
-        text = _INVISIBLE_RE.sub("", text.replace("\xa0", " "))
-        return _WS_RE.sub(" ", text).strip()
+        return clean_text(" ".join(pieces))
 
     @classmethod
     def _clean_attribute(cls, key: str, value: str) -> str:
         """Return a cleaned attribute value: class names sorted, URLs without tracking."""
-        value = cls._clean_text(value)
+        value = clean_text(value)
         if key == "class":
             return " ".join(sorted(value.split()))
         if key in URL_ATTRIBUTES:

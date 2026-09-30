@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 
-from scraper_bot.telegram.timefmt import format_precise, format_utc_offset
+from scraper_bot.telegram.timefmt import format_duration, format_precise, format_utc_offset
 
 
 def test_precise_times_carry_hundredths_of_a_second() -> None:
@@ -18,3 +18,11 @@ def test_the_utc_offset_is_spelled_out() -> None:
     assert offset is not None
     hours, minutes = divmod(abs(int(offset.total_seconds() // 60)), 60)
     assert text.endswith(f"{hours:02d}:{minutes:02d}")
+
+
+def test_format_duration() -> None:
+    assert format_duration(5) == "5s"
+    assert format_duration(65) == "1m 5s"
+    assert format_duration(3_720) == "1h 2m"
+    assert format_duration(90_000) == "1d 1h"
+    assert format_duration(-3) == "0s"

@@ -14,15 +14,16 @@ from scraper_bot.chains.validator import ContractValidator
 from scraper_bot.models.addresses import Address, ConfirmedContract, ValidationStatus
 from scraper_bot.models.pages import BlockSignal
 from scraper_bot.models.sightings import Sighting, Timeline
-from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.alerts import AlertRegistry, Announcer
 from scraper_bot.monitoring.pace import TURBO, SitePace
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.rounds import wait_or_stop
 from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.fetching.blocking import BlockDetector
-from scraper_bot.pages.fetching.result import PageFetcher
+from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
+from scraper_bot.pages.verdicts import VerdictBatch, verdicts
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.telegram.notifier import Notifier
 
@@ -55,7 +56,6 @@ class TurboStats:
     deadline: float | None = None
     cycles: int = 0
     renders: int = 0
-    pending: int = 0  # addresses found after a page's first cycle and newly watched
     found: list[ConfirmedContract] = field(default_factory=list)
     stop_reason: str | None = None
 
@@ -106,9 +106,9 @@ class TurboSession:
         self._limits_source = limits
         self._duration = duration
         self._pending = pending
-        self._registry = registry
         self._pace = pace or SitePace()
         self._tokens = tokens or SiteTokens()
+        self._announcer = Announcer(registry, notifier, self._tokens, pending)
         self._clock = clock
         self._sleep = sleep
         self._stats = TurboStats()
@@ -157,8 +157,8 @@ class TurboSession:
         """Render the pages in cycles until the session ends, then return its stats.
 
         It ends on the time limit, a stop request, ``stop_after`` tokens or a block signal.
-        The user hears when it starts and ends; meanwhile the pending watch checks the site's
-        addresses at the turbo pace.
+        The user hears when it starts and ends (a crash is named in the summary too);
+        meanwhile the pending watch checks the site's addresses at the turbo pace.
         """
         stats, limits = self._stats, self.limits
         stats.started_at = self._clock()
@@ -191,6 +191,9 @@ class TurboSession:
         except asyncio.CancelledError:
             reason = "bot is shutting down"
             raise
+        except Exception as exc:
+            reason = f"crashed ({type(exc).__name__})"
+            raise
         finally:
             self._pace.release(self._url, TURBO)
             self._tokens.unsubscribe(self._url, self._found)
@@ -211,71 +214,115 @@ class TurboSession:
 
         A page's first good render is its baseline: its addresses go to the pending watch as
         baselines. A page that answers normally is read even when another one is blocked in
-        the same cycle, since the CA may be on it.
+        the same cycle, since the CA may be on it. Once every page has its baseline, each is
+        read as soon as its render ends, not after the slowest one.
         """
         started = self._clock()
-        results = await asyncio.gather(*(self._fetcher.fetch(page) for page in self._pages))
-        seen_at = self._clock()
+        fetches = [asyncio.create_task(self._fetch(page)) for page in self._pages]
+        signals: dict[str, BlockSignal | None] = {}
+        try:
+            if all(page in self._last_read for page in self._pages):
+                for fetch in asyncio.as_completed(fetches):
+                    result = await fetch
+                    signals[result.url] = await self._read(result, started, self._clock())
+            else:
+                results = await asyncio.gather(*fetches)
+                seen_at = self._clock()
+                # Pages read before go first, so an address a new page also shows is news,
+                # not a baseline.
+                for result in sorted(results, key=lambda r: r.url not in self._last_read):
+                    signals[result.url] = await self._read(result, started, seen_at)
+        finally:
+            for fetch in fetches:
+                fetch.cancel()
         self._stats.cycles += 1
-        self._stats.renders += len(results)
-        signals = {result.url: self._blocks.inspect(result) for result in results}
-        # Pages read before go first, so an address a new page also shows is news, not a baseline.
-        for result in sorted(results, key=lambda r: r.url not in self._last_read):
-            if not result.ok:
-                continue
-            signature = await asyncio.to_thread(self._normalizer.signature, result.html)
-            if not signature:
-                continue  # a blank render (hydrating, a deploy in progress) shows nothing yet
-            baseline = result.url not in self._last_read
-            found = await asyncio.to_thread(
-                find_sightings,
-                self._extractor,
-                signature,
-                result.html,
-                result.extra_texts,
-                result.dom_texts,
-            )
-            blocked = signals[result.url] is not None
-            if blocked:
-                # A 2xx that looks like a challenge may be the real page, so read only its text.
-                found = shown_on_a_challenge(found)
-            fresh = [s for s in found if s.address not in self._seen]
-            self._seen.update(sighting.address for sighting in fresh)
-            # Known tokens (a trending list, one the monitor just announced) are not news here.
-            fresh = [s for s in fresh if not self._cache.is_known(s.address)]
-            if baseline:
-                for sighting in fresh:
-                    self._pending.offer_baseline(self._url, result.url, sighting)
-            elif fresh:
-                await self._check(result.url, fresh, seen_at)
-            # A challenge did not show the page, so the next good render is still the baseline.
-            if not blocked:
-                self._last_read[result.url] = result.started_at or started
-        return next((signal for signal in signals.values() if signal is not None), None)
+        # A server that is down (a deploy at launch time) isn't a block: the session goes on.
+        return next(
+            (s for page in self._pages if (s := signals.get(page)) is not None and not s.outage),
+            None,
+        )
+
+    async def _fetch(self, page_url: str) -> FetchResult:
+        """Render one page; a render that raises (say, the browser is gone) counts as failed."""
+        try:
+            return await self._fetcher.fetch(page_url)
+        except Exception as exc:
+            log.warning("[%s] turbo render of %s failed: %r", self._url, page_url, exc)
+            return FetchResult(page_url, None, error=f"{type(exc).__name__}: {exc}")
+
+    async def _read(
+        self, result: FetchResult, started: float, seen_at: float
+    ) -> BlockSignal | None:
+        """Check what one render shows and return its block signal, if any.
+
+        ``started`` is when the cycle began, and ``seen_at`` when the render was read.
+        """
+        self._stats.renders += 1
+        signal = self._blocks.inspect(result)
+        if not result.ok:
+            return signal
+        signature = await asyncio.to_thread(self._normalizer.signature, result.html)
+        if not signature:
+            return signal  # a blank render (hydrating, a deploy in progress) shows nothing yet
+        baseline = result.url not in self._last_read
+        found = await asyncio.to_thread(
+            find_sightings,
+            self._extractor,
+            signature,
+            result.html,
+            result.extra_texts,
+            result.dom_texts,
+        )
+        if signal is not None:
+            # A 2xx that looks like a challenge may be the real page, so read only its text.
+            found = shown_on_a_challenge(found)
+        fresh = [s for s in found if s.address not in self._seen]
+        self._seen.update(sighting.address for sighting in fresh)
+        # Known tokens (a trending list, one the monitor just announced) are not news here.
+        fresh = [s for s in fresh if not self._cache.is_known(s.address)]
+        if baseline:
+            for sighting in fresh:
+                self._pending.offer_baseline(self._url, result.url, sighting)
+        elif fresh:
+            await self._check(result.url, fresh, seen_at)
+        # A challenge did not show the page, so the next good render is still the baseline.
+        if signal is None:
+            self._last_read[result.url] = result.started_at or started
+        return signal
 
     async def _check(self, page_url: str, sightings: Sequence[Sighting], seen_at: float) -> None:
-        """Validate new addresses; announce the tokens and hand the rest to the pending watch."""
-        results = await self._validator.validate_many(
-            [s.address for s in sightings], negative_cache=False
-        )
+        """Validate new addresses and act on their verdicts as they come, a token's at once."""
+        found = verdicts(self._validator, [s.address for s in sightings], negative_cache=False)
+        async with contextlib.aclosing(found):
+            async for batch in found:
+                await self._take(page_url, sightings, batch, seen_at)
+
+    async def _take(
+        self, page_url: str, sightings: Sequence[Sighting], batch: VerdictBatch, seen_at: float
+    ) -> None:
+        """Announce the tokens among a batch of verdicts; hand the rest to the pending watch."""
         by_address = {sighting.address: sighting for sighting in sightings}
-        for result in results:
+        for result in batch.results:
             sighting = by_address.get(result.via or result.address)
             contract = result.contract
             if contract is not None:
-                if self._registry.claim(contract):  # records it as known
-                    timeline = Timeline(seen_at, missing_at=self._last_read.get(page_url))
-                    await self._notifier.contract_found(
-                        contract, page_url, sighting=sighting, timeline=timeline
-                    )
-                self._tokens.publish({self._url}, contract.address, contract.network)
+                await self._announcer.announce(
+                    self._url,
+                    [contract],
+                    lambda fresh, seen=sighting: self._notifier.contract_found(
+                        fresh[0],
+                        page_url,
+                        sighting=seen,
+                        timeline=Timeline(seen_at, missing_at=self._last_read.get(page_url)),
+                    ),
+                )
             elif result.status is ValidationStatus.ALREADY_KNOWN and result.via is None:
                 # the monitor announced it in the meantime
                 # (an old token behind a new pair isn't news)
                 network = self._cache.known_network(result.address)
                 self._tokens.publish({self._url}, result.address, network)
-            elif self._pending.offer(self._url, page_url, sighting, result, fast=True):
-                self._stats.pending += 1
+            else:
+                self._pending.offer(self._url, page_url, sighting, result, fast=True)
 
     def _found(self, contract: ConfirmedContract) -> None:
         """Add a token of this site to the session's finds, once.

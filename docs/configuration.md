@@ -24,7 +24,7 @@ needs a restart.
 | Variable | Default | Meaning | Live key |
 | --- | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | – | **Required.** Token from @BotFather. Rejected token = exit code 2. | – |
-| `TELEGRAM_CHAT_IDS` | – | Chats that receive alerts, comma separated. Empty = alerts are dropped with a warning; `/start` tells you your chat id. | – |
+| `TELEGRAM_CHAT_IDS` | – | Chats that receive alerts, comma separated. Empty = alerts are dropped with a warning; `/start` tells you your chat id. A group that becomes a supergroup gets a new id: the bot follows it until a restart and logs the id to put here. | – |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Chats allowed to run commands. Empty = the alert chats in `TELEGRAM_CHAT_IDS`. Any other chat only learns its chat id from `/start`. | – |
 
 ## Monitoring and rendering
@@ -39,12 +39,12 @@ needs a restart.
 | `RENDER_FAILURE_THRESHOLD` | 5 | Load timeouts in a row on one page that send one 🐢 alert and double that page's load timeout (up to 3x) until it renders again. 0 = off. | `render_failure_threshold` |
 | `CONFIRM_DELAY` | 2 | Seconds between the two renders that confirm a change. Longer delays classify slower tickers as volatile. A render that differs only in elements already seen ticking (a timer, a clock) needs no second render. | `confirm_delay` |
 | `LIGHT_INTERVAL` | 1 | Light mode: between renders every live page's HTML and the site's own JSON APIs (the ones a render saw the page call, at most 2 per page) are asked over plain HTTP this often, conditionally (mostly a 304 without a body). A new address there is checked and announced at once; one an API adds before the page shows it comes as "Found in: site API". A site that refuses plain requests is asked with fetch() from a tab kept on it. 0 = off. Below 0.5 s asks for `confirm`. | `light_interval` |
-| `RENDER_INTERVAL` | 30 | A page whose HTML carries what its render shows (80% of its texts), and that neither ticks nor polls on its own, is fully rendered only this often, for change detection; the light mode watches it meanwhile, and a new deploy (other scripts in its HTML) renders it at once. Other pages are rendered every round. Minimum 4. | `render_interval` |
+| `RENDER_INTERVAL` | 30 | A page whose HTML carries what its render shows (80% of its texts), and that neither ticks nor polls on its own, is fully rendered only this often, for change detection, while the light mode watches it (not while the site blocks or the page's polls fail), and a new deploy (other scripts in its HTML) renders it at once. Other pages are rendered every round. Minimum 4. | `render_interval` |
 | `CONTRACT_PAUSE_THRESHOLD` | 5 | New confirmed contracts on one page in one round that are sent as a `.txt` document and pause the site until `/resume`. | `contract_pause_threshold` |
 | `SUB_URL_PATTERNS` | 7 patterns | Sub-pages derived from every root URL; `{domain}` is the host without `www.`. Probed every round, rendered when they exist. A pattern whose page always answers 401/403 keeps its site in block backoff: leave it out. An empty value means the default list. | – |
 | `IGNORED_ATTRIBUTES` | nonce, integrity, csrf tokens, ... | HTML attributes never compared. An empty value means the default list. | – |
 | `MAX_CHANGE_EXAMPLES` | 5 | Removed / added / changed elements quoted per category in a change alert. 0 = counts only. | `max_change_examples` |
-| `ENRICH_TIMEOUT` | 2 | Time budget for the token details edited into a token alert after it went out (name, symbol, decimals, supply, Solana authorities and risky extensions, age, the other networks where the address is a token too, DEX pair). The alert itself never waits for them. Measured 0.05–0.4 s. 0 = links only. | `enrich_timeout` |
+| `ENRICH_TIMEOUT` | 2 | Time budget for the token details, looked up while a token alert goes out and edited into it once it is sent (name, symbol, decimals, supply, Solana authorities and risky extensions, age, the other networks where the address is a token too, DEX pair). The alert itself never waits for them. Measured 0.05–0.4 s. 0 = links only. | `enrich_timeout` |
 | `FLAP_WINDOW_HOURS` / `FLAP_THRESHOLD` | 24 / 2 | An element that alerted `FLAP_THRESHOLD` times within the window is silenced while it keeps changing. 0 hours = off. | `flap_window_hours`, `flap_threshold` |
 | `DEEP_SCAN` | false | Also search iframes, shadow DOM and every script or JSON answer the page loaded. No extra requests. Off by default: wallet kits ship dozens of token addresses in their bundles. When on, an address the page's loaded scripts and JSON carried on its first deep round is ignored until the page itself shows it (iframes and shadow DOM count as the page). A single response body over 3 MB is not scanned. | `deep_scan` |
 | `DEEP_SCAN_MAX_MB` | 5 | Byte budget per render for the deep scan (5 MB of JS take about 0.8 s to scan). | – |
@@ -60,7 +60,7 @@ needs a restart.
 | `TURBO_MAX_PAGES` | 4 | Pages rendered per cycle, the root page included. | `turbo_max_pages` |
 | `LIGHT_TURBO_INTERVAL` | 0.3 | The light mode's pace while a turbo session or an auto-turbo window runs for the site (minimum 0.1). Below 0.3 s asks for `confirm`. | `light_turbo_interval` |
 | `TURBO_RECHECK_INTERVAL` | 1 | Seconds between on-chain checks of a turbo site's addresses that are not a token yet (the pending watch). Elsewhere an address the page names as the CA is checked every second for 15 min, then every 5 s up to an hour, then every 30 s; any other address every 30 s. | `turbo_recheck_interval` |
-| `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot. The pause doubles per blocked round up to this value; a longer `Retry-After` from the site is honoured as sent. Meanwhile each round first sends one plain GET to the root page and renders nothing while that is refused (every fourth blocked round renders anyway). | `block_max_backoff` |
+| `BLOCK_MAX_BACKOFF` | 600 | Longest pause between rounds while a site looks like it blocks the bot. The pause doubles per blocked round up to this value; a longer `Retry-After` from the site is honoured as sent. Meanwhile each round first sends one plain GET to the root page and renders nothing while that is refused (every fourth blocked round renders anyway). A server that is down (a bare 503, a refused connection) is no block: its pause doubles too, but only up to 60 s. | `block_max_backoff` |
 | `AUTO_TURBO` | true | Speed a site up by itself around a launch time one of its pages shows: a countdown with launch words next to it, a launch time with its time zone, a countdown target in its scripts or attributes, or a launch phrase ("CA: soon", "presale is live") that appears (see [commands.md](commands.md#auto-turbo)). Off only stops new windows. | `auto_turbo` |
 | `AUTO_TURBO_BEFORE_MINUTES` / `AUTO_TURBO_AFTER_MINUTES` | 10 / 60 | The window: from this long before the launch time (at once when it is closer) to this long after it, or until the site's first token (`TURBO_STOP_AFTER`). Meanwhile the site's rounds run every `TURBO_INTERVAL`, its light mode every `LIGHT_TURBO_INTERVAL` and its addresses every `TURBO_RECHECK_INTERVAL`. | `auto_turbo_before_minutes`, `auto_turbo_after_minutes` |
 | `AUTO_TURBO_MAX_SITES` | 3 | Sites with an auto-turbo window (waiting or running) at once, apart from `TURBO_MAX_SITES`; a launch time on one more site is only reported. Above 3 asks for `confirm`. | `auto_turbo_max_sites` |
@@ -69,7 +69,7 @@ needs a restart.
 
 | Variable | Default | Meaning | Live key |
 | --- | --- | --- | --- |
-| `UNVERIFIED_RECHECK_MINUTES` | 5 | How often an announced address is re-checked on-chain. | `unverified_recheck_minutes` |
+| `UNVERIFIED_RECHECK_MINUTES` | 5 | How often an announced address is re-checked on-chain. A round re-checks at most 25, those checked longest ago first. | `unverified_recheck_minutes` |
 | `UNVERIFIED_WATCH_HOURS` | 24 | How long it is re-checked before the bot gives up on it. | `unverified_watch_hours` |
 | `UNVERIFIED_MAX_PER_HOUR` | 10 | Alerts per hour and site; the overflow becomes one digest message. | `unverified_max_per_hour` |
 
@@ -105,17 +105,20 @@ needs a restart.
 | --- | --- | --- |
 | `DATA_DIR` | data | Where state, snapshots, caches and the heartbeat live. With another directory start the supervisor with `--heartbeat <DATA_DIR>/heartbeat`. |
 | `LOG_LEVEL` | INFO | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`. |
-| `LOG_FILE` | empty | Optional rotating log file (5 MB, 3 backups). Empty = console only. |
-| `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes; `rebooter.py` restarts the bot after 300 s without one. |
+| `LOG_FILE` | empty | Optional rotating log file (5 MB, 3 backups). Empty = console only. One that cannot be written stops the start (exit code 2). |
+| `HEARTBEAT_INTERVAL` | 15 | Seconds between heartbeat writes, at most 60; `rebooter.py` restarts the bot after 300 s without one. |
 
 ## Validation at start
 
 Wrong values stop the bot with exit code 2 and a message naming the variable:
-non-numeric or non-finite (`nan`, `inf`) numbers, values below their minimum, an unknown
+non-numeric or non-finite (`nan`, `inf`) numbers, values below their minimum (or above
+their maximum: `HEARTBEAT_INTERVAL` 60), an unknown
 `LOG_LEVEL`, booleans that are not one of
-`1/true/yes/on/0/false/no/off`, `POLL_INTERVAL_MAX` below `POLL_INTERVAL_MIN`, no EVM
+`1/true/yes/on/0/false/no/off`, `POLL_INTERVAL_MAX` below `POLL_INTERVAL_MIN`,
+`TURBO_MAX_MINUTES` below `TURBO_DEFAULT_MINUTES`, no EVM
 endpoint left, an RPC URL that is not `http(s)://` with a host (a typo such as `:8545x`),
-a chat id list that is not integers, a `BROWSER_ARGS` value with unbalanced quotes.
+a chat id list that is not integers, a `BROWSER_ARGS` value with unbalanced quotes, a
+`.env` that is not UTF-8 or cannot be read, a `LOG_FILE` that cannot be written.
 Lists tolerate brackets, quotes,
 semicolons and spaces. An empty `SOLANA_RPC_URL`, `SUI_RPC_URL`, `DATA_DIR` or `LOG_LEVEL`
 means the default (only an empty EVM URL skips its network); in `BROWSER_ARGS` on Windows a

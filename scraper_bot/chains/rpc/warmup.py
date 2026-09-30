@@ -21,15 +21,16 @@ log = logging.getLogger(__name__)
 
 WARM_INTERVAL = 30.0
 
-# Gets an endpoint's name and failure. In the app it feeds the validators' endpoint health.
+# Gets an endpoint's name and failure, or None when it answered. In the app it feeds the
+# validators' endpoint health.
 Recorder = Callable[[str, BaseException | None], None]
 
 
 class ConnectionWarmer:
-    """Pings every configured endpoint on a timer and reports failures to the endpoint health.
+    """Pings every configured endpoint on a timer and reports each outcome to the endpoint health.
 
-    Successes are not reported: a cheap ping that works says nothing about the heavier
-    calls of an address check, whose own answers end an outage.
+    Successes count too: without them, two single glitches minutes apart on a quiet bot
+    would read as one long outage and get a 🛑.
     """
 
     def __init__(
@@ -41,7 +42,7 @@ class ConnectionWarmer:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         record: Recorder | None = None,
     ) -> None:
-        """Make one client without retries per configured endpoint; failures go to ``record``."""
+        """Make one client without retries per configured endpoint; outcomes go to ``record``."""
         timeout = settings.rpc_timeout
         self._evm = [
             (net, JsonRpcClient(http, net.rpc_url, timeout, retry=NO_RETRY))
@@ -85,15 +86,16 @@ class ConnectionWarmer:
         return wrong
 
     async def run(self) -> None:
-        """Ping every endpoint every ``interval`` seconds until cancelled, reporting failures."""
+        """Ping every endpoint every ``interval`` seconds until cancelled, reporting outcomes."""
         while True:
             results = await asyncio.gather(
                 *(client.call(method, []) for _, client, method in self._pings),
                 return_exceptions=True,
             )
             for (name, _, _), result in zip(self._pings, results, strict=True):
-                if isinstance(result, BaseException):
-                    log.debug("warm-up call to %s failed: %s", name, result)
-                    if self._record is not None:
-                        self._record(name, result)
+                error = result if isinstance(result, BaseException) else None
+                if error is not None:
+                    log.debug("warm-up call to %s failed: %s", name, error)
+                if self._record is not None:
+                    self._record(name, error)
             await self._sleep(self._interval)

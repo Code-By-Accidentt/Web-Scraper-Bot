@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import dataclasses
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -28,7 +29,7 @@ from scraper_bot.chains.solana.accounts import (
     metadata_address,
 )
 from scraper_bot.chains.solana.validator import SolanaContractValidator
-from scraper_bot.chains.sui.validator import SuiCoinValidator
+from scraper_bot.chains.sui.validator import LAG_WINDOW, SuiCoinValidator
 from scraper_bot.chains.validator import ContractValidator
 from scraper_bot.models.addresses import (
     Address,
@@ -40,7 +41,7 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.settings.env import EvmNetwork
 from scraper_bot.storage.address_cache import AddressCache
-from tests.chains.evm.test_abi import abi_string
+from tests.chains.evm.test_abi import abi_string, abi_uint
 from tests.chains.solana.test_accounts import METAPLEX, MINT
 from tests.conftest import FakeTuning
 
@@ -111,12 +112,13 @@ class FakeRpc:
         return sum(1 for h, m in self.calls if h == host and (method is None or m == method))
 
 
-def word(value: int) -> str:
-    return "0x" + value.to_bytes(32, "big").hex()
-
-
 def address_word(address: str) -> str:
     return "0x" + "00" * 12 + address[2:].lower()
+
+
+def offline_client() -> httpx.AsyncClient:
+    """Return a client with no network behind it, for tests that never send a request."""
+    return httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(500)))
 
 
 def evm_node(answers: dict[str, str] | None = None, code: str = "0x6080604052") -> Responder:
@@ -133,7 +135,9 @@ def evm_node(answers: dict[str, str] | None = None, code: str = "0x6080604052") 
     return responder
 
 
-erc20_contract = evm_node({ERC20_TOTAL_SUPPLY: word(1000 * 10**18), ERC20_DECIMALS: word(18)})
+erc20_contract = evm_node(
+    {ERC20_TOTAL_SUPPLY: abi_uint(1000 * 10**18), ERC20_DECIMALS: abi_uint(18)}
+)
 plain_contract = evm_node()
 
 
@@ -257,9 +261,9 @@ async def test_a_delegated_wallet_is_never_a_token() -> None:
 @pytest.mark.parametrize(
     ("answers", "why"),
     [
-        ({ERC20_DECIMALS: word(6)}, "a system contract with decimals() only (GasPriceOracle)"),
-        ({ERC20_TOTAL_SUPPLY: word(10_000)}, "an NFT collection without decimals()"),
-        ({ERC20_TOTAL_SUPPLY: word(1), ERC20_DECIMALS: word(300)}, "decimals beyond uint8"),
+        ({ERC20_DECIMALS: abi_uint(6)}, "a system contract with decimals() only (GasPriceOracle)"),
+        ({ERC20_TOTAL_SUPPLY: abi_uint(10_000)}, "an NFT collection without decimals()"),
+        ({ERC20_TOTAL_SUPPLY: abi_uint(1), ERC20_DECIMALS: abi_uint(300)}, "decimals beyond uint8"),
     ],
 )
 async def test_contracts_that_are_not_plain_tokens(answers: dict[str, str], why: str) -> None:
@@ -272,8 +276,8 @@ async def test_contracts_that_are_not_plain_tokens(answers: dict[str, str], why:
 
 async def test_lp_pairs_and_pools_name_their_tokens_without_the_quote_side() -> None:
     v2_pair = {
-        ERC20_TOTAL_SUPPLY: word(10**18),
-        ERC20_DECIMALS: word(18),
+        ERC20_TOTAL_SUPPLY: abi_uint(10**18),
+        ERC20_DECIMALS: abi_uint(18),
         PAIR_TOKEN0: address_word(MEME),
         PAIR_TOKEN1: address_word(WETH),
     }
@@ -299,8 +303,8 @@ async def test_lp_pairs_and_pools_name_their_tokens_without_the_quote_side() -> 
 )
 async def test_only_two_sorted_distinct_tokens_make_a_pair(token0: str, token1: str) -> None:
     answers = {
-        ERC20_TOTAL_SUPPLY: word(5),
-        ERC20_DECIMALS: word(9),
+        ERC20_TOTAL_SUPPLY: abi_uint(5),
+        ERC20_DECIMALS: abi_uint(9),
         PAIR_TOKEN0: address_word(token0),
         PAIR_TOKEN1: address_word(token1),
     }
@@ -313,8 +317,8 @@ async def test_only_two_sorted_distinct_tokens_make_a_pair(token0: str, token1: 
 
 async def test_vault_shares_are_not_a_launch() -> None:
     answers = {
-        ERC20_TOTAL_SUPPLY: word(10**18),
-        ERC20_DECIMALS: word(18),
+        ERC20_TOTAL_SUPPLY: abi_uint(10**18),
+        ERC20_DECIMALS: abi_uint(18),
         VAULT_ASSET: address_word(USDC_ETH),
     }
     rpc = FakeRpc()
@@ -326,7 +330,7 @@ async def test_vault_shares_are_not_a_launch() -> None:
 
 async def test_a_copy_of_a_stablecoin_is_no_token_on_its_network(tmp_path: Path) -> None:
     def token(symbol: str) -> Responder:
-        supply, decimals = word(10**12), word(6)
+        supply, decimals = abi_uint(10**12), abi_uint(6)
         return evm_node(
             {ERC20_TOTAL_SUPPLY: supply, ERC20_DECIMALS: decimals, ERC20_SYMBOL: abi_string(symbol)}
         )
@@ -382,7 +386,7 @@ def mixed_probe_failures(method: str, params: list[Any]) -> Any:
     if selector == PAIR_TOKEN0:
         raise RateLimited()
     if selector == ERC20_TOTAL_SUPPLY:
-        return word(1)
+        return abi_uint(1)
     raise RpcFailure("execution reverted")
 
 
@@ -404,6 +408,8 @@ async def test_any_throttled_probe_withholds_the_verdict() -> None:
         ("invalid opcode: INVALID", -32015),
         ("out of gas", -32000),
         ("VM execution error.", -32015),
+        ("invalid jump destination", -32000),
+        ("stack underflow (0 <=> 1)", -32000),
     ],
 )
 async def test_every_revert_flavour_means_not_a_token(message: str, code: int) -> None:
@@ -421,14 +427,16 @@ async def test_every_revert_flavour_means_not_a_token(message: str, code: int) -
 
 @pytest.mark.parametrize(
     "failure",
-    [RpcFailure("header not found", code=-32000), LostAnswer()],
-    ids=["node-error", "lost-answer"],
+    [RpcFailure("header not found", code=-32000), LostAnswer(), None],
+    ids=["node-error", "lost-answer", "null-answer"],
 )
-async def test_a_node_error_or_a_lost_answer_on_one_probe_gives_no_verdict(
-    failure: Exception,
+async def test_a_node_error_or_a_lost_or_null_answer_on_one_probe_gives_no_verdict(
+    failure: Exception | None,
 ) -> None:
     def behind(method: str, params: list[Any]) -> Any:
         if method == "eth_call" and params[0]["data"] == ERC20_TOTAL_SUPPLY:
+            if failure is None:
+                return None  # "result": null from a broken upstream
             raise failure  # no real answer to that call: an outage, not "no such function"
         return erc20_contract(method, params)
 
@@ -599,12 +607,12 @@ async def test_the_token_behind_an_lp_pair_is_checked_and_remembered(tmp_path: P
     pair = Address(Chain.ETHEREUM, USDC_ETH)
     token = Address(Chain.ETHEREUM, MEME)
     pair_answers = {
-        ERC20_TOTAL_SUPPLY: word(10**18),
-        ERC20_DECIMALS: word(18),
+        ERC20_TOTAL_SUPPLY: abi_uint(10**18),
+        ERC20_DECIMALS: abi_uint(18),
         PAIR_TOKEN0: address_word(MEME),
         PAIR_TOKEN1: address_word(WETH),
     }
-    token_answers = {ERC20_TOTAL_SUPPLY: word(10**27), ERC20_DECIMALS: word(18)}
+    token_answers = {ERC20_TOTAL_SUPPLY: abi_uint(10**27), ERC20_DECIMALS: abi_uint(18)}
 
     def node(method: str, params: list[Any]) -> Any:
         target = params[0] if method == "eth_getCode" else params[0]["to"]
@@ -813,7 +821,9 @@ async def test_a_token_is_reported_without_waiting_for_slower_networks() -> None
         if item["method"] == "eth_getCode":
             return "0x6080604052"
         selector = item["params"][0]["data"]
-        return {ERC20_TOTAL_SUPPLY: word(10**18), ERC20_DECIMALS: word(18)}.get(selector, "0x")
+        return {ERC20_TOTAL_SUPPLY: abi_uint(10**18), ERC20_DECIMALS: abi_uint(18)}.get(
+            selector, "0x"
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         validator = evm(http)
@@ -880,7 +890,8 @@ async def test_sui_coin_types_and_packages() -> None:
         strict = sui(http, tuning=FakeTuning(require_erc20=True, skip_stable_copies=False))
         token, not_token = ChainVerdict(AddressKind.TOKEN, "Sui"), AddressKind.NOT_TOKEN
         assert await strict.inspect(SUI_COIN) == token
-        assert await strict.inspect(SUI_PKG) == token  # the package defines a coin
+        # The package defines a coin, and its type comes with the verdict.
+        assert await strict.inspect(SUI_PKG) == dataclasses.replace(token, coin_type=SUI_COIN)
         assert (await strict.inspect(SUI_STRUCT)).kind is not_token  # a type, not a coin
         assert (await strict.inspect(SUI_WALLET)).kind is not_token
         assert (await strict.inspect(SUI_OBJECT)).kind is not_token
@@ -903,6 +914,19 @@ async def test_sui_transport_error_is_unavailable() -> None:
             await validator.inspect(SUI_COIN)
         with pytest.raises(RpcUnavailable):
             await validator.inspect(SUI_PKG)
+
+
+async def test_a_new_sui_coin_the_node_lacks_is_retried_for_a_minute() -> None:
+    rpc = FakeRpc()
+    rpc.route("sui.rpc", sui_node(coins={}, packages={}))  # the node is behind the page
+    clock = FakeClock()
+    async with rpc.client() as http:
+        validator = sui(http, clock=clock)
+        with pytest.raises(RpcUnavailable, match="not on the node yet"):
+            await validator.inspect(SUI_COIN)
+        clock.now += LAG_WINDOW  # still missing a minute later: a made-up coin type
+        assert (await validator.inspect(SUI_COIN)).kind is AddressKind.NOT_TOKEN
+        assert validator.health.down() == set()  # the node answered every time
 
 
 async def test_facade_routes_sui_addresses(tmp_path: Path) -> None:
@@ -1044,7 +1068,7 @@ async def test_a_node_without_batches_answers_about_one_block() -> None:
         if method == "eth_getCode":
             result: object = "0x6080604052"
         elif params[0]["data"] in {ERC20_TOTAL_SUPPLY, ERC20_DECIMALS}:
-            result = word(18)
+            result = abi_uint(18)
         else:
             return httpx.Response(
                 200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": 3, "message": "revert"}}
@@ -1086,7 +1110,7 @@ async def test_a_cancelled_caller_does_not_leave_the_token_known(tmp_path: Path)
             if item["method"] == "eth_getCode":
                 answers.append({"jsonrpc": "2.0", "id": item["id"], "result": "0x6080604052"})
             elif item["params"][0]["data"] in {ERC20_TOTAL_SUPPLY, ERC20_DECIMALS}:
-                answers.append({"jsonrpc": "2.0", "id": item["id"], "result": word(18)})
+                answers.append({"jsonrpc": "2.0", "id": item["id"], "result": abi_uint(18)})
             else:
                 error = {"code": 3, "message": "execution reverted"}
                 answers.append({"jsonrpc": "2.0", "id": item["id"], "error": error})
@@ -1159,7 +1183,7 @@ async def test_a_silent_optional_network_costs_a_verdict_only_the_grace(
         await validator.aclose()
 
 
-def test_a_long_outage_is_reported_once_and_again_after_recovery() -> None:
+def test_a_long_outage_is_reported_once_and_again_after_recovery(tmp_path: Path) -> None:
     from scraper_bot.chains.evm.validator import EvmContractValidator
     from scraper_bot.chains.solana.validator import SolanaContractValidator
     from scraper_bot.chains.sui.validator import SuiCoinValidator
@@ -1168,7 +1192,7 @@ def test_a_long_outage_is_reported_once_and_again_after_recovery() -> None:
     from scraper_bot.storage.address_cache import AddressCache
 
     clock = FakeClock()
-    http = httpx.AsyncClient()
+    http = offline_client()
     networks = [
         EvmNetwork("Base", "https://base.rpc"),
         EvmNetwork("Arc", "https://arc.rpc", 5042, True),
@@ -1179,7 +1203,7 @@ def test_a_long_outage_is_reported_once_and_again_after_recovery() -> None:
         SolanaContractValidator(
             http, "https://sol.rpc", timeout=1, tuning=FakeTuning(), clock=clock
         ),
-        AddressCache(Path("unused-k.tsv"), Path("unused-r.tsv"), rejected_ttl=0),
+        AddressCache(tmp_path / "k.tsv", tmp_path / "r.tsv", rejected_ttl=0),
         sui=SuiCoinValidator(http, "https://sui.rpc", timeout=1, tuning=FakeTuning(), clock=clock),
         max_concurrent=4,
         retry_delay=10,
@@ -1307,7 +1331,7 @@ async def test_a_token_an_optional_network_finds_too_late_is_confirmed_at_once(
         validator.on_late_token = lambda address, network: told.append((address, network))
         first = await validator.validate(ETH)
         assert (first.status, first.kind) == (ValidationStatus.REJECTED, AddressKind.NO_CODE)
-        await asyncio.sleep(0.4)  # Beta answers now: a token, too late for that verdict
+        await until(lambda: told)  # Beta answers now: a token, too late for that verdict
         assert told == [(ETH, "Beta")]
         before = len(requests)
         again = await validator.validate(ETH)  # the next round: no waiting for the delay
@@ -1422,7 +1446,7 @@ def test_the_memories_of_pending_rechecks_are_bounded(
 
     monkeypatch.setattr(validator, "_MAX_PARTIAL", 3)
     clock = FakeClock()
-    validator = optional_validator(httpx.AsyncClient(), tmp_path, clock)
+    validator = optional_validator(offline_client(), tmp_path, clock)
     addresses = [Address(Chain.ETHEREUM, f"0x{i:040x}") for i in range(1, 6)]
     for address in addresses:
         validator._set_partial(address, frozenset({"Beta"}), AddressKind.NO_CODE)
@@ -1436,7 +1460,7 @@ def test_the_memories_of_pending_rechecks_are_bounded(
 
 def test_late_answers_from_two_optional_networks_complete_a_rejection(tmp_path: Path) -> None:
     clock = FakeClock()
-    validator = optional_validator(httpx.AsyncClient(), tmp_path, clock)
+    validator = optional_validator(offline_client(), tmp_path, clock)
     validator._set_partial(ETH, frozenset({"Beta", "Gamma"}), AddressKind.NO_CODE)
     nothing = ChainVerdict(AddressKind.NO_CODE)
     validator._late_answer(ETH.value, "Delta", nothing)  # not one it waits for
@@ -1506,7 +1530,7 @@ async def test_an_answer_in_the_same_step_as_a_token_is_not_late() -> None:
     clock = FakeClock()
     networks = (NETWORKS[0], EvmNetwork("Beta", "https://beta.rpc", optional=True))
     evm_validator = EvmContractValidator(
-        httpx.AsyncClient(), networks, timeout=5, tuning=FakeTuning(), clock=clock
+        offline_client(), networks, timeout=5, tuning=FakeTuning(), clock=clock
     )
     heard: list[str] = []
     evm_validator.on_late = lambda address, name, verdict: heard.append(name)

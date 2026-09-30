@@ -69,6 +69,7 @@ class Harness:
         light: Any = None,
         auto: Any = None,
         pace: SitePace | None = None,
+        pending: Any = None,
     ) -> None:
         self.site = SiteState(ROOT)
         self.checker = FakeChecker()
@@ -99,6 +100,7 @@ class Harness:
             light=light.bind if light is not None else None,
             auto=auto,
             pace=pace,
+            pending=pending,
         )
 
     def outcome(
@@ -245,6 +247,20 @@ async def test_block_signal_doubles_the_interval_and_warns_once() -> None:
     assert h.notifier.recovered == [ROOT]
 
 
+async def test_a_server_that_is_down_slows_the_rounds_a_little_and_warns_nobody() -> None:
+    h = Harness(statuses={APP: 404, DOCS: 404})
+    h.tuning.poll_interval_min = h.tuning.poll_interval_max = 20.0
+    down = BlockSignal("HTTP 503", outage=True)
+    h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 503", block=down)
+    for _ in range(3):
+        await h.monitor.run_once()
+    assert not h.monitor.stats.blocked and h.notifier.blocked == []
+    assert h.monitor.next_delay() == 60.0  # doubled each round, but a minute at most
+    h.outcome(ROOT, PageStatus.UNCHANGED)
+    await h.monitor.run_once()
+    assert h.monitor.next_delay() == 20.0 and h.notifier.recovered == []
+
+
 async def test_a_blocked_site_is_rendered_again_only_when_a_light_request_passes() -> None:
     h = Harness(statuses={APP: 404, DOCS: 404})
     h.outcome(ROOT, PageStatus.UNAVAILABLE, error="HTTP 403", block=BlockSignal("HTTP 403"))
@@ -270,6 +286,7 @@ class FakeLight:
     def __init__(self) -> None:
         self.covered_pages: set[str] = set()
         self.render_soon: Callable[[str], None] = lambda _url: None
+        self.via_browser = False
 
     def bind(self, _url: str, _observe: Any, render_soon: Any, _blocked: Any) -> "FakeLight":
         self.render_soon = render_soon
@@ -554,9 +571,9 @@ def seen(page: str, at: float, *addresses: Address, via: dict[Address, Address] 
 
 
 def observing(
-    statuses: dict[str, int | None], threshold: int = 5
+    statuses: dict[str, int | None], threshold: int = 5, pending: Any = None
 ) -> tuple[Harness, ObservingChecker]:
-    h = Harness(statuses=statuses, threshold=threshold)
+    h = Harness(statuses=statuses, threshold=threshold, pending=pending)
     checker = ObservingChecker()
     h.monitor._checker = checker  # type: ignore[assignment]
     return h, checker
@@ -656,8 +673,9 @@ class RecordingPending:
         self.offers.append((site_url, page_url, result.address, result.status))
         return True
 
-    def announced(self, site_url: str, address: Address) -> None:
+    def announced(self, site_url: str, address: Address) -> frozenset[str]:
         self.announced_tokens.append((site_url, address))
+        return frozenset()
 
     def take_old_news(self, site_url, contract, shown=None) -> bool:
         return False
@@ -667,9 +685,8 @@ class RecordingPending:
 
 
 async def test_addresses_that_are_not_a_token_yet_go_to_the_pending_watch() -> None:
-    h, checker = observing({APP: 404, DOCS: 404})
     pending = RecordingPending()
-    h.monitor._pending = pending  # type: ignore[assignment]
+    h, checker = observing({APP: 404, DOCS: 404}, pending=pending)
     wallet, token = address(4), address(5)
     checker.observations = {
         ROOT: [
@@ -691,12 +708,12 @@ async def test_addresses_that_are_not_a_token_yet_go_to_the_pending_watch() -> N
     checker.observations = {ROOT: [seen(ROOT, 5.0, address(6))]}
     await h.monitor.run_once()
     assert pending.announced_tokens == [(ROOT, address(6))]  # appeared: turbo counts it
+    assert h.notifier.problems == []  # and it was passed on to the turbo sessions too
 
 
 async def test_a_token_on_a_sub_page_that_went_live_counts_for_turbo() -> None:
-    h, checker = observing({APP: 404, DOCS: 404})
     pending = RecordingPending()
-    h.monitor._pending = pending  # type: ignore[assignment]
+    h, checker = observing({APP: 404, DOCS: 404}, pending=pending)
     checker.observations = {ROOT: [seen(ROOT, 1.0)]}
     await h.monitor.run_once()
     h.prober.statuses[APP] = 200  # app.<domain> goes live with the launch

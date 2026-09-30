@@ -3,8 +3,8 @@ import pytest
 from scraper_bot.pages.urls import (
     InvalidUrlError,
     SubUrlDeriver,
+    host_without_www,
     normalize_url,
-    registrable_domain,
     url_to_filename,
 )
 from scraper_bot.settings.defaults import DEFAULT_SUB_URL_PATTERNS
@@ -53,9 +53,9 @@ def test_normalize_url_rejects_garbage(raw: str) -> None:
         normalize_url(raw)
 
 
-def test_registrable_domain_strips_www() -> None:
-    assert registrable_domain("https://www.example.com/x") == "example.com"
-    assert registrable_domain("https://app.example.com") == "app.example.com"
+def test_host_without_www_strips_only_www() -> None:
+    assert host_without_www("https://www.example.com/x") == "example.com"
+    assert host_without_www("https://app.example.com") == "app.example.com"
 
 
 def test_sub_urls_follow_patterns_in_order() -> None:

@@ -111,7 +111,10 @@ async def test_total_supply_tolerates_odd_answers() -> None:
 async def test_coin_type_candidates_put_witness_structs_first() -> None:
     modules: dict[str, Any] = {
         "lib": {"structs": {"Config": {}, "LIB": {}}},
-        "meme": {"structs": {"Helper": {}, "MEME": {}, "Meme": {}}},
+        # A generic struct is never a coin's type, so it is not tried.
+        "meme": {
+            "structs": {"Helper": {}, "MEME": {}, "Meme": {}, "Pool": {"typeParameters": [{}]}}
+        },
         "broken": "not a module",
         "empty": {"structs": []},
         "nothing": {},
@@ -151,8 +154,14 @@ async def test_find_coin_returns_the_first_coin_with_its_metadata() -> None:
 async def test_find_coin_gives_no_verdict_when_a_lookup_failed() -> None:
     structs = {"lib": ["A", "B"]}
     node = FakeSui(package_node(structs, {}, failing=frozenset({f"{PKG}::lib::A"})))
+    no_coin: set[str] = set()
     with pytest.raises(RpcError, match=r"suix_getCoinMetadata via sui\.rpc: HTTP 500"):
-        await find_coin(node.client(), PKG)
+        await find_coin(node.client(), PKG, no_coin=no_coin)
+    assert no_coin == {f"{PKG}::lib::B"}
+    node.calls.clear()
+    with pytest.raises(RpcError):
+        await find_coin(node.client(), PKG, no_coin=no_coin)
+    assert node.count("suix_getCoinMetadata") == 1  # the retry asks only the one that failed
     # Nothing failed: a package without coins is simply not a coin.
     assert await find_coin(FakeSui(package_node(structs, {})).client(), PKG) is None
     assert await find_coin(FakeSui(package_node({}, {})).client(), PKG) is None

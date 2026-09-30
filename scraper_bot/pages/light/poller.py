@@ -2,9 +2,10 @@
 
 A new address in a page's HTML, or in the answer of an API the page calls, goes through the
 usual pipeline at once (checked on-chain, then announced). A page whose HTML carries what
-its render shows, and that neither ticks nor polls on its own, is "covered": the monitor
-then renders it only every ``render_interval``. A new set of scripts in a page's HTML (a
-new deploy of a single-page app) asks the monitor to render that page right away.
+its render shows, and that neither ticks nor polls on its own, is "covered" while the light
+mode polls it: the monitor then renders it only every ``render_interval``. A new set of
+scripts in a page's HTML (a new deploy of a single-page app) asks the monitor to render
+that page right away.
 """
 
 from __future__ import annotations
@@ -19,40 +20,86 @@ import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from scraper_bot.chains.addresses.extractor import AddressExtractor
 from scraper_bot.chains.validator import ContractValidator
 from scraper_bot.models.pages import PageCheckOutcome, Signature
 from scraper_bot.models.sightings import Observation, Sighting, SightingSource
+from scraper_bot.monitoring.rounds import wait_or_stop
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.result import FetchResult
 from scraper_bot.pages.light.transport import LightTransport
-from scraper_bot.pages.sightings import find_sightings, raw_sightings
+from scraper_bot.pages.sightings import find_sightings, locate_raw, raw_sightings
+from scraper_bot.pages.verdicts import observations
 from scraper_bot.settings.live import Tuning
 
 log = logging.getLogger(__name__)
 
 Observe = Callable[[Observation], Awaitable[None]]
+_T = TypeVar("_T")
 
 COVERAGE = 0.8  # share of a render's texts its HTML must carry for the page to be covered
 APIS_PER_PAGE = 2
 APIS_PER_SITE = 6
 _MIN_TEXTS = 10  # a render with fewer texts is too small to judge
 _API_TRIES = 30  # most API URLs we try on one site (later ones are left alone)
-_FAILURES = 3  # failed polls in a row before a page rests or an API is dropped
+_FAILURES = 3  # failed polls in a row before a page or an API rests
 _RENDER_EVERY = 10.0  # new scripts on a page may ask for a render at most this often (s)
 _SCRIPT_FLIPS = 3  # more changes in a row than this mean scripts change per request, not a deploy
 _REFUSED_REST = 60.0  # seconds the light mode rests after the browser was refused as well
-_THREAD_FROM = 100_000  # a text longer than this (chars) gets its address search in a thread
+_THREAD_FROM = 10_000  # a text longer than this (chars) is searched in a thread
 _JUDGE_EVERY = 30.0  # a changed HTML alone may trigger a new judging at most this often (s)
-_TAG_RE = re.compile(r"<(script|link)\b([^>]{0,2000})>", re.IGNORECASE)
+_TAG_RE = re.compile(r"<(script|link)\b([^<>]{0,2000})>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"\b(src|href|rel)\s*=\s*[\"']?([^\"'\s>]{1,1000})", re.IGNORECASE)
 _HINTED_KEY_RE = re.compile(
     r"[\"'](?:ca|contract|contract_?address|mint|token_?address)[\"']\s*:", re.IGNORECASE
 )
 _SECOND_LEVELS = frozenset({"co", "com", "net", "org", "gov", "edu", "ac"})
+# Hosting services whose sub-domains belong to different people: coin.vercel.app and
+# indexer.vercel.app are two sites.
+_SHARED_HOSTS = frozenset(
+    {
+        "4everland.app",
+        "amplifyapp.com",
+        "appspot.com",
+        "azurestaticapps.net",
+        "azurewebsites.net",
+        "bubbleapps.io",
+        "cloudfront.net",
+        "deno.dev",
+        "firebaseapp.com",
+        "fly.dev",
+        "framer.app",
+        "framer.website",
+        "github.io",
+        "gitbook.io",
+        "gitlab.io",
+        "glitch.me",
+        "herokuapp.com",
+        "ipfs.dweb.link",
+        "netlify.app",
+        "ngrok-free.app",
+        "ngrok.app",
+        "ngrok.io",
+        "notion.site",
+        "on.fleek.co",
+        "onrender.com",
+        "pages.dev",
+        "railway.app",
+        "repl.co",
+        "replit.app",
+        "surge.sh",
+        "trycloudflare.com",
+        "up.railway.app",
+        "vercel.app",
+        "web.app",
+        "webflow.io",
+        "workers.dev",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -66,6 +113,7 @@ class _Page:
     digest: str | None = None  # of its last HTML
     html: str = ""
     candidates: frozenset[str] = frozenset()  # address values its last HTML carried
+    served: frozenset[str] | None = None  # the texts of its last HTML, once judged
     scripts: frozenset[str] | None = None
     script_flips: int = 0
     asked_render_at: float = float("-inf")
@@ -93,6 +141,7 @@ class _Api:
     digest: str | None = None
     seen: set[str] = field(default_factory=set)  # every address value it carried
     failures: int = 0
+    rest_until: float = 0.0
 
 
 class LightPoller:
@@ -156,9 +205,21 @@ class LightPoller:
         return self._via_browser
 
     def covered(self, page_url: str) -> bool:
-        """True when the page's HTML carries what its render shows and it does not tick."""
+        """True when the page's HTML carries what its render shows and it does not tick.
+
+        Only while the light mode really polls it: the mode is on, the site doesn't block
+        the bot, neither the mode nor the page rests, and the page's last poll went well.
+        """
         page = self._pages.get(page_url)
-        return page is not None and page.covered
+        if page is None or not page.covered or page.failures:
+            return False
+        now = self._clock()
+        return (
+            self._interval() > 0
+            and not self._is_blocked()
+            and now >= self._rest_until
+            and now >= page.rest_until
+        )
 
     def summary(self) -> str | None:
         """Return one line for /status: what is polled and how often, or None when off."""
@@ -169,7 +230,7 @@ class LightPoller:
         if self._apis:
             polled += f" and {len(self._apis)} API(s)"
         parts = [f"{polled} every {interval:g} s"]
-        covered = sum(1 for page in self._pages.values() if page.covered)
+        covered = sum(1 for url in self._pages if self.covered(url))
         if covered:
             parts.append(f"{covered} rendered every {self._tuning.render_interval:g} s")
         if self._via_browser:
@@ -207,7 +268,7 @@ class LightPoller:
                 self._to_try[key] = (url, outcome.url)
 
     def keep(self, pages: Collection[str]) -> None:
-        """Forget the pages that are no longer live, with the APIs polled for them."""
+        """Forget the pages not in ``pages`` (gone from the site), with the APIs polled for them."""
         for url in [url for url in self._pages if url not in pages]:
             del self._pages[url]
         for key in [key for key, api in self._apis.items() if api.page not in pages]:
@@ -254,7 +315,11 @@ class LightPoller:
                 for page in list(self._pages.values())
                 if now >= page.rest_until
             ),
-            *(self._poll_api(transport, api) for api in list(self._apis.values())),
+            *(
+                self._poll_api(transport, api)
+                for api in list(self._apis.values())
+                if now >= api.rest_until
+            ),
             return_exceptions=True,
         )
         for result in results:
@@ -292,7 +357,7 @@ class LightPoller:
             page.failures = 0
             await self._read(page, started)
             return
-        if not self._usable(answer, page):
+        if not self._usable(answer, page, transport):
             return
         page.etag = answer.headers.get("etag")
         page.modified = answer.headers.get("last-modified")
@@ -301,11 +366,11 @@ class LightPoller:
         if digest == page.digest:
             await self._read(page, started)
             return
-        page.digest, page.html = digest, html
+        page.digest, page.html, page.served = digest, html, None
         # Judge a new render right away, but a changed HTML at most every _JUDGE_EVERY seconds.
         if page.rendered is not None and self._clock() - page.judged_at >= _JUDGE_EVERY:
             page.judge = True
-        self._check_scripts(page, html)
+        self._check_scripts(page, await _off_loop(len(html), _script_list, html))
         found = await self._locate(html)
         new = found - page.candidates
         page.candidates = found
@@ -324,15 +389,8 @@ class LightPoller:
         if answer.status == 304:
             api.failures = 0
             return
-        if not answer.ok or not answer.html:
-            api.failures += 1
-            if api.failures >= _FAILURES:
-                self._apis.pop(_api_key(api.url), None)
-                log.info(
-                    "[%s] light mode stops polling %s (%s)", self._site_url, api.url, answer.reason
-                )
+        if not self._usable(answer, api, transport):
             return
-        api.failures = 0
         api.etag = answer.headers.get("etag")
         api.modified = answer.headers.get("last-modified")
         digest = _digest(answer.html)
@@ -343,11 +401,8 @@ class LightPoller:
         new = found - api.seen
         api.seen |= found
         if new:
-            sightings = tuple(
-                sighting
-                for sighting in raw_sightings(self._extractor, answer.html, SightingSource.API)
-                if sighting.address.value in new
-            )
+            text = answer.html
+            sightings = await _off_loop(len(text), self._api_sightings, text, new)
             await self._report(api.page, sightings, started, read=False)
 
     async def _try_api(self, transport: LightTransport, key: str, url: str, page_url: str) -> None:
@@ -355,7 +410,7 @@ class LightPoller:
 
         Only a JSON answer that holds addresses or names a CA qualifies, up to
         ``APIS_PER_PAGE`` per page and ``APIS_PER_SITE`` in all. What it carries now is its
-        baseline, never news.
+        baseline, never news. One the site refused is tried again later.
         """
         page = self._pages.get(page_url)
         if page is None or len(self._apis) >= APIS_PER_SITE:
@@ -363,6 +418,9 @@ class LightPoller:
         if sum(1 for api in self._apis.values() if api.page == page_url) >= APIS_PER_PAGE:
             return
         answer = await transport.get(url, origin=page.origin)
+        if self._refused(answer, transport):
+            self._to_try[key] = (url, page_url)
+            return
         if answer.status != 200 or not answer.html:
             return
         json_like = answer.html.lstrip()[:1] in {"{", "["}
@@ -388,15 +446,33 @@ class LightPoller:
             len(found),
         )
 
-    def _usable(self, answer: FetchResult, page: _Page) -> bool:
-        """True for a page answer worth reading; a refusal or a failure is handled here.
+    def _usable(self, answer: FetchResult, polled: _Page | _Api, transport: LightTransport) -> bool:
+        """True for an answer worth reading; a refusal or a failure is handled here.
 
-        A refusal of the plain client moves the site to the browser, unless the browser is
-        refused too; a page that keeps failing rests longer and longer (up to five minutes).
+        A page or API that keeps failing rests longer and longer (up to five minutes).
+        """
+        if self._refused(answer, transport):
+            return False
+        if not answer.ok or not answer.html:
+            polled.failures += 1
+            if polled.failures >= _FAILURES:
+                polled.rest_until = self._clock() + 30.0 * min(polled.failures - _FAILURES + 1, 10)
+            return False
+        polled.failures = 0
+        return True
+
+    def _refused(self, answer: FetchResult, transport: LightTransport) -> bool:
+        """True when the site refused what ``transport`` asked (a server that is down doesn't).
+
+        A refusal of the plain client moves the site to the browser. The light mode rests
+        ``_REFUSED_REST`` seconds only when the browser was refused, or the plain client
+        with no browser to turn to.
         """
         refusal = self._blocks.inspect(answer)
-        if refusal is not None:
-            if not self._via_browser and self._browser is not None and not self._is_blocked():
+        if refusal is None or refusal.outage:
+            return False
+        if transport is self._http and self._browser is not None and not self._is_blocked():
+            if not self._via_browser:
                 self._via_browser = True
                 log.info(
                     "[%s] the site refuses plain requests (%s); the light mode asks through "
@@ -404,30 +480,22 @@ class LightPoller:
                     self._site_url,
                     refusal.describe(),
                 )
-            else:
-                self._rest_until = self._clock() + _REFUSED_REST
-                log.info(
-                    "[%s] light requests refused (%s); resting %.0f s",
-                    self._site_url,
-                    refusal.describe(),
-                    _REFUSED_REST,
-                )
-            return False
-        if not answer.ok or not answer.html:
-            page.failures += 1
-            if page.failures >= _FAILURES:
-                page.rest_until = self._clock() + 30.0 * min(page.failures - _FAILURES + 1, 10)
-            return False
-        page.failures = 0
+            return True
+        self._rest_until = self._clock() + _REFUSED_REST
+        log.info(
+            "[%s] light requests refused (%s); resting %.0f s",
+            self._site_url,
+            refusal.describe(),
+            _REFUSED_REST,
+        )
         return True
 
-    def _check_scripts(self, page: _Page, html: str) -> None:
-        """Ask for a render when the page loads other scripts than before (a new deploy).
+    def _check_scripts(self, page: _Page, scripts: frozenset[str]) -> None:
+        """Ask for a render when the page loads other ``scripts`` than before (a new deploy).
 
         At most one render per ``_RENDER_EVERY`` seconds; a page whose script list changes on
         every request is not trusted.
         """
-        scripts = _script_list(html)
         if page.scripts is None or scripts == page.scripts:
             page.scripts = scripts
             page.script_flips = 0
@@ -445,10 +513,7 @@ class LightPoller:
 
     async def _locate(self, text: str) -> frozenset[str]:
         """Return the values of the addresses in ``text`` (in a thread when the text is big)."""
-        if len(text) > _THREAD_FROM:
-            found = await asyncio.to_thread(self._extractor.locate, text)
-        else:
-            found = self._extractor.locate(text)
+        found = await _off_loop(len(text), locate_raw, self._extractor, text)
         return frozenset(address.value for address, _ in found)
 
     def _sightings(self, html: str, values: frozenset[str]) -> tuple[Sighting, ...]:
@@ -460,18 +525,28 @@ class LightPoller:
             if sighting.address.value in values
         )
 
+    def _api_sightings(self, text: str, values: frozenset[str]) -> tuple[Sighting, ...]:
+        """Return the sightings of the addresses ``values`` in an API's answer."""
+        return tuple(
+            sighting
+            for sighting in raw_sightings(self._extractor, text, SightingSource.API)
+            if sighting.address.value in values
+        )
+
     async def _report(
         self, page_url: str, sightings: tuple[Sighting, ...], started: float, *, read: bool
     ) -> None:
-        """Check the addresses on-chain and hand them to the monitor as one observation."""
+        """Check the addresses on-chain and hand them to the monitor, a token without delay."""
         if not sightings:
             if read:
                 await self._observe(Observation(page_url, self._wall(), (), (), started, True))
             return
-        results = tuple(await self._validator.validate_many(s.address for s in sightings))
-        await self._observe(
-            Observation(page_url, self._wall(), sightings, results, started, read=read)
+        found = observations(
+            self._validator, page_url, sightings, seen_at=self._wall(), started=started, read=read
         )
+        async with contextlib.aclosing(found):
+            async for observation in found:
+                await self._observe(observation)
 
     async def _read(self, page: _Page, started: float) -> None:
         """Tell the monitor a covered page was read as it was, for the ⏱ window."""
@@ -483,7 +558,8 @@ class LightPoller:
         and why, in words for the log.
 
         A page that ticks or polls its API on its own changes without a new HTML, so it is
-        never covered, and neither is a render with too little text to judge.
+        never covered, and neither is a render with too little text to judge. The texts of
+        the HTML are read once per HTML, however many renders it is judged against.
         """
         usual = "rendered every round"
         if page.rendered is None:
@@ -495,8 +571,10 @@ class LightPoller:
         shown = [node.text for node in page.rendered if node.text]
         if len(shown) < _MIN_TEXTS:
             return False, f"{usual}: too little text to compare with its HTML"
-        served = {node.text for node in self._normalizer.signature(page.html) if node.text}
-        share = sum(1 for text in shown if text in served) / len(shown)
+        if page.served is None:
+            signature = self._normalizer.signature(page.html)
+            page.served = frozenset(node.text for node in signature if node.text)
+        share = sum(1 for text in shown if text in page.served) / len(shown)
         if share < COVERAGE:
             return False, f"{usual}: its HTML carries {share:.0%} of what it shows"
         every = self._tuning.render_interval
@@ -507,12 +585,17 @@ class LightPoller:
         if self._sleep is not None:
             await self._sleep(seconds)
             return
-        if seconds <= 0:
-            await asyncio.sleep(0)
-            return
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(seconds):
-                await stop.wait()
+        await wait_or_stop(stop, seconds)
+
+
+async def _off_loop(size: int, call: Callable[..., _T], *args: Any) -> _T:
+    """Return ``call(*args)``, run in a thread when it reads more than ``_THREAD_FROM`` chars.
+
+    Searching a long text on the event loop would hold up every other site meanwhile.
+    """
+    if size > _THREAD_FROM:
+        return await asyncio.to_thread(call, *args)
+    return call(*args)
 
 
 def _script_list(html: str) -> frozenset[str]:
@@ -530,13 +613,17 @@ def _script_list(html: str) -> frozenset[str]:
 def _site_of(host: str) -> str:
     """Return the site a host belongs to: ``api.x.io`` and ``app.x.io`` are both ``x.io``.
 
-    Country domains such as ``x.co.uk`` keep three labels; an IP address is its own site.
+    Country domains such as ``x.co.uk`` keep three labels, a project on a shared host keeps
+    its own label (``coin.vercel.app``), and an IP address is its own site.
     """
     host = host.lower().rstrip(".")
     with contextlib.suppress(ValueError):
         ipaddress.ip_address(host)
         return host
     labels = host.split(".")
+    for index in range(1, len(labels)):
+        if ".".join(labels[index:]) in _SHARED_HOSTS:
+            return ".".join(labels[index - 1 :])
     size = 3 if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SECOND_LEVELS else 2
     return ".".join(labels[-size:])
 

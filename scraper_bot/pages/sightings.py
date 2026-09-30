@@ -20,6 +20,7 @@ from scraper_bot.chains.addresses.extractor import (
 from scraper_bot.models.addresses import Address
 from scraper_bot.models.pages import Signature
 from scraper_bot.models.sightings import Sighting, SightingSource
+from scraper_bot.pages.changes.normalizer import unbroken
 
 CONTEXT_CHARS = 60
 HINT_WINDOW = 32  # characters before the address that decide the hint (as in X Scraper)
@@ -122,6 +123,15 @@ def raw_sightings(extractor: AddressExtractor, text: str, source: SightingSource
     return drop_coin_packages(list(best.values()), lambda sighting: sighting.address)
 
 
+def locate_raw(extractor: AddressExtractor, text: str) -> list[tuple[Address, int]]:
+    """Return the addresses in raw markup or an API answer, as the sightings read them.
+
+    An address a ``<wbr>`` or a soft hyphen splits counts too; the offsets point into the
+    text without those breaks (:func:`unbroken`).
+    """
+    return extractor.locate(unbroken(text))
+
+
 def hint_score(before: str) -> int:
     """Return a positive score when the words right before an address name it as a token.
 
@@ -141,9 +151,11 @@ def _offer_raw(
 ) -> None:
     """Add a sighting from ``source`` for each address in ``texts`` that has none yet.
 
-    With ``sui_context`` None each text decides for itself whether bare hex ids are Sui.
+    With ``sui_context`` None each text decides for itself whether bare hex ids are Sui. An
+    address split by a ``<wbr>`` or a soft hyphen counts too; its context is read from the
+    text without those breaks, so other split addresses in it get masked as well.
     """
-    for text in texts:
+    for text in map(unbroken, texts):
         for address, start in extractor.locate(text, sui_context=sui_context):
             if address not in best:
                 # raw markup, so read "&amp;" and "&quot;" the way the page shows them

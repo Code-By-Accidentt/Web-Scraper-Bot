@@ -32,8 +32,10 @@ class Sighting:
 class Observation:
     """What one render of a page showed, reported before the page is compared.
 
-    ``read`` is False for a render that did not show the page itself (a 2xx challenge, a
-    blank page): it does not count as a moment the page was seen without the token.
+    A render's verdicts may come in several observations, a token's first. ``read`` is False
+    for a render that did not show the page itself (a 2xx challenge, a blank page) and for
+    all but the last observation of a render: it does not count as a moment the page was
+    seen without the token.
     """
 
     page_url: str

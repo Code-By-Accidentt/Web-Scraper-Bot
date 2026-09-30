@@ -9,7 +9,7 @@ URL = "https://example.com"
 
 def test_identical_signatures_produce_empty_report() -> None:
     sig = (node("h1", "Title"), node("p", "Body"))
-    report = ChangeDetector().compare(sig, sig, URL)
+    report = ChangeDetector().diff(sig, sig, URL)[0]
     assert report.is_empty
     assert report.counts == ChangeCounts()
     assert not ChangeDetector.differs(sig, sig)
@@ -18,7 +18,7 @@ def test_identical_signatures_produce_empty_report() -> None:
 def test_added_and_removed_nodes_are_listed() -> None:
     old = (node("h1", "Title"), node("p", "Old"), node("p", "Keep"))
     new = (node("h1", "Title"), node("p", "Keep"), node("p", "New"))
-    report = ChangeDetector().compare(old, new, URL)
+    report = ChangeDetector().diff(old, new, URL)[0]
     assert report.removed == (node("p", "Old"),)
     assert report.added == (node("p", "New"),)
     assert report.modified == ()
@@ -28,7 +28,7 @@ def test_added_and_removed_nodes_are_listed() -> None:
 def test_attribute_only_change_is_reported_as_modified() -> None:
     old = (node("a", "Buy", href="/old"), node("p", "x"))
     new = (node("a", "Buy", href="/new"), node("p", "x"))
-    report = ChangeDetector().compare(old, new, URL)
+    report = ChangeDetector().diff(old, new, URL)[0]
     assert report.removed == () and report.added == ()
     assert report.modified == ((node("a", "Buy", href="/old"), node("a", "Buy", href="/new")),)
     before, after = report.modified[0]
@@ -51,7 +51,7 @@ def test_volatile_nodes_and_their_previous_values_are_ignored() -> None:
     second = (node("h1", "T"), node("span", "10:10", class_="timer"), node("p", "same"))
     detector = ChangeDetector()
     volatile = detector.volatile_nodes(first, second)
-    assert detector.compare(old, second, URL, ignore=volatile).is_empty
+    assert detector.diff(old, second, URL, ignore=volatile)[0].is_empty
 
 
 def test_real_change_survives_volatile_filtering() -> None:
@@ -59,7 +59,7 @@ def test_real_change_survives_volatile_filtering() -> None:
     first = (node("h1", "T"), node("span", "10:05"), node("p", "new text"))
     second = (node("h1", "T"), node("span", "10:10"), node("p", "new text"))
     detector = ChangeDetector()
-    report = detector.compare(old, second, URL, ignore=detector.volatile_nodes(first, second))
+    report = detector.diff(old, second, URL, ignore=detector.volatile_nodes(first, second))[0]
     assert report.removed == (node("p", "old text"),)
     assert report.added == (node("p", "new text"),)
 
@@ -80,7 +80,7 @@ def test_old_snapshot_node_that_is_itself_volatile_is_ignored() -> None:
     detector = ChangeDetector()
     volatile = detector.volatile_nodes(first, second)
     assert node("span", "10:00", class_="timer") in volatile
-    assert detector.compare(old, second, URL, ignore=volatile).is_empty
+    assert detector.diff(old, second, URL, ignore=volatile)[0].is_empty
 
     # It is dropped outright, without using up the counterpart another old node needs.
     old = (node("span", "10:00", class_="timer"), node("span", "10:05", class_="timer"))
@@ -88,7 +88,7 @@ def test_old_snapshot_node_that_is_itself_volatile_is_ignored() -> None:
     ignore = frozenset(
         {node("span", "10:00", class_="timer"), node("span", "10:10", class_="timer")}
     )
-    assert detector.compare(old, new, URL, ignore=ignore).is_empty
+    assert detector.diff(old, new, URL, ignore=ignore)[0].is_empty
 
 
 def test_a_static_text_that_turned_into_a_ticking_countdown_is_a_change() -> None:
@@ -97,7 +97,7 @@ def test_a_static_text_that_turned_into_a_ticking_countdown_is_a_change() -> Non
     second = (node("h1", "Pons"), node("p", "Launch in 00:05:28", class_="status"))
     detector = ChangeDetector()
     volatile = detector.volatile_nodes(first, second)
-    report = detector.compare(old, second, URL, ignore=volatile)
+    report = detector.diff(old, second, URL, ignore=volatile)[0]
     assert report.removed == (node("p", "Presale is live", class_="status"),)
     assert report.added == ()  # the countdown itself is volatile
 
@@ -108,7 +108,7 @@ def test_a_counter_with_another_value_is_the_previous_value_of_a_volatile_node()
     second = (node("p", "Raised: 13,004.25 SOL", class_="raised"),)
     detector = ChangeDetector()
     volatile = detector.volatile_nodes(first, second)
-    assert detector.compare(old, second, URL, ignore=volatile).is_empty
+    assert detector.diff(old, second, URL, ignore=volatile)[0].is_empty
 
 
 def test_shape_masks_every_number() -> None:
@@ -125,9 +125,9 @@ def test_a_node_inserted_into_a_run_of_identical_rows_is_the_only_addition() -> 
     for count in (250, 20_000):  # 250: 101 removed and 102 added before; 20 000: minutes
         rows = (node("div", class_="skeleton"),) * count
         started = time.perf_counter()
-        report = ChangeDetector().compare(
+        report = ChangeDetector().diff(
             (head, *rows, soon), (head, *rows[:100], fresh, *rows[100:], live), URL
-        )
+        )[0]
         assert time.perf_counter() - started < 1.0
         assert (report.removed, report.added) == ((soon,), (fresh, live))
 

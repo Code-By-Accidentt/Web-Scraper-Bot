@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
@@ -14,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from scraper_bot.telegram.markup import strip_markup
+from scraper_bot.telegram.markup import TAG_RE, strip_markup
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +29,6 @@ _CHAT_BURST = 5  # Telegram allows short bursts, so a quiet chat may get this ma
 _GLOBAL_LIMIT = 30  # requests per second over all chats
 # These errors mean the request never left, so sending it again can't make a duplicate.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-_TAG_RE = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)\b[^<>]*>")
 
 
 class TelegramAuthError(Exception):
@@ -70,6 +68,7 @@ class _Answer:
     result: Any = None
     error: str | None = None
     plain: bool = False  # it went out as plain text after Telegram rejected the HTML
+    chat_id: int | None = None  # where it went, which differs once a group became a supergroup
 
     @property
     def ok(self) -> bool:
@@ -157,7 +156,8 @@ class TelegramClient:
     short burst at once, then about one request a second; a flood limit pauses the whole
     chat, not one message. Messages go out as HTML; long ones are
     split without breaking tags, and if Telegram rejects the markup, the text goes out
-    plain, so a formatting slip never loses an alert.
+    plain, so a formatting slip never loses an alert. A group that becomes a supergroup is
+    followed to its new id for the rest of the run.
     """
 
     MAX_MESSAGE_LENGTH = 4096
@@ -178,31 +178,31 @@ class TelegramClient:
         self._clock = clock
         self._queues: dict[int, _ChatQueue] = {}
         self._recent: deque[float] = deque(maxlen=_GLOBAL_LIMIT)  # when the latest requests left
+        self._moved: dict[int, int] = {}  # group id -> the id it got as a supergroup
         self.username: str | None = None  # the bot's own @name, None until get_me() answers
 
-    async def send_message(self, chat_id: int, text: str, *, patient: bool = False) -> bool:
+    async def send_message(self, chat_id: int, text: str) -> bool:
         """Send ``text``, split into chunks if needed; return True when every chunk went out.
 
         It goes ahead of the alerts waiting for the chat, as a command reply should: three
-        tries, and a flood wait over 10 s drops it. A ``patient`` send queues like a token
-        alert instead and rides out flood waits and outages.
+        tries, and a flood wait over 10 s drops it.
         """
-        answers = await self._send_text(chat_id, text, _ALERT if patient else _REPLY)
+        answers = await self._send_text(chat_id, text, _REPLY)
         return all(answer.ok for answer in answers)
 
-    async def send_tracked(
-        self, chat_id: int, text: str, *, patient: bool = False
-    ) -> SentMessage | None:
-        """Send ``text`` and return the message, so it can be edited later.
+    async def send_tracked(self, chat_id: int, text: str) -> SentMessage | None:
+        """Send a token alert and return the message, so its details can be edited in later.
 
-        A ``patient`` send is a token alert: only command replies go ahead of it, and it rides
-        out flood waits and outages. Return None when sending failed, or when the text needed
-        several chunks: it is still sent then, but cannot be edited.
+        Only command replies go ahead of it, and it rides out flood waits and outages.
+        Return None when sending failed, or when the text needed several chunks: it is
+        still sent then, but cannot be edited.
         """
-        answers = await self._send_text(chat_id, text, _ALERT if patient else _NOTICE)
+        answers = await self._send_text(chat_id, text, _ALERT)
         if len(answers) != 1 or not answers[0].ok:
             return None
-        return SentMessage(chat_id, _message_id(answers[0].result), plain=answers[0].plain)
+        answer = answers[0]
+        where = answer.chat_id if answer.chat_id is not None else chat_id
+        return SentMessage(where, _message_id(answer.result), plain=answer.plain)
 
     async def edit_message_text(self, message: SentMessage, text: str) -> bool:
         """Replace the text of a sent message, in its markup; return True when done.
@@ -245,23 +245,6 @@ class TelegramClient:
             await asyncio.wait(futures, timeout=wait)
         return any(all(_accepted(future) for future in chunks) for chunks in queued)
 
-    async def send_document(
-        self,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str = "",
-        *,
-        patient: bool = False,
-    ) -> bool:
-        """Send ``content`` as a text file; return True when it went out.
-
-        A ``patient`` one queues like a token alert. The caption is cut to Telegram's limit
-        of 1024 characters.
-        """
-        answer = await self._queue_document(chat_id, filename, content, caption, patient)
-        return answer.ok
-
     async def broadcast_document(
         self,
         chat_ids: Iterable[int],
@@ -278,6 +261,14 @@ class TelegramClient:
                 for chat_id in chat_ids
             )
         )
+
+    def former_id(self, chat_id: int) -> int | None:
+        """Return the id a supergroup had as a group earlier in this run, or None.
+
+        Telegram gives a group a new id when it becomes a supergroup; its commands count
+        like those of the group it was.
+        """
+        return next((old for old, new in self._moved.items() if new == chat_id), None)
 
     async def get_me(self) -> dict[str, Any] | None:
         """Return the bot's profile and remember its username.
@@ -344,8 +335,10 @@ class TelegramClient:
     ) -> list[asyncio.Future[_Answer]]:
         """Queue the chunks of ``text`` for a chat, in order; return the futures of their answers.
 
-        A chunk whose HTML Telegram rejects is sent again as plain text.
+        A chunk whose HTML Telegram rejects is sent again as plain text. A group that became
+        a supergroup gets it at its new id.
         """
+        chat_id = self._moved.get(chat_id, chat_id)
         futures = []
         for chunk in self._chunks(text):
             data = {
@@ -366,6 +359,7 @@ class TelegramClient:
         self, chat_id: int, filename: str, content: bytes, caption: str, patient: bool
     ) -> asyncio.Future[_Answer]:
         """Queue a text file for a chat and return the future of its answer."""
+        chat_id = self._moved.get(chat_id, chat_id)
         return self._submit(
             chat_id,
             "sendDocument",
@@ -450,7 +444,8 @@ class TelegramClient:
 
         A request that never reached Telegram is resent after a pause, and so is a patient
         one that got a 5xx answer. One that may have arrived (its answer timed out) is never
-        resent, so a message cannot come twice.
+        resent, so a message cannot come twice. A group that became a supergroup gets the
+        request again at its new id.
         """
         method, policy = request.method, request.policy
         try:
@@ -475,10 +470,14 @@ class TelegramClient:
             payload = {}
         status = response.status_code
         if status == 200 and payload.get("ok"):
-            return _Answer(result=payload.get("result"), plain=request.as_plain)
+            where = request.data.get("chat_id")
+            return _Answer(result=payload.get("result"), plain=request.as_plain, chat_id=where)
         error = str(payload.get("description") or "") or f"HTTP {status}"
         if status == 429:
             return self._flood(queue, request, _retry_after(payload), error)
+        moved_to = _migrated_to(payload)
+        if moved_to is not None and self._follow(request, moved_to):
+            return None
         if status >= 500 and policy.patient and self._backoff(queue, request):
             log.warning(
                 "%s to chat %s failed: HTTP %s %s; retrying in %.0fs",
@@ -495,6 +494,33 @@ class TelegramClient:
             return None
         log.error("%s to chat %s failed: HTTP %s %s", method, chat_id, status, error)
         return _Answer(error=error)
+
+    def _follow(self, request: _Request, new_id: int) -> bool:
+        """Take note that a request's group became a supergroup; return True to resend it there.
+
+        From now on everything for the group goes to ``new_id``. An edit isn't resent: its
+        message stays behind in the old group.
+        """
+        old_id = request.data.get("chat_id")
+        if not isinstance(old_id, int) or old_id == new_id or new_id in self._moved:
+            return False
+        if self._moved.get(old_id) != new_id:
+            self._moved[old_id] = new_id
+            log.error(
+                "chat %s became a supergroup with the new id %s; the bot sends there until it "
+                "restarts. Put %s in place of %s in TELEGRAM_CHAT_IDS (and in "
+                "TELEGRAM_ALLOWED_CHAT_IDS, if it's there) in .env",
+                old_id,
+                new_id,
+                new_id,
+                old_id,
+            )
+        if request.method == "editMessageText":
+            return False
+        request.data = {**request.data, "chat_id": new_id}
+        if request.plain is not None:
+            request.plain = {**request.plain, "chat_id": new_id}
+        return True
 
     def _flood(
         self, queue: _ChatQueue, request: _Request, wait: float, error: str
@@ -577,7 +603,7 @@ class TelegramClient:
 def _open_tags(html: str) -> list[tuple[str, str]]:
     """Return (name, opening tag) for each element still open at the end of ``html``."""
     stack: list[tuple[str, str]] = []
-    for match in _TAG_RE.finditer(html):
+    for match in TAG_RE.finditer(html):
         name = match.group(2).lower()
         if not match.group(1):
             stack.append((name, match.group(0)))
@@ -623,6 +649,13 @@ def _retry_after(payload: Any) -> float:
     except (TypeError, ValueError):
         return 3.0
     return max(seconds, 0.0) if math.isfinite(seconds) else 3.0
+
+
+def _migrated_to(payload: dict[str, Any]) -> int | None:
+    """Return the new id Telegram names when a group has become a supergroup, else None."""
+    parameters = payload.get("parameters")
+    value = parameters.get("migrate_to_chat_id") if isinstance(parameters, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _message_id(result: Any) -> int:

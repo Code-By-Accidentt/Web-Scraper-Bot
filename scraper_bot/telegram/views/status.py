@@ -11,7 +11,8 @@ from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.monitor_manager import MonitorManager
 from scraper_bot.monitoring.pending.watch import PendingWatch
 from scraper_bot.monitoring.turbo.auto import AutoWindowView
-from scraper_bot.monitoring.turbo.manager import TurboManager
+from scraper_bot.monitoring.turbo.manager import ScheduledTurbo, TurboManager
+from scraper_bot.monitoring.turbo.session import TurboSession
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.telegram.markup import escape
 from scraper_bot.telegram.timefmt import (
@@ -86,18 +87,8 @@ class StatusReporter:
         for site in sites:
             lines.append(f"• {escape(site.url)}: {self._describe(site, now)}")
         if self._turbo is not None:
-            for session in self._turbo.active():
-                stats = session.stats
-                lines.append(
-                    f"🚀 Turbo {escape(session.url)}: {stats.cycles} cycles, "
-                    f"{len(stats.found)} confirmed, "
-                    f"{session.pending_count} pending, {format_duration(session.seconds_left)} left"
-                )
-            for plan in self._turbo.scheduled():
-                lines.append(
-                    f"⏰ Turbo {escape(plan.url)}: scheduled at "
-                    f"{format_schedule(plan.start_at, now)} for {plan.minutes:.0f} min"
-                )
+            lines += [describe_turbo(session) for session in self._turbo.active()]
+            lines += [describe_turbo_plan(plan, now) for plan in self._turbo.scheduled()]
             lines += [describe_auto_window(w, now) for w in self._turbo.auto_windows()]
         if self._pending is not None and self._pending.count():
             lines.append(
@@ -137,7 +128,26 @@ class StatusReporter:
                 f"; ⚠️ BLOCKED? {escape(stats.block_reason)} since {since}, "
                 f"interval x{2**stats.block_level}"
             )
+        if stats.down_since is not None:
+            since = format_clock(stats.down_since, date=False)
+            text += f"; ⚠️ server down? {escape(stats.down_reason or '')} since {since}"
         return text
+
+
+def describe_turbo(session: TurboSession) -> str:
+    """Return one line about a running turbo session: what it did so far and the time left."""
+    stats = session.stats
+    return (
+        f"🚀 Turbo {escape(session.url)}: {stats.cycles} cycles, {stats.renders} renders, "
+        f"{len(stats.found)} confirmed, {session.pending_count} pending, "
+        f"{format_duration(session.seconds_left)} left"
+    )
+
+
+def describe_turbo_plan(plan: ScheduledTurbo, now: float) -> str:
+    """Return one line about a turbo session planned for later: when it starts, how long."""
+    when = format_schedule(plan.start_at, now)
+    return f"⏰ Turbo {escape(plan.url)}: scheduled at {when} for {plan.minutes:.0f} min"
 
 
 def describe_auto_window(window: AutoWindowView, now: float) -> str:

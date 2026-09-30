@@ -44,9 +44,9 @@ async def test_addresses_and_commands_are_monospace() -> None:
 class SlowTelegram(FakeTelegram):
     """Token alerts take a moment to leave, like a real Telegram round trip."""
 
-    async def send_tracked(self, chat_id, text, *, patient=False):
+    async def send_tracked(self, chat_id, text):
         await asyncio.sleep(0.02)
-        return await super().send_tracked(chat_id, text, patient=patient)
+        return await super().send_tracked(chat_id, text)
 
 
 async def test_turbo_summary_never_overtakes_the_alerts_it_lists() -> None:
@@ -151,7 +151,8 @@ async def test_contract_alert_carries_token_details_and_links() -> None:
     ) in plain
     assert "dexscreener.com/ethereum/pair" not in text  # a pair address is never shown
     assert f'<a href="https://etherscan.io/token/{ADDRESS.value}">Etherscan</a>' in text
-    assert plain.endswith("Links: Etherscan · DexScreener · Uniswap")
+    links = re.sub(r" \(https://[^)]*\)", "", plain.splitlines()[-1])
+    assert links == "Links: Etherscan · DexScreener · Uniswap"
 
 
 async def test_no_pair_and_failed_lookups_still_produce_an_alert() -> None:
@@ -489,7 +490,7 @@ async def test_a_cancelled_round_does_not_lose_the_document_and_the_pause_waits(
     monitor = asyncio.create_task(
         notifier.contracts_batch("https://x.io", "https://x.io", contracts)
     )
-    await monitor
+    await asyncio.wait_for(monitor, 1)
     monitor.cancel()  # /pause or shutdown while the upload is still running
     sent = telegram.broadcast
 
@@ -513,7 +514,7 @@ async def test_an_alert_cut_off_by_a_stop_goes_out_at_the_next_start(tmp_path: P
     class Unreachable(FakeTelegram):
         """Telegram does not answer before the bot stops."""
 
-        async def send_tracked(self, chat_id, text, *, patient=False):
+        async def send_tracked(self, chat_id, text):
             await asyncio.Event().wait()
 
     path = tmp_path / "outbox.json"
@@ -536,6 +537,44 @@ async def test_an_alert_cut_off_by_a_stop_goes_out_at_the_next_start(tmp_path: P
     await damaged.drain()
     assert told.messages[0][1].startswith("🛑 The list of unsent alerts (outbox.json) was damaged")
     assert len(list(tmp_path.glob("outbox.json.broken-*"))) == 1  # moved aside, not lost
+
+
+async def test_an_alert_the_outbox_cannot_save_does_not_block_the_next_ones(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "outbox.json"
+    notifier, telegram = make()
+    notifier.outbox = Outbox(path)
+    odd = Sighting(ADDRESS, SightingSource.TEXT, "CA \ud83d:")  # a lone surrogate can't be saved
+    await notifier.contract_found(ConfirmedContract(ADDRESS, "Base"), "https://x.io", sighting=odd)
+    other = ConfirmedContract(Address(Chain.ETHEREUM, "0x" + "b" * 40), "Base")
+    await notifier.contract_found(other, "https://x.io")
+    await notifier.drain()
+    texts = [text for _, text in telegram.messages]
+    assert sum(text.startswith("🔔") for text in texts) == 2  # both alerts went out
+    assert any(text.startswith("🛑 Saving unsent alerts (outbox.json) failed") for text in texts)
+    assert json.loads(path.read_text(encoding="utf-8"))["entries"] == []  # saved, then done
+
+
+async def test_token_details_reach_a_chat_without_waiting_for_the_slowest_one() -> None:
+    other_chat = asyncio.Event()
+
+    class OneSlowChat(FakeTelegram):
+        async def send_tracked(self, chat_id, text):
+            if chat_id == 2:
+                await other_chat.wait()  # this chat's round trip takes long
+            return await super().send_tracked(chat_id, text)
+
+    telegram = OneSlowChat()
+    enricher = FakeEnricher(TokenInfo(name="USD Coin", symbol="USDC"))
+    notifier = Notifier(telegram, [1, 2], enricher=enricher)  # type: ignore[arg-type]
+    await notifier.contract_found(ConfirmedContract(ADDRESS, "Base"), "https://x.io")
+    await asyncio.sleep(0.01)
+    assert enricher.calls  # looked up while the alert is still on its way
+    assert [chat for chat, _ in telegram.edits] == [1]
+    other_chat.set()
+    await notifier.drain()
+    assert sorted(chat for chat, _ in telegram.edits) == [1, 2]
 
 
 def test_format_helpers() -> None:

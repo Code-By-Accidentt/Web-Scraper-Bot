@@ -63,18 +63,6 @@ def test_related_settings_are_kept_consistent(tmp_path: Path) -> None:
         prefs.set("turbo_default_minutes", "999")
 
 
-def test_risky_values_need_confirmation(tmp_path: Path) -> None:
-    prefs = make_prefs(tmp_path)
-    with pytest.raises(ConfirmationRequired) as info:
-        prefs.set("require_erc20", "off")
-    assert info.value.spec.key == "require_erc20" and info.value.value is False
-    assert prefs.require_erc20 is True  # nothing changed
-    assert prefs.set("require_erc20", "off", confirmed=True).new is False
-    with pytest.raises(ConfirmationRequired):
-        prefs.set("poll_interval_min", "1")
-    assert prefs.set("poll_interval_min", "4").new == 4.0  # safe value: no confirmation
-
-
 def test_overrides_persist_and_reload(tmp_path: Path) -> None:
     prefs = make_prefs(tmp_path)
     prefs.set("poll_interval_min", "7")

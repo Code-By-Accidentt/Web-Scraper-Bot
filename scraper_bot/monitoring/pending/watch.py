@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from itertools import islice
@@ -38,7 +40,7 @@ from scraper_bot.models.addresses import (
     parse_address_key,
 )
 from scraper_bot.models.sightings import Sighting, SightingSource, Timeline
-from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.alerts import AlertRegistry, Announcer
 from scraper_bot.monitoring.pace import SitePace
 from scraper_bot.monitoring.pending.entry import (
     SLOW_INTERVAL,
@@ -135,6 +137,7 @@ class PendingWatch:
         self._pace = pace or SitePace()
         self._pace.on_boost(self._hurry_site)
         self._tokens = tokens or SiteTokens()
+        self._announcer = Announcer(registry, notifier, self._tokens, self)
         # One queue per chain family, so a hanging EVM confirmation never holds up a Solana mint.
         self._confirming = {
             Chain.ETHEREUM: asyncio.Semaphore(CONFIRMING_AT_ONCE),
@@ -142,13 +145,15 @@ class PendingWatch:
         }
         self._health = health
         self._stale_absences = frozenset(stale_absences)
-        # Optional-network batches still running after their tick -> (their entries, sent at).
+        # Batches still running after their tick's grace -> (their entries, sent at).
         self._late_batches: dict[asyncio.Future[list[Any]], tuple[list[PendingEntry], float]] = {}
         self._in_flight: set[str] = set()  # networks whose last batch has not come back
         self._new_networks = frozenset(new_networks)
         self._old_news = OldNews()
         self._dirty = False
         self._saved_at = 0.0
+        # True when pending.json is damaged and couldn't be moved aside, so we mustn't save over it.
+        self._frozen = False
 
     def count(self, site_url: str | None = None) -> int:
         """Return how many addresses are watched, in all or for one site."""
@@ -313,8 +318,8 @@ class PendingWatch:
             evm = evm if chain is Chain.ETHEREUM else []
             solana = solana if chain is Chain.SOLANA else []
         await asyncio.gather(
-            self._pass(self._look_evm(evm, now), now),
-            self._pass(self._look_solana(solana, now), now),
+            self._pass(lambda: self._look_evm(evm, now), now),
+            self._pass(lambda: self._look_solana(solana, now), now),
         )
         await self._send_old_news()
 
@@ -336,11 +341,11 @@ class PendingWatch:
 
     async def _pass(
         self,
-        look: Awaitable[list[tuple[PendingEntry, tuple[str, ...] | None]]],
+        look: Callable[[], Awaitable[list[tuple[PendingEntry, tuple[str, ...] | None]]]],
         now: float,
     ) -> None:
-        """Wait for one existence check, then fully validate every address that appeared."""
-        appeared = await look
+        """Run one existence check, then fully validate every address that appeared."""
+        appeared = await look()
         await asyncio.gather(*(self._confirm(entry, networks, now) for entry, networks in appeared))
 
     async def _look_evm(
@@ -352,7 +357,7 @@ class PendingWatch:
         EIP-7702 delegation) are dropped; the rest are marked absent and rescheduled.
         """
         appeared: list[tuple[PendingEntry, tuple[str, ...] | None]] = []
-        # If an optional network reported code late, confirm it now without another look.
+        # If a network reported code late, confirm it now without another look.
         hurried = [e for e in entries if e.late]
         for entry in hurried:
             where, entry.late = tuple(sorted(entry.late)), set()
@@ -395,10 +400,12 @@ class PendingWatch:
     ) -> dict[str, Any]:
         """Send ``calls`` to every EVM network and return each one's answer list or error.
 
-        Optional networks get ``OPTIONAL_GRACE`` seconds more once the required ones have
-        answered; a batch still running then finishes in the background, and what it says
-        about ``entries`` still counts. A network whose last batch has not come back is
-        skipped, so a hanging node gets one request at a time.
+        Once a network shows code at one of ``entries``, or only optional networks are left,
+        the others get ``OPTIONAL_GRACE`` seconds more, required ones too: one slow node
+        never holds up a deployment another network already shows. A batch still running
+        then finishes in the background, and what it says about ``entries`` still counts.
+        A network whose last batch has not come back is skipped, so a hanging node gets one
+        request at a time.
         """
         tasks: dict[asyncio.Future[list[Any]], str] = {}
         for name, client in self._evm:
@@ -412,13 +419,14 @@ class PendingWatch:
         pending = set(tasks)
         loop = asyncio.get_running_loop()
         grace_ends: float | None = None
+        seen_code = False
         try:
             while pending:
-                timeout = None
-                if all(tasks[task] not in self._required for task in pending):
-                    if grace_ends is None:
-                        grace_ends = loop.time() + OPTIONAL_GRACE
-                    timeout = max(grace_ends - loop.time(), 0.0)
+                if grace_ends is None and (
+                    seen_code or self._required.isdisjoint(tasks[task] for task in pending)
+                ):
+                    grace_ends = loop.time() + OPTIONAL_GRACE
+                timeout = None if grace_ends is None else max(grace_ends - loop.time(), 0.0)
                 done, pending = await asyncio.wait(
                     pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
                 )
@@ -427,7 +435,9 @@ class PendingWatch:
                         self._late_batches[task] = (entries, sent_at)
                     break
                 for task in done:
-                    answers[tasks[task]] = task.exception() or task.result()
+                    answer = task.exception() or task.result()
+                    answers[tasks[task]] = answer
+                    seen_code = seen_code or _shows_code(answer, len(entries))
         except BaseException:
             for task in pending:
                 task.cancel()
@@ -467,7 +477,7 @@ class PendingWatch:
     def hurry(self, address: Address, network: str) -> None:
         """Confirm ``address`` on ``network`` at the next tick, without another look.
 
-        Used when an optional network reports code after its check (or its verdict) was over.
+        Used when a network reports code after its check (or its verdict) was over.
         """
         entry = self._entries.get(address)
         if entry is None:
@@ -580,14 +590,17 @@ class PendingWatch:
                 if late_for is not None:
                     self._old_news.queue(late_for, contract, self._clock())
                     continue
-                if self._registry.claim(contract):
-                    await self._notifier.contract_found(
-                        contract,
+                await self._announcer.announce(
+                    entry.site_url,
+                    [contract],
+                    lambda fresh, via=result.via is not None: self._notifier.contract_found(
+                        fresh[0],
                         entry.page_url,
                         sighting=entry.sighting,
-                        timeline=self._timeline(entry, networks, via=result.via is not None),
-                    )
-                self._tokens.publish(entry.sites, contract.address, contract.network)
+                        timeline=self._timeline(entry, networks, via=via),
+                    ),
+                    also=entry.sites,
+                )
             return
         if entry.address not in self._entries:
             return  # removed in the meantime (/remove, or the monitor announced it)
@@ -775,8 +788,9 @@ class PendingWatch:
     def load(self) -> None:
         """Load the entries, dropped addresses and old news of an earlier run.
 
-        A broken file starts the watch empty. After new EVM networks were added, the saved
-        EVM entries become baselines (see :meth:`_forget_old_verdicts`).
+        A damaged file is moved aside and reported, and the watch starts empty. After new
+        EVM networks were added, the saved EVM entries become baselines (see
+        :meth:`_forget_old_verdicts`).
         """
         if not self._path.is_file():
             return
@@ -794,7 +808,7 @@ class PendingWatch:
             }
             old_news = OldNews.from_dict(data.get("old_news"))
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
-            log.warning("pending watch file %s is unreadable (%s); starting empty", self._path, exc)
+            self._set_aside(f"unreadable: {exc}")
             return
         self._entries = {entry.address: entry for entry in entries if entry is not None}
         self._dropped = dict(sorted(dropped.items(), key=lambda item: item[1].until))
@@ -830,11 +844,50 @@ class PendingWatch:
             len(evm),
         )
 
+    def _set_aside(self, problem: str) -> None:
+        """Move a damaged watch file aside for a person to look at, and report it once.
+
+        The next save starts a new file. If it can be neither moved nor copied, the watch
+        is never saved over it.
+        """
+        target: Path | None = self._path.with_name(
+            f"{self._path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        try:
+            os.replace(self._path, target)  # type: ignore[arg-type]
+        except OSError:
+            try:
+                shutil.copyfile(self._path, target)  # type: ignore[arg-type]
+            except OSError:
+                target = None
+                self._frozen = True
+        log.error(
+            "pending watch file %s: %s; the damaged file was moved to %s",
+            self._path,
+            problem,
+            target,
+        )
+        where = (
+            f"The damaged file was moved to: {target}"
+            if target is not None
+            else "It could not be moved aside, so the watch is not saved until it is gone."
+        )
+        self._notifier.report_later(
+            "pending-damaged",
+            "The watch of addresses published before their token (pending.json) was damaged",
+            f"{problem}\n{where}",
+            hint="The watch starts empty and takes up the addresses the pages still show on "
+            "the next rounds; delete the damaged copy once you no longer need it.",
+        )
+
     def save(self) -> None:
         """Write the watch to its file, forgetting expired drops first.
 
-        A failed write is logged, and the loop tries again at its next tick.
+        A failed write is logged, and the loop tries again at its next tick. Nothing is
+        written over a damaged file that could not be moved aside.
         """
+        if self._frozen:
+            return
         now = self._clock()
         self._dropped = {a: d for a, d in self._dropped.items() if d.until > now}
         payload = {
@@ -860,3 +913,14 @@ def _uint(answer: Any) -> int:
         return int(answer, 16) if isinstance(answer, str) else 0
     except ValueError:
         return 0
+
+
+def _shows_code(answer: Any, count: int) -> bool:
+    """Return True when a network's batch answer shows contract code at one of the addresses.
+
+    The first ``count`` answers are the eth_getCode ones; a wallet's EIP-7702 delegation
+    doesn't count as code here.
+    """
+    return isinstance(answer, list) and any(
+        has_code(code) and not is_delegated_wallet(code) for code in answer[:count]
+    )

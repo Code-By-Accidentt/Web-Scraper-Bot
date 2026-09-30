@@ -66,6 +66,7 @@ HOSTILE = {
     "/popups": "<p>popups</p><a id='x' href='/api?blank' target='_blank'>x</a><script>"
     "window.open('/api?popup'); document.getElementById('x').click();</script>",
 }
+ASKED: list[str] = []  # the paths the test site was asked for
 
 
 @pytest.fixture
@@ -73,16 +74,20 @@ def site(tmp_path: Path) -> Iterator[str]:
     (tmp_path / "index.html").write_text(INDEX_HTML, encoding="utf-8")
     (tmp_path / "bundle.js").write_text(BUNDLE_JS, encoding="utf-8")
     (tmp_path / "frame.html").write_text(FRAME_HTML, encoding="utf-8")
+    ASKED.clear()
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, directory=str(tmp_path), **kwargs)
 
         def do_GET(self):
-            if self.path == "/api":
+            ASKED.append(self.path)
+            if self.path in ("/api", "/cors"):
                 body = API_JSON.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                if self.path == "/cors":  # an API that lets any site read it, without cookies
+                    self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -258,12 +263,20 @@ async def test_a_tab_kept_on_the_site_fetches_with_the_browser_cookies(
     site: str, tmp_path: Path
 ) -> None:
     origin = site.replace("/index.html", "")
+    api_host = origin.replace("127.0.0.1", "localhost")  # another origin, as api.x.io is
     async with browser(settings_for(tmp_path, DEEP_SCAN="false")) as fetcher:
         assert (await fetcher.fetch(origin + "/cookie")).ok  # the site sets a cookie
         first = await fetcher.tab_fetch(origin + "/whoami", origin=origin)
         again = await fetcher.tab_fetch(origin + "/whoami", origin=origin)  # the same tab
+        # The kept tab's page never came from the network, so Chromium can't tell it's on
+        # this machine too, and asks before it reaches another local origin. We say yes.
+        assert fetcher._context is not None
+        await fetcher._context.grant_permissions(["local-network-access"])
+        api = await fetcher.tab_fetch(api_host + "/cors", origin=origin)
     assert first.status == 200 and "cookie: passed=1" in first.html
     assert "Headless" not in first.html and again.status == 200
+    assert api.status == 200 and ADDR.format(17) in api.html
+    assert "/robots.txt" not in ASKED  # the kept tab itself asks the site nothing
 
 
 async def test_playwright_starts_afresh_after_its_share_of_renders(

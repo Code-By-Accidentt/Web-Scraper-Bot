@@ -64,12 +64,6 @@ class ChangeDetector:
             return False
         return min(len(first), len(second)) / larger < _MIN_SIZE_RATIO
 
-    def compare(
-        self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()
-    ) -> ChangeReport:
-        """Return only the change report of :meth:`diff`."""
-        return self.diff(old, new, url, ignore)[0]
-
     def diff(
         self, old: Signature, new: Signature, url: str, ignore: frozenset[Node] = frozenset()
     ) -> tuple[ChangeReport, Signature]:

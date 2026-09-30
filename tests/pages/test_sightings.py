@@ -53,6 +53,15 @@ def test_other_addresses_in_the_context_are_masked() -> None:
     assert "…" in context and context.endswith("new token:")
 
 
+def test_an_address_split_by_an_invisible_break_is_found_whole() -> None:
+    html = (
+        f"<html><body><p>CA: {TOKEN[:20]}<wbr>{TOKEN[20:]}</p>"
+        f"<template>mint {MINT[:20]}&shy;{MINT[20:]}</template></body></html>"
+    )
+    found = {s.address.value: s.source for s in sightings(html)}
+    assert found == {TOKEN: SightingSource.TEXT, MINT: SightingSource.SOURCE}
+
+
 def test_the_context_is_capped() -> None:
     html = f"<html><body><p>{'word ' * 40}CA {TOKEN}</p></body></html>"
     [found] = sightings(html)

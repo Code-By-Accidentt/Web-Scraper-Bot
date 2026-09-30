@@ -97,6 +97,7 @@ class Preferences:
         self._settings = settings
         self._path = path
         self._overrides: dict[str, Any] = {}
+        self.save_error: str | None = None  # why the last change wasn't saved; None if it was
 
     def spec(self, key: str) -> PreferenceSpec:
         """Return the setting named ``key`` (any case); raise PreferenceError if unknown."""
@@ -135,7 +136,8 @@ class Preferences:
         """Change a setting to the value the user typed, save it and return the change.
 
         Raises PreferenceError for a bad value, and ConfirmationRequired for a risky one
-        unless ``confirmed``. Setting the default value removes the override.
+        unless ``confirmed``. Setting the default value removes the override. A failed save
+        only sets ``save_error``.
         """
         spec = self.spec(key)
         value = self._parse(spec, raw)
@@ -223,8 +225,17 @@ class Preferences:
         log.info("%d preference override(s) loaded", len(self._overrides))
 
     def save(self) -> None:
-        """Write the overrides to the file."""
-        atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
+        """Write the overrides to the file; if that fails, ``save_error`` says why.
+
+        A change that couldn't be saved still applies, until the next restart.
+        """
+        try:
+            atomic_write_text(self._path, json.dumps(self._overrides, indent=2, sort_keys=True))
+        except OSError as exc:
+            log.error("saving %s failed (%s); the change lasts until a restart", self._path, exc)
+            self.save_error = str(exc)
+        else:
+            self.save_error = None
 
     @staticmethod
     def _parse(spec: PreferenceSpec, raw: str) -> Any:

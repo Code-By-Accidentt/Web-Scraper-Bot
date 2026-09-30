@@ -395,6 +395,9 @@ async def test_entries_survive_a_restart_and_a_broken_file_is_ignored(h) -> None
     broken = h.build()
     broken.load()
     assert broken.count() == 0
+    # Moved aside and reported, not silently overwritten by the next save.
+    assert not h.path.exists() and list(h.path.parent.glob("pending.json.broken-*"))
+    assert h.notifier.problems[-1][0] == "pending-damaged"
 
 
 async def test_the_loop_is_silent_without_addresses(h) -> None:
@@ -807,6 +810,33 @@ async def test_a_late_empty_answer_counts_as_seen_absent(
     await asyncio.sleep(0.05)
     entry = h.watch._entries[EVM]
     assert entry.absent_on["Arc"] == sent_at  # the late "nothing here" counts
+    await h.http.aclose()
+
+
+async def test_code_on_one_network_does_not_wait_for_a_slow_required_one(
+    h, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pending_module, "OPTIONAL_GRACE", 0.02)
+    original = h.chains.handler
+    slow = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "base.rpc":
+            await slow.wait()  # Base is required, but answers only after the tick moved on
+        return original(request)
+
+    h.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    h.watch = h.build()
+    h.watch.offer(SITE, PAGE, text(EVM), rejected(EVM, AddressKind.NO_CODE))
+    h.watch.offer(SITE, PAGE, text(OTHER), rejected(OTHER, AddressKind.NO_CODE))
+    h.chains.host_code[("eth.rpc", EVM.value.lower())] = "0x6080"
+    h.validator.confirm(EVM, "Ethereum")
+    sent_at = h.now
+    await asyncio.wait_for(h.tick(0), timeout=1)
+    assert h.notifier.contracts == [(ConfirmedContract(EVM, "Ethereum"), PAGE)]
+    slow.set()
+    await asyncio.sleep(0.05)  # Base's late answer still counts for the other address
+    assert h.watch._entries[OTHER].absent_on == {"Ethereum": sent_at, "Base": sent_at}
     await h.http.aclose()
 
 

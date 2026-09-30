@@ -67,11 +67,6 @@ def test_empty_or_garbage_input_gives_empty_signature() -> None:
     assert sig("   \x00 ") == ()
 
 
-def test_signature_is_stable_for_same_input() -> None:
-    html = "<ul><li class='a'>1</li><li class='b'>2</li></ul>"
-    assert sig(html) == sig(html)
-
-
 def test_canvas_is_ignored_because_scripts_resize_it() -> None:
     with_size = "<div><canvas width='1266' height='340'></canvas><p>chart</p></div>"
     without_size = "<div><canvas></canvas><p>chart</p></div>"

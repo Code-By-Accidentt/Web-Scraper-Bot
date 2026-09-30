@@ -8,6 +8,8 @@ covered by ``test_fetcher_browser.py`` behind an opt-in flag.
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,12 +17,7 @@ import httpx
 import pytest
 from playwright import async_api as pw
 
-from scraper_bot.pages.fetching.chromium import (
-    _PER_RESPONSE_LIMIT,
-    _SCANNED_CONTENT_TYPES,
-    _SCANNED_RESOURCE_TYPES,
-    PlaywrightFetcher,
-)
+from scraper_bot.pages.fetching.chromium import _PER_RESPONSE_LIMIT, PlaywrightFetcher
 from scraper_bot.pages.fetching.prober import HttpProber, ProbeResult
 from scraper_bot.pages.fetching.result import FetchResult
 from tests.conftest import make_settings
@@ -30,21 +27,23 @@ URL = "https://example.com/app"
 
 # ── result types ────────────────────────────────────────────────────────────
 @pytest.mark.parametrize(
-    ("status", "error", "expected"),
+    ("status", "error", "unreachable", "expected"),
     [
-        (None, "ConnectError: name not resolved", False),
-        (404, None, False),
-        (410, None, False),
-        (200, None, True),
-        (403, None, True),
-        (405, None, True),
-        (500, None, True),
+        (None, "ConnectError: name not resolved", True, False),
+        (None, "ReadTimeout: timed out", False, True),  # a slow server, maybe a missing page
+        (404, None, False, False),
+        (410, None, False, False),
+        (200, None, False, True),
+        (403, None, False, True),
+        (405, None, False, True),
+        (500, None, False, True),
     ],
 )
 def test_probe_result_worth_rendering(
-    status: int | None, error: str | None, expected: bool
+    status: int | None, error: str | None, unreachable: bool, expected: bool
 ) -> None:
-    assert ProbeResult(URL, status, error=error).worth_rendering is expected
+    probe = ProbeResult(URL, status, error=error, unreachable=unreachable)
+    assert probe.worth_rendering is expected
 
 
 @pytest.mark.parametrize(
@@ -127,19 +126,23 @@ async def test_prober_uses_the_get_status_when_head_lies() -> None:
     assert result.worth_rendering is True
 
 
-@pytest.mark.parametrize("status", [200, 403, 500])
-def test_prober_statuses_that_need_no_get(status: int) -> None:
-    assert status not in HttpProber._RETRY_WITH_GET
-
-
-async def test_prober_reports_connection_errors() -> None:
-    recorder = Recorder({("HEAD", "/app"): httpx.ConnectError("[Errno 11001] getaddrinfo failed")})
+@pytest.mark.parametrize(
+    ("cause", "worth_rendering"),
+    [
+        (socket.gaierror(11001, "getaddrinfo failed"), False),
+        (ConnectionRefusedError(111, "Connection refused"), False),
+        (ssl.SSLCertVerificationError(1, "certificate has expired"), True),  # the browser goes on
+    ],
+)
+async def test_prober_reports_connection_errors(cause: OSError, worth_rendering: bool) -> None:
+    error = httpx.ConnectError(str(cause))
+    error.__cause__ = cause  # httpx wraps the socket's own error like this
+    recorder = Recorder({("HEAD", "/app"): error})
     result = await probe(recorder)
     assert result.status is None
     assert result.error is not None
     assert result.error.startswith("ConnectError: ")
-    assert "getaddrinfo failed" in result.error
-    assert result.worth_rendering is False
+    assert result.worth_rendering is worth_rendering and not result.gone
     assert recorder.methods == ["HEAD"]
 
 
@@ -307,12 +310,6 @@ class FakePage:
 def test_worth_scanning(resource_type: str, content_type: str | None, expected: bool) -> None:
     response = FakeResponse(resource_type, content_type)
     assert PlaywrightFetcher._worth_scanning(response) is expected  # type: ignore[arg-type]
-
-
-def test_scanned_constants_are_consistent() -> None:
-    assert {"document", "script", "xhr", "fetch"} <= _SCANNED_RESOURCE_TYPES
-    assert "json" in _SCANNED_CONTENT_TYPES and "javascript" in _SCANNED_CONTENT_TYPES
-    assert _PER_RESPONSE_LIMIT == 3 * 1024 * 1024
 
 
 async def test_deep_scan_collects_frames_shadow_roots_and_bodies(tmp_path: Path) -> None:

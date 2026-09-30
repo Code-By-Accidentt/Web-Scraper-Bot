@@ -183,14 +183,15 @@ def token_links(
 ) -> list[tuple[str, str]]:
     """Return (label, url) pairs for a token: explorer, DexScreener and, if known, a swap page.
 
-    ``identifier`` (e.g. a Sui coin type) replaces the address in the URLs when given. An
-    unknown network gets an empty list and a bare Sui object id only a Suiscan link. The
-    URLs never hold a pair address, so a bot reading the chat cannot pick up a second contract.
+    ``identifier`` (e.g. a Sui coin type) replaces the address in the URLs when given, and
+    so does the coin type the validator found behind a bare Sui package. An unknown network
+    gets an empty list and a bare Sui object id only a Suiscan link. The URLs never hold a
+    pair address, so a bot reading the chat cannot pick up a second contract.
     """
     links = NETWORK_LINKS.get(contract.network)
     if links is None:
         return []
-    address = identifier or contract.address.value
+    address = identifier or contract.coin_type or contract.address.value
     if contract.address.chain is Chain.SUI and not is_sui_coin_type(address):
         return [("Suiscan", f"https://suiscan.xyz/mainnet/object/{address}")]
     out = [

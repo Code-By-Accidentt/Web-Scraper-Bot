@@ -252,7 +252,11 @@ class ContractValidator:
         if verdict.kind is AddressKind.TOKEN and verdict.network:
             log.info("%s %s confirmed as a token on %s", chain, address, verdict.network)
             return ValidationResult(
-                address, ValidationStatus.CONFIRMED, verdict.network, kind=AddressKind.TOKEN
+                address,
+                ValidationStatus.CONFIRMED,
+                verdict.network,
+                kind=AddressKind.TOKEN,
+                coin_type=verdict.coin_type,
             )
         resolved = tuple(Address(address.chain, side) for side in verdict.sides)
         unanswered = " (an optional network did not answer)" if verdict.partial else ""

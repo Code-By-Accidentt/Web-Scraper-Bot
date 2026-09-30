@@ -2,7 +2,8 @@
 
 Every new address is announced at once as unverified, then re-checked on-chain every
 ``unverified_recheck`` seconds for ``unverified_watch`` seconds, bypassing the negative
-cache. Confirmations get a message; alerts above the hourly cap go into one digest.
+cache; a round re-checks 25 addresses at most. Confirmations get a message; alerts above
+the hourly cap go into one digest.
 """
 
 from __future__ import annotations
@@ -12,9 +13,16 @@ import time
 from collections.abc import Callable, Sequence
 
 from scraper_bot.chains.validator import ContractValidator
-from scraper_bot.models.addresses import Address, ValidationStatus, address_key, parse_address_key
+from scraper_bot.models.addresses import (
+    Address,
+    ConfirmedContract,
+    ValidationStatus,
+    address_key,
+    parse_address_key,
+)
 from scraper_bot.models.sites import SiteState
-from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.alerts import AlertRegistry, AnnouncedWatch, Announcer
+from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.settings.live import Tuning
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.telegram.notifier import Notifier
@@ -24,6 +32,7 @@ log = logging.getLogger(__name__)
 _MEMORY = 7 * 86_400  # how long we remember an announced address, so it isn't announced twice (s)
 _MAX_ENTRIES = 1000
 _DIGEST_PERIOD = 3600.0
+_RECHECK_AT_ONCE = 25  # addresses validated per recheck; the others wait for the next rounds
 
 
 class UnverifiedWatcher:
@@ -39,9 +48,15 @@ class UnverifiedWatcher:
         persist: Callable[[], None],
         tuning: Tuning,
         registry: AlertRegistry | None = None,
+        pending: AnnouncedWatch | None = None,
+        tokens: SiteTokens | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        """Set up the watcher of ``site``; announced addresses are saved in ``site.unverified``."""
+        """Set up the watcher of ``site``; announced addresses are saved in ``site.unverified``.
+
+        A confirmed address also leaves the ``pending`` watch and reaches the site's turbo
+        sessions and auto-turbo windows through ``tokens``.
+        """
         self._site = site
         self._validator = validator
         self._cache = cache
@@ -49,6 +64,7 @@ class UnverifiedWatcher:
         self._persist = persist
         self._tuning = tuning
         self._registry = registry if registry is not None else AlertRegistry()
+        self._announcer = Announcer(self._registry, notifier, tokens or SiteTokens(), pending)
         self._clock = clock
         self._pages: dict[str, str] = {}
         self._last_check: dict[str, float] = {}
@@ -62,65 +78,77 @@ class UnverifiedWatcher:
         return self._site.unverified_enabled
 
     async def observe(self, candidates: Sequence[Address], page_url: str) -> None:
-        """Announce addresses never seen on this site before and start watching them."""
+        """Announce addresses never seen on this site before and start watching them.
+
+        Every new address is marked as seen before the first message goes out, so a page
+        checked at the same moment can't announce it a second time.
+        """
         if not self.enabled or not candidates:
             return
         now = self._clock()
         self._prune(now)
-        fresh = [
-            address
-            for address in candidates
-            if address_key(address) not in self._site.unverified
-            and not self._cache.is_known(address)
-        ]
-        for address in fresh:
+        fresh = False
+        alerts: list[Address] = []
+        for address in candidates:
             key = address_key(address)
+            if key in self._site.unverified or self._cache.is_known(address):
+                continue
+            fresh = True
             self._site.unverified[key] = now
             self._pages[key] = page_url
             if self._under_cap(now):
                 self._alert_times.append(now)
-                await self._notifier.unverified_address(
-                    address,
-                    page_url,
-                    self._tuning.unverified_recheck,
-                    self._tuning.unverified_watch,
-                )
+                alerts.append(address)
             else:
                 self._digest_pending += 1
         if fresh:
             self._persist()
+        for address in alerts:
+            await self._notifier.unverified_address(
+                address,
+                page_url,
+                self._tuning.unverified_recheck,
+                self._tuning.unverified_watch,
+            )
         await self._flush_digest(now)
 
     async def recheck(self) -> None:
         """Validate the watched addresses that are due and announce those that became tokens.
 
-        It also sends the overflow digest once its hour is up.
+        At most ``_RECHECK_AT_ONCE`` are validated per round, the ones checked longest ago
+        first, so a round never waits on hundreds of them. It also sends the overflow digest
+        once its hour is up.
         """
         if not self.enabled:
             return
         now = self._clock()
         await self._flush_digest(now)  # a quiet site must still get its overflow digest
-        due: list[Address] = []
+        due: list[tuple[float, Address]] = []
         for key, announced_at in self._site.unverified.items():
             if now - announced_at > self._tuning.unverified_watch:
                 continue
-            if now - self._last_check.get(key, 0.0) < self._tuning.unverified_recheck:
+            checked = self._last_check.get(key, 0.0)
+            if now - checked < self._tuning.unverified_recheck:
                 continue
             address = parse_address_key(key)
             if address is not None:
-                due.append(address)
+                due.append((checked, address))
         if not due:
             return
+        due.sort(key=lambda item: item[0])
+        batch = [address for _, address in due[:_RECHECK_AT_ONCE]]
+        results = await self._validator.validate_many(batch, negative_cache=False)
+        for key in map(address_key, batch):
+            if key in self._site.unverified:  # not forgotten while it was validated
+                self._last_check[key] = now
         changed = False
-        for result in await self._validator.validate_many(due, negative_cache=False):
+        for result in results:
             key = address_key(result.address)
-            self._last_check[key] = now
             if result.status is ValidationStatus.CONFIRMED and result.contract is not None:
                 # The pending watch may confirm it at the same moment, so only one of us alerts.
-                if self._registry.claim(result.contract):
-                    await self._notifier.address_confirmed(
-                        result.contract, self._pages.get(key, self._site.url)
-                    )
+                await self._announcer.announce(
+                    self._site.url, [result.contract], self._send_confirmed
+                )
                 self._forget(key)
                 changed = True
             elif result.status is ValidationStatus.ALREADY_KNOWN:
@@ -128,6 +156,12 @@ class UnverifiedWatcher:
                 changed = True
         if changed:
             self._persist()
+
+    async def _send_confirmed(self, contracts: list[ConfirmedContract]) -> None:
+        """Say that watched addresses became tokens, each with the page it was seen on."""
+        for contract in contracts:
+            page = self._pages.get(address_key(contract.address), self._site.url)
+            await self._notifier.address_confirmed(contract, page)
 
     def _under_cap(self, now: float) -> bool:
         """Return True while fewer than ``unverified_max_per_hour`` alerts went out this hour."""

@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from scraper_bot.models.addresses import (
 )
 from scraper_bot.models.sites import SiteState
 from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
 from scraper_bot.storage.address_cache import AddressCache
 from scraper_bot.storage.state import StateStore
@@ -37,6 +39,7 @@ class Harness:
         self.persist_calls = 0
         self.now = 1_000.0
         self.registry = AlertRegistry()
+        self.tokens = SiteTokens()
 
         def persist() -> None:
             self.persist_calls += 1
@@ -49,6 +52,7 @@ class Harness:
             persist=persist,
             tuning=self.tuning,
             registry=self.registry,
+            tokens=self.tokens,
             clock=lambda: self.now,
         )
 
@@ -68,6 +72,19 @@ async def test_new_addresses_are_announced_once_and_persisted(tmp_path: Path) ->
     assert h.persist_calls == 1
 
 
+async def test_pages_checked_at_once_announce_an_address_once(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    send = h.notifier.unverified_address
+
+    async def slow_send(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        await asyncio.sleep(0)  # a real message waits for Telegram
+        await send(*args, **kwargs)
+
+    h.notifier.unverified_address = slow_send  # type: ignore[method-assign]
+    await asyncio.gather(h.watcher.observe([A, B], PAGE), h.watcher.observe([B, A], ROOT))
+    assert h.notifier.unverified == [(A, PAGE), (B, PAGE)]  # the first page marked both at once
+
+
 async def test_known_contracts_and_disabled_mode_are_ignored(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     h.cache.add_known(ConfirmedContract(A, "Base"))
@@ -82,6 +99,8 @@ async def test_known_contracts_and_disabled_mode_are_ignored(tmp_path: Path) -> 
 
 async def test_recheck_confirms_due_addresses_and_stops_watching_them(tmp_path: Path) -> None:
     h = Harness(tmp_path)
+    heard: list[ConfirmedContract] = []
+    h.tokens.subscribe(ROOT, heard.append)  # as a turbo session of the site does
     h.validator.reject_then_confirm(A, "Base", rejections=1)
     await h.watcher.observe([A], PAGE)
     await h.watcher.recheck()  # first check: still rejected
@@ -91,6 +110,7 @@ async def test_recheck_confirms_due_addresses_and_stops_watching_them(tmp_path: 
     h.now += 61
     await h.watcher.recheck()
     assert h.notifier.confirmed == [(ConfirmedContract(A, "Base"), PAGE)]
+    assert heard == [ConfirmedContract(A, "Base")]
     assert h.site.unverified == {}
     assert h.validator.negative_cache_calls == [False, False]
     assert h.persist_calls == 2

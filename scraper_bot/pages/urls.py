@@ -52,7 +52,7 @@ def normalize_url(raw: str) -> str:
     return urlunsplit((parts.scheme, netloc, path, parts.query, route))
 
 
-def registrable_domain(url: str) -> str:
+def host_without_www(url: str) -> str:
     """Return the host of ``url`` without a leading ``www.``."""
     host = (urlsplit(url).hostname or "").lower()
     return host[4:] if host.startswith("www.") else host
@@ -70,7 +70,7 @@ class SubUrlDeriver:
 
         Patterns that do not give a valid URL are skipped, and so are duplicates.
         """
-        domain = registrable_domain(root_url)
+        domain = host_without_www(root_url)
         seen: set[str] = {root_url}
         result: list[str] = []
         for pattern in self._patterns:

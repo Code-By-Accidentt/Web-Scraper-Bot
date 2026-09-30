@@ -13,7 +13,8 @@ from scraper_bot.models.pages import BlockSignal
 from scraper_bot.pages.fetching.result import FetchResult
 
 _BLOCK_STATUSES = frozenset({401, 403, 407, 429, 503})
-# Phrases added to a block's reason when we can't tell which protection it is.
+# Phrases added to a block's reason when we can't tell which protection it is. On a 503
+# they also tell a refusal from a server that is down.
 _CHALLENGE_MARKERS = (
     "just a moment",
     "attention required",
@@ -80,6 +81,10 @@ _PROTECTIONS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("Akamai", ("server=akamaighost",), ()),
     ("Cloudflare", ("cf-ray", "server=cloudflare"), ("| cloudflare</title>", "cf-error-details")),
 )
+_PLAIN_CDNS = frozenset({"Akamai", "Cloudflare"})
+# Challenge phrases a server's own error page carries too: Cloudflare puts its widget ids
+# (cf-chl-widget-...) on normal pages. They don't make a 503 a refusal.
+_COMMON_MARKERS = frozenset({"cf-chl"})
 # Widgets a person has to solve, as (name, substring checked first, pattern). Invisible
 # ones (size=invisible, checkbox-invisible) are left out. The length caps in the patterns
 # keep hostile HTML cheap to scan.
@@ -107,9 +112,9 @@ _CAPTCHA_WIDGETS = (
         re.compile(r"<div\b[^>]{0,500}?\bclass=[\"'][^\"'>]{0,500}?\bcf-turnstile\b"),
     ),
 )
+_REFUSED_CONNECTION = "err_connection_refused"  # nobody listens: the server is down
 _CONNECTION_ERRORS = (
     "err_connection_reset",
-    "err_connection_refused",
     "err_connection_closed",
     "err_empty_response",
     "err_http2_protocol_error",
@@ -127,8 +132,9 @@ class BlockDetector:
         """Return a block signal when the answer looks like a refusal, or None.
 
         Block statuses, connection resets and challenge pages count; firewall headers from
-        Cloudflare, Vercel and AWS WAF mark a challenge even on a 2xx answer. Other fetch
-        errors mean the site is down, not refusing, and return None.
+        Cloudflare, Vercel and AWS WAF mark a challenge even on a 2xx answer. A 503 without
+        any sign of a protection and a refused connection are an outage signal: the server
+        is down (a deploy, maintenance). Other fetch errors return None.
         """
         headers = {key.lower(): value.lower() for key, value in result.headers.items()}
         mitigated = (
@@ -140,6 +146,8 @@ class BlockDetector:
             return self._signal(f"HTTP {result.status}", result, headers, result.retry_after)
         if result.error is not None:
             lowered = result.error.lower()
+            if _REFUSED_CONNECTION in lowered:
+                return BlockSignal(result.error[:120], outage=True)
             if any(code in lowered for code in _CONNECTION_ERRORS):
                 return BlockSignal(result.error[:120])
             return None
@@ -171,6 +179,8 @@ class BlockDetector:
         """Build the signal for ``answer``, naming the protection when the answer shows it.
 
         Without a known protection, a challenge phrase from the page is added to the reason.
+        A 503 that shows no protection beyond a plain CDN, no challenge title and no
+        challenge phrase is an outage signal.
         """
         page = result.html[:_PAGE].lower()
         protection = self._protection(headers, page)
@@ -178,7 +188,20 @@ class BlockDetector:
             marker = self._marker(page)
             if marker is not None:
                 answer += f" ({marker})"
-        return BlockSignal(answer, retry_after, protection)
+        outage = result.status == 503 and not self._guarded(result.html, page, protection)
+        return BlockSignal(answer, retry_after, protection, outage)
+
+    def _guarded(self, html: str, page: str, protection: str | None) -> bool:
+        """True when a refusal shows more than a plain CDN in front of the server.
+
+        That is a protection we know by name, a challenge title, or a challenge phrase near
+        the top of the page.
+        """
+        if protection is not None and protection not in _PLAIN_CDNS:
+            return True
+        head = page[:_HEAD]
+        phrases = (marker for marker in _CHALLENGE_MARKERS if marker not in _COMMON_MARKERS)
+        return self._challenge_title(html) or any(marker in head for marker in phrases)
 
     @staticmethod
     def _protection(headers: dict[str, str], page: str) -> str | None:
