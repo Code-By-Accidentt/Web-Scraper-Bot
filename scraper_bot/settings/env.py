@@ -62,6 +62,8 @@ FALSE_WORDS = frozenset({"0", "false", "no", "off"})
 
 
 LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+# rebooter.py restarts a bot whose heartbeat is 300 s old, so several beats must fit in that.
+MAX_HEARTBEAT_INTERVAL = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +155,7 @@ class Settings:
         """
         merged: dict[str, str] = {}
         if dotenv_path is not None and Path(dotenv_path).is_file():
-            merged.update({k: v for k, v in dotenv_values(dotenv_path).items() if v is not None})
+            merged.update({k: v for k, v in _read_dotenv(dotenv_path).items() if v is not None})
         merged.update(os.environ if env is None else env)
         reader = _EnvReader(merged)
 
@@ -179,6 +181,11 @@ class Settings:
         sui_rpc_url = reader.url(
             "SUI_RPC_URL", reader.text_or_default("SUI_RPC_URL", DEFAULT_SUI_RPC_URL)
         )
+
+        turbo_default = reader.number("TURBO_DEFAULT_MINUTES", 30.0, minimum=1.0)
+        turbo_max = reader.number("TURBO_MAX_MINUTES", 180.0, minimum=1.0)
+        if turbo_max < turbo_default:
+            raise ConfigError("TURBO_MAX_MINUTES must be >= TURBO_DEFAULT_MINUTES")
 
         log_file = reader.text("LOG_FILE")
         return cls(
@@ -211,8 +218,8 @@ class Settings:
                 reader.number("DEEP_SCAN_MAX_MB", 5.0, minimum=0.0) * 1024 * 1024
             ),
             turbo_interval=reader.number("TURBO_INTERVAL", 2.0, minimum=1.0),
-            turbo_default_minutes=reader.number("TURBO_DEFAULT_MINUTES", 30.0, minimum=1.0),
-            turbo_max_minutes=reader.number("TURBO_MAX_MINUTES", 180.0, minimum=1.0),
+            turbo_default_minutes=turbo_default,
+            turbo_max_minutes=turbo_max,
             turbo_stop_after=reader.integer("TURBO_STOP_AFTER", 1, minimum=0),
             turbo_max_sites=reader.integer("TURBO_MAX_SITES", 1, minimum=1),
             turbo_max_pages=reader.integer("TURBO_MAX_PAGES", 4, minimum=1),
@@ -245,9 +252,24 @@ class Settings:
             data_dir=Path(reader.text_or_default("DATA_DIR", "data")),
             log_level=reader.choice("LOG_LEVEL", "INFO", LOG_LEVELS),
             log_file=Path(log_file) if log_file else None,
-            heartbeat_interval=reader.number("HEARTBEAT_INTERVAL", 15.0, minimum=1.0),
+            heartbeat_interval=reader.number(
+                "HEARTBEAT_INTERVAL", 15.0, minimum=1.0, maximum=MAX_HEARTBEAT_INTERVAL
+            ),
             outdated_defaults=find_outdated_defaults(merged),
         )
+
+
+def _read_dotenv(path: str | os.PathLike[str]) -> dict[str, str | None]:
+    """Return the values in a ``.env`` file; raise ConfigError when it can't be read as UTF-8."""
+    try:
+        return dotenv_values(path, encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start}); "
+            "save it as UTF-8 and start again"
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(f"{path} cannot be read: {exc}") from exc
 
 
 def find_outdated_defaults(
@@ -359,8 +381,15 @@ class _EnvReader:
             raise ConfigError(f"{key} must be >= {minimum}")
         return value
 
-    def number(self, key: str, default: float, *, minimum: float | None = None) -> float:
-        """Return the value of ``key`` as a finite number not below ``minimum``, or ``default``."""
+    def number(
+        self,
+        key: str,
+        default: float,
+        *,
+        minimum: float | None = None,
+        maximum: float | None = None,
+    ) -> float:
+        """Return the value of ``key`` as a finite number within the limits, or ``default``."""
         raw = self.text(key)
         if not raw:
             return default
@@ -372,6 +401,8 @@ class _EnvReader:
             raise ConfigError(f"{key} must be a finite number, got {raw!r}")
         if minimum is not None and value < minimum:
             raise ConfigError(f"{key} must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            raise ConfigError(f"{key} must be <= {maximum}")
         return value
 
     def text_list(self, key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:

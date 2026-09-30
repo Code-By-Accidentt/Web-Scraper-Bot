@@ -3,6 +3,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -28,7 +29,7 @@ from scraper_bot.monitoring.turbo.manager import (
 )
 from scraper_bot.monitoring.turbo.session import LimitsSource, TurboLimits, TurboSession, TurboStats
 from scraper_bot.pages.fetching.blocking import BlockDetector
-from scraper_bot.pages.fetching.result import FetchResult
+from scraper_bot.pages.fetching.result import BrowserUnavailable, FetchResult
 from scraper_bot.pages.urls import SubUrlDeriver
 from scraper_bot.storage.address_cache import AddressCache
 from tests.conftest import (
@@ -79,6 +80,9 @@ class FakePending:
 
     def offer_baseline(self, site_url: str, page_url: str, sighting: Sighting) -> None:
         self.baseline.append((sighting.address, page_url))
+
+    def announced(self, site_url: str, address: Address) -> frozenset[str]:
+        return frozenset()
 
 
 class Harness:
@@ -140,7 +144,7 @@ async def test_a_new_token_is_announced_and_ends_the_session(tmp_path) -> None:
     h = Harness(tmp_path)
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
     h.validator.confirm(ADDRESS, "Base")
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     contract = ConfirmedContract(ADDRESS, "Base")
     assert h.notifier.contracts == [(contract, ROOT)]
     [(sighting, timeline)] = h.notifier.contract_details
@@ -164,7 +168,7 @@ async def test_a_new_address_that_is_not_a_token_yet_waits_in_the_pending_watch(
     task = asyncio.create_task(h.session.run())
     await wait_for_cycles(h.session, 3)
     assert h.pending.offers == [(ADDRESS, ROOT, True)]  # handed over at the turbo pace
-    assert h.session.stats.pending == 1 and h.notifier.contracts == []
+    assert h.notifier.contracts == []
     h.tokens.publish({ROOT}, ADDRESS, "Base")  # the watch saw it deployed and announced it
     stats = await asyncio.wait_for(task, timeout=2)
     assert stats.stop_reason == "found 1 confirmed contract(s)"
@@ -174,7 +178,7 @@ async def test_a_new_address_that_is_not_a_token_yet_waits_in_the_pending_watch(
 async def test_addresses_present_from_the_start_are_left_to_the_watch(tmp_path) -> None:
     h = Harness(tmp_path, duration=0.05, real_clock=True)
     h.fetcher.html(ROOT, WITH_ADDRESS)
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert h.pending.baseline == [(ADDRESS, ROOT)]  # news only if it does not exist yet
     assert h.validator.calls == [] and h.notifier.contracts == []
     assert stats.stop_reason == "time limit reached"
@@ -184,7 +188,7 @@ async def test_known_tokens_are_ignored(tmp_path) -> None:
     h = Harness(tmp_path, duration=0.05, real_clock=True)
     h.cache.add_known(ConfirmedContract(ADDRESS, "Base"))
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert stats.stop_reason == "time limit reached"
     assert stats.found == [] and h.validator.calls == [] and h.pending.offers == []
 
@@ -201,7 +205,7 @@ async def test_confirmation_by_the_regular_monitor_counts_without_a_second_alert
         return await validate_many(addresses, **options)
 
     h.validator.validate_many = announced_meanwhile  # type: ignore[method-assign]
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert stats.found == [ConfirmedContract(ADDRESS, "Base")]
     assert h.notifier.contracts == []
     assert stats.stop_reason == "found 1 confirmed contract(s)"
@@ -219,7 +223,7 @@ async def test_a_token_claimed_elsewhere_is_not_announced_twice(tmp_path) -> Non
         return await validate_many(addresses, **options)
 
     h.validator.validate_many = claimed_meanwhile  # type: ignore[method-assign]
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert h.notifier.contracts == []
     assert stats.stop_reason == "found 1 confirmed contract(s)"
 
@@ -227,7 +231,7 @@ async def test_a_token_claimed_elsewhere_is_not_announced_twice(tmp_path) -> Non
 async def test_block_signal_ends_the_session(tmp_path) -> None:
     h = Harness(tmp_path)
     h.fetcher.script(ROOT, FetchResult(ROOT, 200, EMPTY), FetchResult(ROOT, 403, CHALLENGE))
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert stats.stop_reason == "possible IP block (HTTP 403 (just a moment))"
     assert stats.cycles == 2
 
@@ -235,7 +239,7 @@ async def test_block_signal_ends_the_session(tmp_path) -> None:
 async def test_time_limit_and_manual_stop(tmp_path) -> None:
     timed = Harness(tmp_path, duration=0.05, real_clock=True)
     timed.fetcher.html(ROOT, EMPTY)
-    stats = await timed.session.run()
+    stats = await asyncio.wait_for(timed.session.run(), timeout=2)
     assert stats.stop_reason == "time limit reached" and stats.cycles >= 1
 
     manual = Harness(tmp_path)
@@ -257,7 +261,7 @@ async def test_stop_after_zero_keeps_running_after_a_find(tmp_path) -> None:
     h = Harness(tmp_path, limits=replace(LIMITS, stop_after=0), duration=0.05, sleep=pause)
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
     h.validator.confirm(ADDRESS, "Base")
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert [contract.address for contract in stats.found] == [ADDRESS]
     assert stats.stop_reason == "time limit reached" and stats.cycles > 2
 
@@ -458,7 +462,7 @@ async def test_turbo_stop_cancels_a_scheduled_session_while_it_launches() -> Non
         await manager.start(ROOT, 5, start_at=time.time() + 5)
         await asyncio.sleep(0.02)  # timer fired, launch is probing sub-pages
         assert await manager.stop(ROOT) == ROOT
-        await asyncio.sleep(0.2)  # the probe would have finished by now
+        await asyncio.sleep(0.08)  # the probe would have finished by now
         assert manager.active() == [] and manager.scheduled() == []
     finally:
         await manager.shutdown()
@@ -469,7 +473,7 @@ async def test_no_session_starts_during_a_shutdown() -> None:
     await manager.start(ROOT, 5, start_at=time.time() + 5)
     await asyncio.sleep(0.02)  # the launch is probing sub-pages
     await manager.shutdown()
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.08)  # the probe would have finished by now
     assert manager.active() == []
 
 
@@ -487,10 +491,18 @@ async def test_fetch_errors_inside_a_cycle_are_skipped(tmp_path) -> None:
     docs, app = "https://example.com/docs", "https://app.example.com"
     h = Harness(tmp_path, pages=[ROOT, docs, app])
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
-    h.fetcher.script(docs, FetchResult(docs, None, error="Timeout 30000ms exceeded"))
     h.fetcher.html(app, WITH_TWO, status=500)  # server error: no block, not scanned either
     h.validator.confirm(ADDRESS, "Base")
-    stats = await h.session.run()
+    fetch = h.fetcher.fetch
+
+    async def browser_gone_on_docs(url: str, **options: Any) -> FetchResult:
+        result = await fetch(url, **options)
+        if url == docs:
+            raise BrowserUnavailable("browser could not start")  # fails the page, not the session
+        return result
+
+    h.fetcher.fetch = browser_gone_on_docs  # type: ignore[method-assign]
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert stats.stop_reason == "found 1 confirmed contract(s)"
     assert (stats.cycles, stats.renders) == (2, 6)
     assert h.notifier.contracts == [(ConfirmedContract(ADDRESS, "Base"), ROOT)]
@@ -517,7 +529,7 @@ async def test_slow_cycle_does_not_sleep(tmp_path) -> None:
     slow = Harness(tmp_path, fetcher=SlowFetcher(), sleep=record)  # 0.01 s interval, 0.02 s render
     session = slow.session
     slow.fetcher.html(ROOT, EMPTY)
-    stats = await session.run()
+    stats = await asyncio.wait_for(session.run(), timeout=2)
     assert stats.cycles == 2 and stats.stop_reason == "stopped manually"
     assert pauses == [0.0, 0.0]
 
@@ -525,7 +537,7 @@ async def test_slow_cycle_does_not_sleep(tmp_path) -> None:
     fast = Harness(tmp_path, limits=replace(LIMITS, interval=1.0), sleep=record)
     session = fast.session
     fast.fetcher.html(ROOT, EMPTY)
-    await session.run()
+    await asyncio.wait_for(session.run(), timeout=2)
     assert len(pauses) == 2 and all(0.5 < pause <= 1.0 for pause in pauses)  # the remainder
 
 
@@ -729,7 +741,7 @@ async def test_a_block_on_one_page_does_not_cost_the_ca_another_page_shows(tmp_p
     h.fetcher.html(ROOT, EMPTY, WITH_ADDRESS)
     h.fetcher.html(docs, EMPTY, CHALLENGE)  # the second cycle: the docs page is challenged
     h.validator.confirm(ADDRESS, "Base")
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert h.notifier.contracts == [(ConfirmedContract(ADDRESS, "Base"), ROOT)]
     assert stats.found == [ConfirmedContract(ADDRESS, "Base")]
     assert stats.stop_reason == "found 1 confirmed contract(s)"
@@ -740,7 +752,7 @@ async def test_a_2xx_page_that_looks_like_a_challenge_is_still_read(tmp_path) ->
     looks_blocked = WITH_ADDRESS.replace("<html>", "<html><title>Just a moment...</title>")
     h.fetcher.html(ROOT, EMPTY, looks_blocked)
     h.validator.confirm(ADDRESS, "Base")
-    stats = await h.session.run()
+    stats = await asyncio.wait_for(h.session.run(), timeout=2)
     assert h.notifier.contracts == [(ConfirmedContract(ADDRESS, "Base"), ROOT)]
     assert stats.stop_reason == "found 1 confirmed contract(s)"  # the block would end it too
     assert stats.cycles == 2

@@ -21,7 +21,8 @@ log = logging.getLogger(__name__)
 def configure_logging(settings: Settings) -> None:
     """Send the log to stdout and, when LOG_FILE is set, to a rotating file as well.
 
-    Chatty libraries are limited to warnings.
+    Chatty libraries are limited to warnings. Raises ConfigError when LOG_FILE can't be
+    written.
     """
     formatter = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
     handlers: list[logging.Handler] = []
@@ -32,10 +33,13 @@ def configure_logging(settings: Settings) -> None:
     console.setFormatter(formatter)
     handlers.append(console)
     if settings.log_file is not None:
-        settings.log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            settings.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
-        )
+        try:
+            settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(
+                settings.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
+        except OSError as exc:
+            raise ConfigError(f"LOG_FILE {settings.log_file} cannot be written: {exc}") from exc
         file_handler.setFormatter(formatter)
         handlers.append(file_handler)
     logging.basicConfig(level=settings.log_level, handlers=handlers, force=True)
@@ -72,10 +76,10 @@ def main() -> int:
     """
     try:
         settings = Settings.from_env()
+        configure_logging(settings)
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
-    configure_logging(settings)
     log.info("scraper-bot %s starting (data dir: %s)", __version__, settings.data_dir.resolve())
     if not settings.chat_ids:
         log.warning(

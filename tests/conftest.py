@@ -209,7 +209,7 @@ class FakeProber:
         self.calls.append(url)
         status = self.statuses.get(url, 200)
         if status is None:
-            return ProbeResult(url, None, error="ConnectError: name not resolved")
+            return ProbeResult(url, None, error="ConnectError: name not resolved", unreachable=True)
         return ProbeResult(url, status)
 
     async def peek(self, url: str) -> FetchResult:
@@ -428,13 +428,11 @@ class FakeTelegram:
         self.edits: list[tuple[int, str]] = []
         self.profile_calls = 0
 
-    async def send_message(self, chat_id: int, text: str, *, patient: bool = False) -> bool:
+    async def send_message(self, chat_id: int, text: str) -> bool:
         self.messages.append((chat_id, text))
         return True
 
-    async def send_tracked(
-        self, chat_id: int, text: str, *, patient: bool = False
-    ) -> SentMessage | None:
+    async def send_tracked(self, chat_id: int, text: str) -> SentMessage | None:
         self.messages.append((chat_id, text))
         return SentMessage(chat_id, len(self.messages) - 1)
 
@@ -459,17 +457,8 @@ class FakeTelegram:
         self.profile_calls += 1
         return None
 
-    async def send_document(
-        self,
-        chat_id: int,
-        filename: str,
-        content: bytes,
-        caption: str = "",
-        *,
-        patient: bool = False,
-    ) -> bool:
-        self.documents.append((chat_id, filename, content, caption))
-        return True
+    def former_id(self, chat_id: int) -> int | None:
+        return None
 
     async def broadcast_document(
         self,
@@ -481,7 +470,7 @@ class FakeTelegram:
         patient: bool = False,
     ) -> None:
         for chat_id in chat_ids:
-            await self.send_document(chat_id, filename, content, caption)
+            self.documents.append((chat_id, filename, content, caption))
 
     async def get_updates(self, offset: int | None, timeout: int) -> list[dict[str, Any]] | None:
         self.offsets.append(offset)

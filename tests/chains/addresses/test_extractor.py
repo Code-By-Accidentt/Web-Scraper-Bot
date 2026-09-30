@@ -187,6 +187,17 @@ def test_a_run_glued_to_other_letters_is_a_fragment(glued: str) -> None:
     assert solana(glued.format(PUMP_MINT)) == []
 
 
+SHORT_MINT = "9bqzAcgue7dcR78dAo1QbrXMMUJ1wciNze7duLUXQCc"  # 43 characters
+
+
+@pytest.mark.parametrize("escape", ["\\n", "\\u002F", "%2F"])
+def test_an_address_right_after_a_json_or_url_escape_is_found(escape: str) -> None:
+    for address in (USDC_ETH, PUMP_MINT, SHORT_MINT):
+        text = f'"text":"CA:{escape}{address}"'
+        assert [found.value for found, _ in AddressExtractor().locate(text)] == [address]
+    assert extract(AddressExtractor(), f"ff{USDC_ETH} {escape}ab{USDC_ETH}") == []
+
+
 def test_an_upper_case_data_uri_is_blanked_too() -> None:
     text = f'<img src="data:image/png;BASE64,{PNG}"> CA: {PUMP_MINT}'
     assert solana(text) == [(PUMP_MINT, text.index(PUMP_MINT))]

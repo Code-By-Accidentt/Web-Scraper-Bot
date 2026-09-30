@@ -47,8 +47,10 @@ scraper_bot/
       request_filter.py requests never needed: prefetches, analytics beacons
       prober.py         HttpProber: does a sub-page exist at all? does a blocking site
                         still refuse?
-      blocking.py       recognises blocks (401/403/407/429/503, challenge pages, connection
-                        resets) and names the protection; spots captcha widgets
+      blocking.py       recognises blocks (401/403/407/429, a 503 behind a protection,
+                        challenge pages, connection resets) and names the protection, tells
+                        a server that is down (a bare 503, a refused connection); spots
+                        captcha widgets
     light/            the light mode
       poller.py         LightPoller: a site's pages and own JSON APIs polled over HTTP between
                         renders; which pages it covers; renders asked for after a new deploy
@@ -60,6 +62,8 @@ scraper_bot/
       noise.py          memory of elements that keep changing (flapping)
     page_checker.py     the per-page pipeline: render -> addresses -> diff -> snapshot
     early.py            EarlyReader: addresses a page shows while it loads, checked at once
+    verdicts.py         the verdicts on a render's addresses, a token's without waiting for
+                        the rest
     launch.py           read_launch: countdowns, launch times and launch phrases of a render
     sightings.py        where on a page each address stands and the words in front of it
     urls.py             URL normalisation, sub-page derivation, snapshot file names
@@ -86,7 +90,8 @@ scraper_bot/
     site_monitor.py     rounds for one root site and its sub-pages, block backoff, timeout streaks
     monitor_manager.py  add / remove / pause / resume, one task per site, crash restart
     rounds.py           what the monitor and turbo share: pages to render, the paced wait
-    alerts.py           AlertRegistry: one alert per token across pages, sites and modes
+    alerts.py           AlertRegistry: one alert per token across pages, sites and modes;
+                        Announcer: what every path does with a token it confirmed
     pace.py             SitePace: which sites turbo or auto-turbo speeds up, and what gets faster
     tokens.py           SiteTokens: a site's new tokens for its turbo session and auto-turbo window
     pending/            PendingWatch: addresses published before deployment
@@ -103,7 +108,8 @@ scraper_bot/
 
   telegram/         what the user sees
     client.py         Bot API over httpx: a send queue per chat, HTML messages, plain-text
-                      fallback, documents, polling
+                      fallback (links kept as "label (url)"), documents, polling, a group
+                      that became a supergroup followed to its new id
     notifier.py       every alert the bot sends on its own initiative
     commands/
       parsing.py        /command text -> name and arguments, /turbo arguments
@@ -140,11 +146,14 @@ own asyncio task, then sleeps for a random `poll_interval_min`..`poll_interval_m
 SiteMonitor.run_once
  │
  ├─ while blocked: HttpProber.peek(root)  one GET; still refused -> the round renders
- │                                     nothing (every 4th blocked round renders anyway)
+ │                                     nothing (every 4th blocked round renders anyway; no
+ │                                     GET for a site the light mode asks via the browser)
  │
- ├─ HttpProber.probe(sub-page) x7      HEAD (GET after 404/405/410/501); 404/410 or any
- │                                     transport error (DNS, connection, TLS, 10 s timeout)
- │                                     means "does not exist"
+ ├─ HttpProber.probe(sub-page) x7      HEAD (GET after 404/405/410/501); 404/410, a host
+ │                                     that does not resolve or a refused connection means
+ │                                     "does not exist" (a timeout or a TLS error is left to
+ │                                     the browser); only 404/410 drops the page's light
+ │                                     polls and timeout count
  │
  ├─ PageChecker.check(page)  for the root and every live sub-page that is due, concurrently
  │   (a page the light mode covers is due every render_interval, or at once after a deploy)
@@ -164,15 +173,18 @@ SiteMonitor.run_once
  │   │                                 source, loaded script) and the words in front of it;
  │   │                                 script-only addresses from the page's first deep round
  │   │                                 are skipped (Snapshot.deep_seen)
- │   ├─ ContractValidator.validate_many  cache first, then RPC; tokens behind LP pairs too
+ │   ├─ verdicts (pages/verdicts.py)   ContractValidator per address: cache first, then RPC;
+ │   │                                 tokens behind LP pairs too
  │   ├─ on_observation  ─────────────► SiteMonitor announces the tokens NOW (AlertRegistry:
- │   │                                 one alert per token), before any comparison
+ │   │                                 one alert per token), before any comparison; a
+ │   │                                 token's verdict comes at once, slower ones later
  │   ├─ snapshot missing?  -> BASELINE (store it)
  │   ├─ identical, or only elements known to tick differ (VolatileShapes)?  -> UNCHANGED
  │   └─ differs:  sleep confirm_delay, render again
  │        ├─ new addresses of the second render -> on_observation again
  │        ├─ ChangeDetector.volatile_nodes(first, second)   what moved between two renders
- │        ├─ ChangeDetector.compare(snapshot, second, ignore=volatile)
+ │        ├─ ChangeDetector.diff(snapshot, second, ignore=volatile)
+ │        ├─ a first snapshot under 60% of the second render (a skeleton)?  -> no report
  │        ├─ NoiseFilter.apply           drop elements that already alerted flap_threshold times
  │        ├─ VolatileShapes.learn        remember the elements that ticked between the renders
  │        └─ store the second render, without the volatile nodes the old snapshot did not
@@ -181,7 +193,8 @@ SiteMonitor.run_once
  ├─ per outcome: hand the render's launch clues to the AutoTurbo, announce a new
  │   sub-page, a captcha widget (once per page and widget), the change report (unless
  │   muted), feed candidates to the UnverifiedWatcher, count load timeouts
- ├─ UnverifiedWatcher.recheck          re-validate watched addresses that are due
+ ├─ UnverifiedWatcher.recheck          re-validate watched addresses that are due (at most
+ │                                     25, those checked longest ago first)
  └─ update block state (backoff) and /status counters
 
 LightPoller.run   one per site, from the end of its first round
@@ -199,8 +212,12 @@ LightPoller.run   one per site, from the end of its first round
 
 A token alert goes out from a task the `Notifier` owns, the moment the page shows the
 token: usually while the page still loads (see "Addresses are read while the page loads"
-below), else when its render is read. Claiming it in the `AlertRegistry` is what writes
-the token into the known cache,
+below), else when its render is read. There each address is checked on its own
+(`pages/verdicts.py`, in the light mode and turbo too): a token's verdict is handed over
+at once, with the verdicts that come in within half a second, and the slower ones (a
+wallet next to the CA is asked on every network) follow; only the last of them counts as
+the read of the page for the ⏱ line. Claiming the token in the `AlertRegistry` is what
+writes it into the known cache,
 so a round cancelled during the check (or a restart) cannot hide a token that was never
 announced, and neither a later cancellation nor a stop can lose the alert: it is kept in
 `data/outbox.json` until every chat got it (see the rules below). In each chat's Telegram
@@ -209,7 +226,9 @@ to about ten minutes (see Concurrency and resources), so a rate limit never hold
 page. The ⏸️ pause notice and the turbo summary follow the alerts they belong to from
 tasks of their own; the monitor pauses the site first. The token's details
 (name, supply, Solana authorities and Token-2022 flags, age, the other networks where the
-address is a token too, with their symbols, DEX pair) follow as an edit of the same message. When one page reaches `contract_pause_threshold`
+address is a token too, with their symbols, DEX pair) are looked up while the alert goes
+out and follow as an edit of the same message, in each chat once its own copy is sent.
+When one page reaches `contract_pause_threshold`
 tokens in one round (both renders), the render that crosses it sends its tokens as a
 `.txt` document and the site pauses (tokens of an earlier render of that round went out
 one by one); when that happens on the monitor's first round, the pause message says the
@@ -249,7 +268,9 @@ is much smaller than the other (a truncated load) the page is skipped for this r
 UNSTABLE and the snapshot is kept. So is a round whose confirming render has under 60% of
 the stored snapshot's nodes (a loading skeleton, a half-loaded list); the third such round
 in a row is compared as usual, since the page then really changed. Tokens are looked for
-in those renders all the same.
+in those renders all the same. The other way round, a page's first snapshot (marked
+`baseline` until its first comparison) with under 60% of the nodes of the render it is
+first compared with caught the page still loading: it is replaced without a report.
 
 **A timer costs one render.** On a page with a ticking timer or a live clock every render
 differs from the snapshot, which would cost a second render on every check. So a round
@@ -291,7 +312,9 @@ invisible characters, Cyrillic and Greek look-alikes and Tether's ₮ (`USDС` w
 candidate must also look like a key: a base58 run of 32 to 44 characters not glued to
 other letters or digits, with both upper- and lower-case letters (base32 ids of IPFS or
 Arweave are single-case), outside inline `data:` files, whose base64 is full of
-base58-looking runs.
+base58-looking runs. An address right after an escape in raw JSON or a URL (`\n`,
+`\u002F`, `%2F`) counts, but a match never starts inside one; so does an address that a
+`<wbr>`, a soft hyphen or another invisible character splits.
 
 **An address is checked once.** `ContractValidator` remembers verdicts: confirmed
 tokens forever (`known_contracts.txt`, written when the token's alert is claimed),
@@ -308,10 +331,16 @@ and a real token on another (`0xF181…`: "USDC.e" on Sonic, LIMP on Ethereum) i
 on the network where it is a token; a copy everywhere is rejected like any non-token. A
 Solana address counts only as an SPL / Token-2022 mint read at `confirmed` commitment (a
 node's default, `finalized`, trails by about 13 s), fetched in one `getMultipleAccounts`
-call together with its Metaplex metadata account. A transport failure or rate limit on any network means "no
+call together with its Metaplex metadata account. A transport failure, a rate limit or a
+null answer to `eth_getCode` or `eth_call` on any network means "no
 verdict" rather than a cached rejection, because a wrong rejection would hide a real
-launch for hours. The exception are the optional networks, Arc and Robinhood Chain (young
-chains with few public nodes): an EVM check waits for them only half a second
+launch for hours; an error of the EVM itself (a revert, an invalid jump) is an answer. A
+Sui coin type whose package the node does not have yet (a node a block behind the page)
+gets no verdict either, for a minute after it was first found missing; a bare Sui package
+is searched for its coin (generic structs skipped) within `RPC_TIMEOUT` in all, and a retry
+asks only the candidates that gave no answer. The exception are the optional networks,
+Arc and Robinhood Chain (young chains with few public nodes): an EVM check waits for them
+only half a second
 (`OPTIONAL_GRACE`) after the required networks answered, and when they fail or lag, the
 other networks' answers give the verdict, which names the networks missing from it. A
 late answer is not thrown away: a token found there is kept and the next look at the
@@ -322,7 +351,8 @@ page showing the address never waits for that, and a token found then is confirm
 the address's next check. An optional endpoint that fails twice in a row rests: checks
 leave it out without waiting, but for probes (at once, then 2, 4, 8, 16 and 30 s apart),
 whose answer ends the rest. The pending watch never rests an endpoint: it sends one batch
-at a time to each, and a late answer there counts too (code: confirmed at the next tick;
+at a time to each; once one network shows code, the others (required ones too) get half a
+second more, and a late answer there counts too (code: confirmed at the next tick;
 none: seen absent as of the tick).
 The network set the caches were built with is
 kept in `data/evm_networks.txt`; when a network is added, cached EVM rejections are
@@ -363,15 +393,19 @@ exists already; what does not exist yet goes to the pending watch, and turns int
 only on a network where a check saw it absent. A token the regular monitor sees appear
 between two of its renders, or on a sub-page that goes live, counts for the session too. Later addresses are
 checked at once: a token is announced, anything that may still become one goes to the
-watch at the turbo pace (`turbo_recheck_interval`). `/unverified <url> on` remains the one
-place where addresses are announced before they are tokens; it validates with
-`negative_cache=False`, so earlier rejections are ignored, and its `✅ Confirmed` claims
-the `AlertRegistry` like every token alert.
+watch at the turbo pace (`turbo_recheck_interval`). Once every page had its first read,
+each render is read as soon as it ends, not after the slowest one of the cycle; a render
+that raises counts as a failed render of its page, and the session goes on.
+`/unverified <url> on` remains the one place where addresses are announced before they
+are tokens; it validates with `negative_cache=False`, so earlier rejections are ignored,
+and its `✅ Confirmed` claims the `AlertRegistry` like every token alert, ends the pending
+watch of the address and reaches the site's turbo session and auto-turbo window.
 
 **Auto-turbo speeds a site up around its launch.** With `auto_turbo` on, the page checker
 reads each render once more for launch clues (`pages/launch.py`, in a worker thread, a few
-milliseconds on usual pages): countdowns with launch words next to them and no veto word
-("round", "ends", "reset", "funding" ...) right before, launch times written with their
+milliseconds on usual pages; a failure there is only logged): countdowns with launch
+words next to them and no veto word ("round", "ends", "reset", "funding" ...) right
+before, launch times written with their
 time zone, countdown targets in inline scripts or element attributes, launch phrases.
 `LaunchClueTracker` (`monitoring/turbo/clues.py`) takes a countdown's end as a launch time
 only once two renders agree on it within its step plus 5 s, the later one shows less time
@@ -387,23 +421,32 @@ the boost wakes the monitor at once. A /turbo session boosts the same way, witho
 rounds. The window ends at its end, at the site's `turbo_stop_after`-th token, on
 `/turbo stop` or when the site is paused or removed. The tokens come from `SiteTokens`
 (`monitoring/tokens.py`): the monitor publishes a token that appeared since the page's
-last read, the pending watch one it confirmed, a turbo session its own; turbo sessions and
-windows subscribe. A launch time that moves by more than a minute before it is reached
-moves the window; a countdown that starts over after its end (a game round) plans nothing
+last read, the pending watch one it confirmed, a turbo session its own, the unverified
+mode its `✅ Confirmed`; turbo sessions and windows subscribe. All of them go through one
+`Announcer` (`monitoring/alerts.py`): claim, alert, end the pending watch of the address,
+publish to the site and to the other sites the watch saw it on. A launch time that moves
+by more than a minute before it is reached moves the window; a countdown that starts over
+after its end (a game round) plans nothing
 more. After a window ended, its launch times (including the ones it took over from), the
 same text with the same clock a day later and its phrase on the same page plan nothing for
 a day.
 Windows live in memory only, like turbo sessions.
 
 **Blocks slow the bot down, nothing else.** A block signal from any page of a site
-(HTTP 401/403/407/429/503, a mitigation header such as `cf-mitigated: challenge`,
-`x-vercel-mitigated` or `x-amzn-waf-action`, a page whose title begins like a challenge
-such as "Just a moment" or "Vercel Security Checkpoint", connection resets) doubles the
+(HTTP 401/403/407/429, a 503 with a sign of a protection, a mitigation header such as
+`cf-mitigated: challenge`, `x-vercel-mitigated` or `x-amzn-waf-action`, a page whose
+title begins like a challenge such as "Just a moment" or "Vercel Security Checkpoint",
+connection resets) doubles the
 pause between rounds up to `block_max_backoff` and honours a longer `Retry-After` as
 sent. It sends one warning, which names the protection when the answer gives it away
 (Cloudflare challenge or Turnstile, Vercel, AWS WAF, DataDome, DDoS-Guard, PerimeterX,
 Imperva, Sucuri, hCaptcha, reCAPTCHA, or the CDN in front), and one recovery notice
-after a round without block signals in which the root page answered. A 2xx page counts
+after a round without block signals in which the root page answered. A 503 without any
+sign of a protection (at most a plain CDN in front, no challenge title or phrase) and a
+refused connection mean the server is down (a deploy, maintenance), not a refusal: the
+pause doubles too, but only up to 60 s (a `Retry-After` counts up to 60 s as well), nobody
+is told (`/status` shows `⚠️ server down?`), the light mode counts a failed poll and a
+turbo session goes on. A 2xx page counts
 as a challenge by a mitigation header, a title that begins like one, or a title part that
 is nothing but a challenge phrase ("Security Captcha", "site | Access Denied", not a lone
 "Verification"); a title that merely mentions a captcha is no block. Such a page is still read for what it shows
@@ -415,7 +458,9 @@ widget. While a site blocks, each round first asks its root page with one plain 
 first 64 KB): if that is still refused, the round renders nothing and counts as blocked,
 so the bot does not prolong a ban with full page loads; every fourth blocked round
 renders anyway, since the browser may pass where the HTTP client does not, and anything
-but a refusal (the page, a 404, a network error) lets the round render. There is no
+but a refusal (the page, a 404, a network error, a server that is down) lets the round
+render. A site the light mode asks through the browser (see below) gets no such GET, since
+the HTTP client is always refused there: its rounds render. There is no
 proxy rotation and no captcha solving by design.
 
 **The browser reads like a person's.** With `HIDE_AUTOMATION` (on by default) Chromium
@@ -439,22 +484,30 @@ second of CPU, so the monitor also asks every live page over plain HTTP each
 auto-turbo window runs for the site), conditionally, so an unchanged page is a 304 without a body. A page whose HTML
 gains an address hands it to the usual pipeline at once (checked on-chain, one alert per
 token, the pending watch). The site's own JSON APIs that a render saw the page call
-(GET, answered in JSON, on the site's domain or a subdomain; price feeds and other
-sites are never asked) are tried once: one that holds addresses or names a CA (`"ca":`,
-`"contract":`, `"mint":`) is polled too, at most two per page and six per site. What it
+(GET, answered in JSON, on the site's domain or a subdomain, where a project on a shared
+host such as `coin.vercel.app` is a domain of its own; price feeds and other
+sites are never asked) are tried once (again later when the site refused the try): one
+that holds addresses or names a CA (`"ca":`, `"contract":`, `"mint":`) is polled too, at
+most two per page and six per site. What it
 carries when adopted is its baseline; an address it later adds is announced even before
 the page shows it, as "Found in: site API". A page whose HTML carries at least 80% of its
 render's texts, and that neither ticks (a timer, see above) nor calls its API again and
-again on its own, is covered: the monitor then renders it only every `render_interval`
-(30 s), for change detection; every other page (a single-page app, a page that reveals
-its CA from a script) keeps its render every round, and gets the polls on top. A page
+again on its own, is covered: while the light mode really polls it (the mode is on and not
+resting, the site does not block, the page's last poll went well), the monitor renders it
+only every `render_interval` (30 s), for change detection; every other page (a single-page
+app, a page that reveals its CA from a script) keeps its render every round, and gets the
+polls on top. A page
 whose HTML starts loading other scripts (a new deploy of a single-page app) is rendered
 at once (at most every 10 s; a list that changes on every request is ignored). A site
 that refuses the plain client (a block signal) while the renders pass is asked with
-fetch() from a tab kept on its origin (`PlaywrightFetcher.tab_fetch`, opened on the
-origin's robots.txt, at most eight such tabs): the requests then carry the browser's
-cookies, headers and TLS. Refused there too, the polls rest a minute; while the site
-blocks the bot they stop. `light_interval 0` turns the light mode off.
+fetch() from a tab kept on its origin (`PlaywrightFetcher.tab_fetch`, at most eight such
+tabs; the tab shows an empty page the bot serves itself at the origin's `/robots.txt`, so
+opening it asks the site nothing): the requests then carry the browser's headers and TLS,
+and its cookies when they go to that origin itself. They are not conditional: the
+browser's cache is off while the bot filters its requests, so every answer comes whole.
+Refused there too, the polls rest a minute; while the site
+blocks the bot they stop. `light_interval 0` turns the light mode off, and every page is
+rendered each round again.
 
 **Addresses are read while the page loads.** Every tab runs a small observer before the
 page's own scripts (`pages/fetching/observer.py`): a `MutationObserver` on the document
@@ -485,20 +538,22 @@ is left to the chats still configured, right after the 🤖 message, token detai
 included. After a stop or crash just after Telegram accepted a message but before the
 outbox noted it, the next start sends that message once more (rare, and accepted). A
 damaged outbox is moved aside as `outbox.json.broken-<time>` with a 🛑; when the outbox
-cannot be saved, the bot logs the error and sends a 🛑, and the alerts go out all the same.
+cannot be saved, the bot logs the error and sends a 🛑 (once, until a save works again),
+and the alerts go out all the same. An entry that could not be saved is not kept, so it never
+holds up the saves of later ones.
 
 ## Persistent state
 
 | File | Written by | Content |
 | --- | --- | --- |
 | `data/state.json` | `StateStore` | every site: url, paused, notifications flag, announced sub-pages, last change, unverified mode and its memory, captcha widgets reported per page; a damaged file is moved aside as `state.json.broken-<time>` |
-| `data/snapshots/<host_path>-<hash>.json` | `SnapshotStore` | one per page: the last accepted node list, the noise memory, the elements seen ticking (`volatile`, for a day) and, once deep scan has seen the page, the addresses its scripts carried then (`deep_seen`) |
+| `data/snapshots/<host_path>-<hash>.json` | `SnapshotStore` | one per page: the last accepted node list, the noise memory, the elements seen ticking (`volatile`, for a day) and, once deep scan has seen the page, the addresses its scripts carried then (`deep_seen`); a page's first snapshot is marked `baseline` until its first comparison. One that cannot be written stays in memory (with a 🛑) until a later save works |
 | `data/browser_state.json` | `PlaywrightFetcher` | with `HIDE_AUTOMATION`: the browser's cookies and local storage, restored at every launch; an unreadable one is moved aside as `browser_state.json.bad` |
 | `data/known_contracts.txt` | `AddressCache` | confirmed contracts, tab separated, append-only |
 | `data/rejected_addresses.txt` | `AddressCache` | rejected addresses with a timestamp, compacted on start |
 | `data/preferences.json` | `Preferences` | live overrides made with `/set` |
 | `data/ignore.txt` | you | optional: addresses never to announce, one per line, `#` comments |
-| `data/pending.json` | `PendingWatch` | addresses waiting to become a token (sites, networks seen empty), dropped ones remembered for a week (wallets and non-tokens refused; expired ones refused unless named as the CA or seen by turbo), and the addresses a pausing first check left open (`old_news`, for a day) |
+| `data/pending.json` | `PendingWatch` | addresses waiting to become a token (sites, networks seen empty), dropped ones remembered for a week (wallets and non-tokens refused; expired ones refused unless named as the CA or seen by turbo), and the addresses a pausing first check left open (`old_news`, for a day); a damaged file is moved aside as `pending.json.broken-<time>` with a 🛑 |
 | `data/outbox.json` | `Outbox` (for the `Notifier`) | token alerts, `✅ Confirmed` alerts and token documents not yet delivered to every chat, with the chats still owed; a damaged file is moved aside as `outbox.json.broken-<time>` |
 | `data/outdated_defaults.txt` | `Application` | the old `.env` values last reported in Telegram, so a restart does not report them again |
 | `data/evm_networks.txt` | `Runtime` | the EVM networks the caches were built with, written once the bot runs |
@@ -519,7 +574,7 @@ half-written file; the address caches are appended to line by line, and
   again and the fetch is tried once more. Between renders, after an hour or 10 000
   renders, whichever comes first, Playwright and the browser start afresh, because
   Playwright keeps a little memory for every call (6 to 14 KB per render, measured): the
-  renders in flight get up to 30 s to finish, the cache starts empty, and the cookies
+  renders in flight get up to 30 s to finish, and the cookies
   carry over through `browser_state.json` (with `HIDE_AUTOMATION`; without, they start
   empty too). A tab
   per fetch, at most `MAX_CONCURRENT_PAGES` renders at once; a tab that a page opens itself
@@ -530,15 +585,17 @@ half-written file; the address caches are appended to line by line, and
   requests finish in the background (at most 64 of them) instead of being cancelled,
   because cancelling would drop a warm connection.
 - Two httpx clients: one for RPC, Telegram and DexScreener (HTTP/2, idle connections kept
-  60 s, `ConnectionWarmer` calls every RPC endpoint (EVM, Solana, Sui) every 30 s and
-  checks each EVM endpoint's
+  60 s, `ConnectionWarmer` calls every RPC endpoint (EVM, Solana, Sui) every 30 s, its
+  answers ending an endpoint's outage like any other, and checks each EVM endpoint's
   chain id at start), one plain HTTP/1.1 client for the sub-page probes and the light
   request of a blocked site, so an HTTP/2 protocol error can never make a live page look
   absent. With `HIDE_AUTOMATION` both send the browser's User-Agent and language.
 - `JsonRpcClient` retries quick failures (HTTP 429 with `Retry-After`, 500/502/503/504,
   refused or reset connections, HTTP/2 protocol errors, rate-limit errors inside a 200,
-  also inside a batch answer) within `RPC_TIMEOUT`, a hard deadline; after a 429 every
-  client of the HTTP pool leaves that host alone; batches carry up to 50 calls, and a node
+  also inside a batch answer, where one error for the whole batch is a rate limit by its
+  code, or by its words unless they are about the batch itself) within `RPC_TIMEOUT`, a
+  hard deadline; after a 429 every client of the HTTP pool leaves that host alone; batches
+  carry up to 50 calls, and a node
   that refuses a batch gets single calls for ten minutes (the token probe then asks about
   one block number, so that nodes behind a load balancer agree). `EndpointHealth` remembers
   since when an endpoint fails and its latest error; one 🛑 goes out only after five

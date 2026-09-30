@@ -26,6 +26,7 @@ from scraper_bot.settings.env import Settings
 from scraper_bot.settings.live import Preferences
 from scraper_bot.telegram.commands.parsing import parse_command
 from scraper_bot.telegram.notifier import Notifier
+from tests.chains.evm.test_abi import abi_string, abi_uint
 from tests.conftest import FakeFetcher, FakeTelegram, make_settings
 
 ROOT = "https://example.com"
@@ -54,16 +55,6 @@ ENV = {
 def page(*lines: str) -> str:
     body = "".join(f"<p>{line}</p>" for line in lines)
     return f"<html><body><h1>Launchpad</h1>{body}</body></html>"
-
-
-def abi_string(text: str) -> str:
-    raw = text.encode()
-    padded = raw + b"\x00" * (-len(raw) % 32)
-    return "0x" + (32).to_bytes(32, "big").hex() + len(raw).to_bytes(32, "big").hex() + padded.hex()
-
-
-def abi_uint(value: int) -> str:
-    return "0x" + value.to_bytes(32, "big").hex()
 
 
 class FakeChain:

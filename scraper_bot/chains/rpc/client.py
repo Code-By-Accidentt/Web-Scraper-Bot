@@ -275,7 +275,7 @@ class JsonRpcClient:
         if isinstance(payload, list) and isinstance(data, dict):
             # One error for the whole batch: a rate limit, or the node won't take such batches.
             error = data.get("error")
-            if isinstance(error, dict) and error.get("code") in _RATE_LIMIT_CODES:
+            if _batch_rate_limited(error):
                 raise _Retryable(RpcError(f"{method} via {self._host}: rate limited"))
             raise _BatchRefused(f"{method} via {self._host}: {_error_text(error)}")
         if _is_rate_limited(data):
@@ -333,6 +333,18 @@ def _is_rate_limit(error: Any) -> bool:
     if error.get("code") in _RATE_LIMIT_CODES:
         return True
     return any(phrase in message for phrase in _RATE_LIMIT_PHRASES)
+
+
+def _batch_rate_limited(error: Any) -> bool:
+    """Return True if the one error answering a whole batch is a rate limit, not a refusal.
+
+    A rate limit may come with a generic code and only its words ("Too many requests"). Words
+    about the batch itself ("batch size limit exceeded") mean the node won't take it.
+    """
+    if not _is_rate_limit(error):
+        return False
+    words = str(error.get("message", "")).lower()
+    return error.get("code") in _RATE_LIMIT_CODES or "batch" not in words
 
 
 def _error_text(error: Any) -> str:

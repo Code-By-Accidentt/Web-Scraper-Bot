@@ -92,12 +92,14 @@ Keep these points in mind:
 - No captcha solving, no proxy or IP rotation, no tampering with a site's check scripts.
   `HIDE_AUTOMATION` only drops the marks of automation (the "Headless" in the User-Agent,
   `navigator.webdriver`) and keeps cookies; the browser never poses as another browser,
-  device or place. When a site answers 401/403/407/429/503, shows a challenge page or
-  resets connections, the bot slows down (the interval doubles up to `BLOCK_MAX_BACKOFF`;
-  a longer `Retry-After` from the site is honoured; while the site still refuses one
-  light request, nothing is rendered), tells you once, naming the protection when it can,
-  and resumes the normal pace after a round without block signals in which the root page
-  answered.
+  device or place. When a site answers 401/403/407/429 (a 503 only with signs of a
+  protection), shows a challenge page or resets connections, the bot slows down (the
+  interval doubles up to `BLOCK_MAX_BACKOFF`; a longer `Retry-After` from the site is
+  honoured; while the site still refuses one light request, nothing is rendered), tells
+  you once, naming the protection when it can, and resumes the normal pace after a round
+  without block signals in which the root page answered. A server that is down (a bare
+  503, a refused connection) slows it down too, with pauses of up to a minute between
+  rounds.
 - No writes to any blockchain, no wallets, no private keys.
 - No outbound traffic other than Telegram, the configured RPC endpoints, DexScreener and
   the sites you asked it to watch, including the third-party hosts their pages load

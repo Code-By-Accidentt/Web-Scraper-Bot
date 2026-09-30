@@ -336,8 +336,7 @@ async def test_restart_is_skipped_when_site_paused_or_removed_meanwhile(
             await h.manager.pause_site(ROOT)
         else:
             await h.manager.remove_site(ROOT)
-        for _ in range(12):  # 60 ms in small steps: the restart timer fires meanwhile
-            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.06)  # the restart timer (30 ms) fires meanwhile
         assert len(h.monitors) == 1
         assert not h.manager.is_running(ROOT)
         assert [site.url for site in h.manager.sites()] == ([ROOT] if action == "pause" else [])

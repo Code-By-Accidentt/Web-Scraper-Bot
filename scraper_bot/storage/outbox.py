@@ -53,16 +53,22 @@ class Outbox:
     def add(self, entry: OutboxEntry) -> None:
         """Keep an entry until every chat got it.
 
-        It is written to disk before this returns; OSError means it is kept in memory only.
+        It is written to disk before this returns. If that fails for any reason, the entry
+        is not kept and the error is raised, so one entry that can't be saved (odd text in
+        it, say) never stops the later ones from being saved.
         """
         self._load()
         self._entries[entry.id] = entry
-        self._save()
+        try:
+            self._save()
+        except BaseException:
+            del self._entries[entry.id]
+            raise
 
     def delivered(self, entry: OutboxEntry, chat_id: int) -> None:
         """Strike a chat off an entry; the entry leaves once no chat is left.
 
-        Raise OSError when the change cannot be written.
+        Raise the error (usually OSError) when the change cannot be written.
         """
         if chat_id in entry.chats:
             entry.chats.remove(chat_id)

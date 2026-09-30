@@ -286,10 +286,16 @@ async def test_a_refused_batch_falls_back_to_single_calls() -> None:
     assert kinds == ["batch", "single", "single", "single"]  # asked once, remembered
 
 
-async def test_a_rate_limit_inside_a_batch_answer_is_retried() -> None:
-    limited = httpx.Response(
-        200, json=[{"jsonrpc": "2.0", "id": 0, "error": {"code": -32005, "message": "limit"}}]
-    )
+@pytest.mark.parametrize(
+    "body",
+    [
+        [{"jsonrpc": "2.0", "id": 0, "error": {"code": -32005, "message": "limit"}}],
+        # one error for the whole batch, a rate limit only by its words
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32000, "message": "Too many requests"}},
+    ],
+)
+async def test_a_rate_limit_inside_a_batch_answer_is_retried(body: Any) -> None:
+    limited = httpx.Response(200, json=body)
     fine = httpx.Response(200, json=[{"jsonrpc": "2.0", "id": 0, "result": "0x1"}])
     handler, seen = scripted(limited, fine)
     assert await retrying(handler, Clock()).call_batch([("eth_chainId", [])]) == ["0x1"]

@@ -21,6 +21,10 @@ def test_link_escapes_text_and_url() -> None:
     assert link("A & B", 'https://x.io/?a=1&b="2"') == (
         '<a href="https://x.io/?a=1&amp;b=&quot;2&quot;">A &amp; B</a>'
     )
+    # The plain fallback keeps where a link leads, and drops any tag, not only ours.
+    assert strip_markup(f"See {link('Etherscan', 'https://etherscan.io/?a=1&b=2')} now") == (
+        "See Etherscan (https://etherscan.io/?a=1&b=2) now"
+    )
     assert (
-        strip_markup(f"See {link('Etherscan', 'https://etherscan.io')} now") == "See Etherscan now"
+        strip_markup(f"{link('https://x.io', 'https://x.io')} <b>bold</b>") == "https://x.io bold"
     )

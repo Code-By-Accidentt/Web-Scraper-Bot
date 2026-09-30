@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 from typing import Protocol
 
 import httpx
@@ -88,15 +89,23 @@ class BrowserTransport:
     ) -> FetchResult:
         """Return the answer to a fetch() of ``url`` from the tab kept on ``origin``.
 
-        The browser's own cache makes the request conditional, so ``etag`` and ``modified``
-        are not needed; an unchanged answer comes back whole.
+        ``etag`` and ``modified`` aren't sent, and the browser's cache is off while the bot
+        filters requests, so every answer comes back whole, never as a 304.
         """
         return await self._browser.tab_fetch(url, origin=origin, timeout=TIMEOUT * 2)
 
 
 def _text(body: bytes, encoding: str | None) -> str:
-    """Decode a body with its charset, or as UTF-8 when the charset is unknown."""
+    """Decode a body with its charset, or as UTF-8 when the charset is unknown.
+
+    Some charsets (UTF-7, unicode_escape) can yield lone surrogates, which no file or
+    message takes; they become U+FFFD like any other byte that doesn't decode.
+    """
     try:
-        return body.decode(encoding or "utf-8", errors="replace")
-    except LookupError:
+        codec = codecs.lookup(encoding or "utf-8").name
+        text = body.decode(codec, errors="replace")
+    except (LookupError, UnicodeError):  # not a text charset, or one that can't replace
         return body.decode("utf-8", errors="replace")
+    if codec == "utf-8":
+        return text  # this decoder never yields a surrogate
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")

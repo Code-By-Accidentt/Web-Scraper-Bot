@@ -14,10 +14,10 @@ from scraper_bot.models.addresses import Address, ConfirmedContract, ValidationR
 from scraper_bot.models.pages import BlockSignal, PageCheckOutcome, PageStatus
 from scraper_bot.models.sightings import Observation, Sighting, Timeline
 from scraper_bot.models.sites import LastChange, SiteState
-from scraper_bot.monitoring.alerts import AlertRegistry
+from scraper_bot.monitoring.alerts import AlertRegistry, Announcer
 from scraper_bot.monitoring.pace import SitePace
 from scraper_bot.monitoring.pending.watch import PendingWatch
-from scraper_bot.monitoring.rounds import live_pages, wait_or_stop
+from scraper_bot.monitoring.rounds import probe_pages, wait_or_stop
 from scraper_bot.monitoring.tokens import SiteTokens
 from scraper_bot.monitoring.turbo.auto import AutoTurbo
 from scraper_bot.monitoring.unverified import UnverifiedWatcher
@@ -50,6 +50,8 @@ class MonitorStats:
     block_reason: str | None = None
     blocked_since: float | None = None
     retry_after: float | None = None
+    down_reason: str | None = None  # the server seems down (not refusing us), for /status
+    down_since: float | None = None
     timing_out: int = 0  # pages the user was warned about for repeated load timeouts
     light: str | None = None  # what the light mode polls, for /status
 
@@ -69,6 +71,7 @@ class _PageHealth:
 
 
 _MAX_BLOCK_LEVEL = 8
+_OUTAGE_MAX_BACKOFF = 60.0  # longest pause (s) while the server is down, not refusing us
 # At most this many blocked rounds in a row skip rendering after a refused light request.
 _LIGHT_SKIPS = 3
 _MAX_TIMEOUT_FACTOR = 3
@@ -130,7 +133,9 @@ class SiteMonitor:
         self._auto = auto
         self._pace = pace or SitePace()
         self._tokens = tokens or SiteTokens()
+        self._announcer = Announcer(self._registry, notifier, self._tokens, pending)
         self._light_skips = 0  # blocked rounds in a row skipped after a refused light request
+        self._outages = 0  # rounds in a row that found the server down (up to _MAX_BLOCK_LEVEL)
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()  # ends the pause between rounds early
         self._wake_up = self._wake.set  # kept as one object, so the pace can remove it later
@@ -168,7 +173,8 @@ class SiteMonitor:
     async def run(self) -> None:
         """Run rounds, with a pause between them, until a stop is requested.
 
-        The light mode starts after the first round, which shows it the live pages.
+        The light mode starts after the first round, which shows it the live pages. If it
+        crashed meanwhile, the log says so when the monitor stops.
         """
         log.info("monitor started for %s", self._site.url)
         polling: asyncio.Task[None] | None = None
@@ -186,7 +192,11 @@ class SiteMonitor:
         finally:
             if polling is not None:
                 polling.cancel()
-                await asyncio.gather(polling, return_exceptions=True)
+                [ended] = await asyncio.gather(polling, return_exceptions=True)
+                if isinstance(ended, Exception):
+                    log.error(
+                        "[%s] the light mode crashed: %r", self._site.url, ended, exc_info=ended
+                    )
             self._pace.unlisten(self._site.url, self._wake_up)
             if self._auto is not None and self._site.paused:
                 self._auto.forget(self._site.url)  # a paused site loses its auto-turbo window
@@ -214,9 +224,9 @@ class SiteMonitor:
             )
             await self._update_block_state([outcome])
             return [outcome]
-        pages = await live_pages(self._prober, self._deriver, self._site.url)
+        pages, known = await probe_pages(self._prober, self._deriver, self._site.url)
         if self._light is not None:
-            self._light.keep(pages)
+            self._light.keep(known)
         due = [url for url in pages if self._due(url)]
         results = await asyncio.gather(
             *(self._check_and_handle(url) for url in due), return_exceptions=True
@@ -246,7 +256,7 @@ class SiteMonitor:
         self._stats.last_round_seconds = time.perf_counter() - started
         self._stats.last_pages = len(due)
         self._stats.light = self._light.summary() if self._light is not None else None
-        for url in [url for url in self._health if url not in pages]:
+        for url in [url for url in self._health if url not in known]:
             del self._health[url]
         self._count_timing_out()
         await self._update_block_state(outcomes)
@@ -258,13 +268,16 @@ class SiteMonitor:
         Return the block signal of a refusal: the round then renders nothing, so the bot does
         not prolong the ban. After ``_LIGHT_SKIPS`` spared rounds in a row one renders anyway,
         as the browser may pass where the HTTP client is refused. Anything but a refusal
-        (the page, a 404, a network error) lets the round render as usual.
+        (the page, a 404, a network error, a server that is down) lets the round render as
+        usual, and so does a site the light mode asks through the browser already: the
+        HTTP client is always refused there.
         """
-        if not self._stats.blocked or self._light_skips >= _LIGHT_SKIPS:
+        via_browser = self._light is not None and self._light.via_browser
+        if not self._stats.blocked or self._light_skips >= _LIGHT_SKIPS or via_browser:
             self._light_skips = 0
             return None
         signal = self._blocks.inspect(await self._prober.peek(self._site.url))
-        if signal is None:
+        if signal is None or signal.outage:
             self._light_skips = 0
             return None
         self._light_skips += 1
@@ -279,17 +292,20 @@ class SiteMonitor:
         """Return the seconds until the next round.
 
         That is a random interval doubled per block level (up to ``block_max_backoff``), and
-        never shorter than a Retry-After the site asked for. In an auto-turbo window a round
-        starts every ``turbo_interval`` seconds, counted like turbo cycles from the start of
-        the last round, unless the site blocks.
+        never shorter than a Retry-After the site asked for. While the server is down it
+        doubles per round too, but up to ``_OUTAGE_MAX_BACKOFF`` only. In an auto-turbo
+        window a round starts every ``turbo_interval`` seconds, counted like turbo cycles
+        from the start of the last round, unless the site blocks.
         """
         fast = self._pace.rounds_fast(self._site.url)
         if fast:
             base = self._tuning.turbo_interval
         else:
             base = self._rng.uniform(self._tuning.poll_interval_min, self._tuning.poll_interval_max)
-        cap = max(self._tuning.block_max_backoff, base)
-        delay = min(base * (2**self._stats.block_level), cap)
+        level, cap = self._stats.block_level, self._tuning.block_max_backoff
+        if not self._stats.blocked and self._outages:
+            level, cap = self._outages, min(cap, _OUTAGE_MAX_BACKOFF)
+        delay = min(base * (2**level), max(cap, base))
         if self._stats.retry_after:
             delay = max(delay, self._stats.retry_after)
         if fast and not self._stats.blocked:
@@ -387,22 +403,25 @@ class SiteMonitor:
         When a page reaches ``contract_pause_threshold`` tokens in one round, they go out as
         a document instead and the site is paused. When that is the first round, the pending
         watch hears what the round could not confirm: it may turn out a token later.
+        Only a token that appeared since the page's last read (or on a new page) is news to
+        the pending watch, turbo sessions and auto-turbo windows; one the page showed all
+        along is not.
         """
-        new = [item for item in found if self._registry.claim(item[0])]
-        if not new:
-            return
-        count = self._round_tokens.get(page_url, 0) + len(new)
-        self._round_tokens[page_url] = count
-        if count < self._tuning.contract_pause_threshold:
-            for contract, sighting, timeline in new:
-                await self._notifier.contract_found(
-                    contract, page_url, sighting=sighting, timeline=timeline
-                )
-            self._tell_found(new, new_page=new_page)
-            return
+        details: dict[ConfirmedContract, tuple[Sighting | None, Timeline]] = {}
+        for contract, sighting, timeline in found:
+            details.setdefault(contract, (sighting, timeline))  # the first sighting names it
+        news = {
+            contract
+            for contract, (_, timeline) in details.items()
+            if new_page or timeline.missing_at is not None
+        }
         site = self._site
-        await self._notifier.contracts_batch(site.url, page_url, [c for c, _, _ in new])
-        self._tell_found(new, new_page=new_page)
+        new = await self._announcer.announce(
+            site.url, list(details), lambda fresh: self._send(page_url, fresh, details), news=news
+        )
+        count = self._round_tokens.get(page_url, 0)
+        if not new or count < self._tuning.contract_pause_threshold:
+            return
         if self._stop.is_set():
             return  # another page of this round already paused the site
         self.request_stop()
@@ -420,35 +439,26 @@ class SiteMonitor:
             first_check=first_check,
         )
 
-    def _tell_found(
+    async def _send(
         self,
-        found: Sequence[tuple[ConfirmedContract, Sighting | None, Timeline]],
-        *,
-        new_page: bool,
+        page_url: str,
+        fresh: list[ConfirmedContract],
+        details: dict[ConfirmedContract, tuple[Sighting | None, Timeline]],
     ) -> None:
-        """Tell the pending watch, turbo sessions and auto-turbo windows about announced tokens.
+        """Send the tokens a page showed first, and count them for the page's round.
 
-        Only a token that appeared since the page's last read (or on a new page) counts as
-        found; one the page showed all along is not news to them. A failure here is only
-        reported: the alerts went out already.
+        Each gets its own alert, unless the page reaches ``contract_pause_threshold``
+        tokens this round: then they go out together as one document.
         """
-        site_url = self._site.url
-        try:
-            for contract, _, timeline in found:
-                if timeline.missing_at is None and not new_page:
-                    continue
-                others = frozenset[str]()
-                if self._pending is not None:
-                    others = self._pending.announced(site_url, contract.address)
-                self._tokens.publish({site_url, *others}, contract.address, contract.network)
-        except Exception as exc:
-            log.exception("[%s] telling others about announced tokens failed", site_url)
-            self._notifier.report_later(
-                f"tell:{site_url}",
-                f"Could not pass the tokens found on {site_url} on",
-                f"{type(exc).__name__}: {exc}",
-                hint="The alerts went out; a turbo session or auto-turbo window of the site "
-                "may not stop at its first token.",
+        count = self._round_tokens.get(page_url, 0) + len(fresh)
+        self._round_tokens[page_url] = count
+        if count >= self._tuning.contract_pause_threshold:
+            await self._notifier.contracts_batch(self._site.url, page_url, fresh)
+            return
+        for contract in fresh:
+            sighting, timeline = details[contract]
+            await self._notifier.contract_found(
+                contract, page_url, sighting=sighting, timeline=timeline
             )
 
     async def _track_timeouts(self, outcome: PageCheckOutcome) -> None:
@@ -546,10 +556,23 @@ class SiteMonitor:
     async def _update_block_state(self, outcomes: Sequence[PageCheckOutcome]) -> None:
         """Raise the block level on a block signal, or reset it once the root page answers.
 
-        The user is told when a block starts and when the site recovers.
+        The user is told when a block starts and when the site recovers. A server that is
+        down (an outage signal) isn't refusing the bot: its rounds slow down a little, up to
+        ``_OUTAGE_MAX_BACKOFF``, and nobody is told; /status shows it.
         """
         site, stats = self._site, self._stats
-        signals = [(o.url, o.block) for o in outcomes if o.block is not None]
+        outage = next((o.block for o in outcomes if o.block is not None and o.block.outage), None)
+        self._outages = min(self._outages + 1, _MAX_BLOCK_LEVEL) if outage is not None else 0
+        if outage is None:
+            stats.down_reason = stats.down_since = None
+        else:
+            stats.down_reason = outage.describe()
+            if stats.down_since is None:
+                stats.down_since = time.time()
+        signals = [(o.url, o.block) for o in outcomes if o.block is not None and not o.block.outage]
+        if not signals and not stats.blocked:
+            self._note_outage(outage)
+            return
         if signals:
             page_url, signal = signals[0]
             first_time = stats.blocked_since is None
@@ -582,6 +605,26 @@ class SiteMonitor:
             await self._notifier.site_recovered(
                 site.url, time.time() - since if since is not None else None
             )
+
+    def _note_outage(self, outage: BlockSignal | None) -> None:
+        """Plan the next round of a site whose server is down, and log it; nobody is told.
+
+        A Retry-After the server sent counts, up to ``_OUTAGE_MAX_BACKOFF``. Without an
+        outage the pause goes back to normal.
+        """
+        stats = self._stats
+        stats.retry_after = None
+        if outage is None:
+            return
+        if outage.retry_after:
+            stats.retry_after = min(outage.retry_after, _OUTAGE_MAX_BACKOFF)
+        self._planned_delay = self.next_delay()
+        log.warning(
+            "[%s] the server seems down (%s); next round in %.0fs",
+            self._site.url,
+            outage.describe(),
+            self._planned_delay,
+        )
 
     def _due(self, page_url: str) -> bool:
         """True when the page is rendered this round.

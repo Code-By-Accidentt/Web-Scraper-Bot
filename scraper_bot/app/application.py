@@ -46,7 +46,8 @@ class Application:
         """Open the HTTP clients and the browser, serve the bot, and close them when it stops.
 
         Raises TelegramAuthError for a rejected token, and BrowserUnavailable (after telling
-        the chat) when the browser cannot start.
+        the chat) when the browser cannot start. Any other error that stops the bot is told
+        to the chat too, before it is raised.
         """
         cfg = self._settings
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
@@ -111,6 +112,9 @@ class Application:
                     probe_http=probes,
                 )
                 await runtime.serve()
+            except Exception as exc:
+                await _tell_fatal(notifier, exc)
+                raise
             finally:
                 await fetcher.stop()
 
@@ -122,6 +126,19 @@ class Application:
             log.warning("could not verify the Telegram token now; continuing anyway")
         else:
             log.info("Telegram bot @%s (id %s)", profile.get("username"), profile.get("id"))
+
+
+async def _tell_fatal(notifier: Notifier, exc: Exception) -> None:
+    """Tell the chat that an error stopped the bot; a failure here never hides that error."""
+    try:
+        await notifier.problem(
+            "fatal",
+            "The bot stopped on an unexpected error",
+            f"{type(exc).__name__}: {exc}",
+            hint="The supervisor (rebooter.py) starts it again; the traceback is in the log.",
+        )
+    except Exception:
+        log.warning("could not tell the chat about the fatal error", exc_info=True)
 
 
 def _speak_as(user_agent: str, *clients: httpx.AsyncClient) -> None:

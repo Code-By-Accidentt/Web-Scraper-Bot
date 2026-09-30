@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from scraper_bot.models.addresses import ConfirmedContract
 from scraper_bot.models.launch import LaunchClues
 from scraper_bot.monitoring.pace import AUTO, SitePace
+from scraper_bot.monitoring.rounds import wait_or_stop
 from scraper_bot.monitoring.tokens import SiteTokens, Subscriber
 from scraper_bot.monitoring.turbo.clues import LaunchCandidate, LaunchClueTracker
 from scraper_bot.monitoring.turbo.session import MANUAL_STOP
@@ -227,7 +228,9 @@ class AutoTurbo:
         window.heard = lambda contract: self._heard(window, contract)
         self._tokens.subscribe(site_url, window.heard)
         self._windows[site_url] = window
-        self._tasks[site_url] = asyncio.create_task(self._run(window), name=f"auto:{site_url}")
+        task = asyncio.create_task(self._run(window), name=f"auto:{site_url}")
+        task.add_done_callback(lambda done: self._on_done(site_url, done))
+        self._tasks[site_url] = task
         log.info(
             "[%s] auto-turbo planned from %s on %s: faster checks %.0f s from now for %.0f s",
             site_url,
@@ -285,8 +288,27 @@ class AutoTurbo:
         except asyncio.CancelledError:
             window.reason = window.reason or "the bot is shutting down"
             raise
+        except Exception as exc:
+            window.reason = window.reason or f"crashed ({type(exc).__name__})"
+            raise
         finally:
             await self._finish(window)
+
+    def _on_done(self, site_url: str, task: asyncio.Task[None]) -> None:
+        """Tell the user when a window crashed; a cancelled one (at shutdown) did not."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            return
+        log.error("auto-turbo window for %s crashed: %r", site_url, error, exc_info=error)
+        self._notifier.report_later(
+            f"auto:{site_url}",
+            f"Auto-turbo window for {site_url} crashed",
+            f"{type(error).__name__}: {error}",
+            hint="The site is back at its usual pace; start /turbo by hand if the launch is "
+            "still ahead.",
+        )
 
     def _activate(self, window: _Window) -> None:
         """Speed the site up; its monitor starts its next round at once."""
@@ -378,9 +400,7 @@ class AutoTurbo:
     async def _wait(self, window: _Window, seconds: float) -> None:
         """Wait ``seconds``, or less when the window changes (moved, stopped) meanwhile."""
         if self._sleep is None:
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(max(seconds, 0.0)):
-                    await window.changed.wait()
+            await wait_or_stop(window.changed, seconds)
         else:
             sleeper = asyncio.ensure_future(self._sleep(max(seconds, 0.0)))
             waiter = asyncio.ensure_future(window.changed.wait())

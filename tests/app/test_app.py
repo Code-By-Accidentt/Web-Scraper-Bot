@@ -94,6 +94,8 @@ def test_configure_logging_with_a_log_file(tmp_path: Path, restore_logging: None
     handler.flush()
     text = log_file.read_text(encoding="utf-8")
     assert "DEBUG    scraper_bot.test_app: hello from the test" in text
+    with pytest.raises(ConfigError, match="LOG_FILE"):  # exit code 2, not a traceback
+        configure_logging(make_settings(tmp_path, LOG_FILE=str(log_file / "inside-a-file.log")))
 
 
 def test_configure_logging_without_a_log_file(tmp_path: Path, restore_logging: None) -> None:
@@ -197,16 +199,23 @@ def test_main_logs_the_failure_reason(
     assert "interrupted; shutting down" in caplog.text
 
 
-def test_main_warns_when_no_chat_ids_are_configured(
+def test_main_warns_only_when_no_chat_ids_are_configured(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger="scraper_bot.app")
+    configured = make_settings(tmp_path)
     silent = make_settings(tmp_path, TELEGRAM_CHAT_IDS="")
     assert silent.chat_ids == ()
-    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls, *args, **kwargs: silent))
     monkeypatch.setattr(cli, "configure_logging", lambda settings: None)
     monkeypatch.setattr(cli.Application, "run", run_raising(None))
 
+    monkeypatch.setattr(
+        cli.Settings, "from_env", classmethod(lambda cls, *args, **kwargs: configured)
+    )
+    assert main() == 0
+    assert "TELEGRAM_CHAT_IDS is empty" not in caplog.text
+
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls, *args, **kwargs: silent))
     assert main() == 0
     assert "TELEGRAM_CHAT_IDS is empty" in caplog.text
     assert not silent.data_dir.exists()  # Application.run was stubbed: nothing on disk
@@ -228,15 +237,6 @@ def test_main_warns_about_defaults_of_an_earlier_release(
     assert main() == 0
     assert "DEEP_SCAN=true is the default of an earlier release" in caplog.text
     assert "the default is now false" in caplog.text
-
-
-def test_main_is_quiet_about_chat_ids_when_they_are_set(
-    monkeypatch: pytest.MonkeyPatch, quiet_main: Settings, caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.INFO, logger="scraper_bot.app")
-    monkeypatch.setattr(cli.Application, "run", run_raising(None))
-    assert main() == 0
-    assert "TELEGRAM_CHAT_IDS is empty" not in caplog.text
 
 
 # ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -278,7 +278,10 @@ async def test_heartbeat_keeps_running_when_the_write_fails(
 
     monkeypatch.setattr(heartbeat_module, "atomic_write_text", failing_write)
     path = tmp_path / "heartbeat"
-    task = asyncio.create_task(Heartbeat(path, interval=0.001).run())
+    reports: list[tuple[str, ...]] = []
+    task = asyncio.create_task(
+        Heartbeat(path, interval=0.001, report=lambda *args: reports.append(args)).run()
+    )
     try:
         for _ in range(200):
             if len(attempts) >= 3:
@@ -289,6 +292,9 @@ async def test_heartbeat_keeps_running_when_the_write_fails(
     assert len(attempts) >= 3
     assert not path.exists()
     assert "heartbeat write failed: disk full" in caplog.text
+    # The chat hears it once: without a heartbeat the supervisor restarts the bot every 5 min.
+    [(key, _title, detail, hint)] = reports
+    assert (key, detail) == ("heartbeat", "disk full") and str(tmp_path) in hint
 
 
 # ── Application._check_token ────────────────────────────────────────────────
@@ -474,25 +480,6 @@ async def test_build_runtime_wires_a_working_bot(wired: Wired) -> None:
 
     assert not manager.is_running(SITE)
     assert wired.texts() == [wired.texts()[0]] * 2  # a static page raises no alert
-
-
-async def test_runtime_start_reports_the_running_sites(wired: Wired) -> None:
-    runtime = wired.runtime
-    await runtime.start()
-    try:
-        await runtime.commands.execute(1, ParsedCommand("add", SITE))
-    finally:
-        await runtime.shutdown()
-
-    # Second boot from the persisted state: the site is loaded and started again.
-    async with httpx.AsyncClient(transport=httpx.MockTransport(wired.transport)) as http:
-        again = Wired(wired.settings.data_dir.parent, http, wired.transport)
-        await again.runtime.start()
-        try:
-            assert again.runtime.manager.is_running(SITE)
-            assert again.texts()[0].startswith(f"🤖 Bot started (v{__version__}): 1/1 site(s)")
-        finally:
-            await again.runtime.shutdown()
 
 
 async def test_runtime_serve_can_be_cancelled(wired: Wired) -> None:

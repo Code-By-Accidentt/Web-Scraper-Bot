@@ -56,13 +56,14 @@ bothers you.
   once and keeps re-checking it on-chain for a day.
 - **Live settings.** `/settings` explains every tunable knob, `/set` changes it without a
   restart, risky values ask for `confirm`.
-- **Block awareness.** 401/403/407/429/503, WAF challenges and connection resets slow the
-  site's interval down (doubling up to a cap, or longer when the site sends `Retry-After`),
-  with one warning that names the protection (Cloudflare, Vercel, AWS WAF, DataDome, ...)
-  and one recovery notice; while the site still refuses one light request, nothing is
-  rendered. The browser does not announce itself as automated and keeps its cookies
-  across restarts, so a check it passed on its own is not asked again. A captcha widget
-  on a page is reported once. No proxy rotation, no captcha solving.
+- **Block awareness.** 401/403/407/429, a 503 from a bot protection, WAF challenges and
+  connection resets slow the site's interval down (doubling up to a cap, or longer when
+  the site sends `Retry-After`), with one warning that names the protection (Cloudflare,
+  Vercel, AWS WAF, DataDome, ...) and one recovery notice; while the site still refuses
+  one light request, nothing is rendered. The browser does not announce itself as
+  automated and keeps its cookies across restarts, so a check it passed on its own is not
+  asked again. A captcha widget on a page is reported once. No proxy rotation, no captcha
+  solving.
 - **Pages that keep timing out** get one alert and a longer load timeout until they render
   again.
 - **Persistent and supervised.** Sites, flags, snapshots and caches live under `data/` and

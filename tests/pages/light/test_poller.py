@@ -6,7 +6,7 @@ from scraper_bot.models.pages import PageCheckOutcome, PageStatus
 from scraper_bot.models.sightings import Observation, SightingSource
 from scraper_bot.pages.changes.normalizer import HtmlNormalizer
 from scraper_bot.pages.fetching.result import FetchResult
-from scraper_bot.pages.light.poller import LightPoller
+from scraper_bot.pages.light.poller import LightPoller, _site_of
 from tests.conftest import FakeTuning, FakeValidator
 
 URL = "https://x.io"
@@ -139,3 +139,36 @@ async def test_a_site_that_refuses_plain_requests_is_asked_through_the_browser()
     await light.poll_once()
     assert light.via_browser and len(plain.calls) == 1
     assert [s.address.value for o in seen for s in o.sightings] == [BRETT]
+
+
+async def test_a_page_is_covered_only_while_the_light_mode_really_polls_it() -> None:
+    transport = FakeTransport({URL: [answer(URL, html()), FetchResult(URL, 502, "")]})
+    light, _, _ = poller(transport)
+    light.learn(rendered())
+    await light.poll_once()
+    assert light.covered(URL)
+    light._tuning.light_interval = 0  # /set light_interval 0: nobody polls it any more
+    assert not light.covered(URL)
+    light._tuning.light_interval = 1.0
+    await light.poll_once()  # a failed poll: its render every round takes over at once
+    assert not light.covered(URL)
+
+
+async def test_an_api_that_keeps_failing_rests_and_is_not_dropped() -> None:
+    api = "https://api.x.io/launch"
+    down = FetchResult(api, 502, "")
+    transport = FakeTransport(
+        {URL: [answer(URL, html())], api: [answer(api, '{"ca": null}'), down]}
+    )
+    light, _, _ = poller(transport)
+    light.learn(rendered(api))
+    for _ in range(5):
+        await light.poll_once()  # adopted, then three failures, then a rest
+    assert [url for url, _ in transport.calls].count(api) == 4
+    assert "1 API(s)" in (light.summary() or "")  # still polled once the rest is over
+
+
+def test_projects_on_a_shared_host_are_different_sites() -> None:
+    assert _site_of("coin.vercel.app") != _site_of("indexer.vercel.app")
+    assert _site_of("api.coin.vercel.app") == _site_of("coin.vercel.app")
+    assert _site_of("api.x.io") == _site_of("app.x.io") == "x.io"

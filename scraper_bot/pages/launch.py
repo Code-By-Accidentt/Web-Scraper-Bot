@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from lxml import html as lxml_html
 
 from scraper_bot.models.launch import Countdown, LaunchClues, LaunchTime, Phrase, TimeSource
-from scraper_bot.pages.changes.normalizer import DROP_TAGS, parse_document
+from scraper_bot.pages.changes.normalizer import DROP_TAGS, clean_text, parse_document
 
 log = logging.getLogger(__name__)
 
@@ -219,9 +219,6 @@ _PHRASES = (
     ),
 )
 _LABEL_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-_WS_RE = re.compile(r"\s+")
-# Zero-width spaces and joiners, direction marks, the word joiner and the BOM.
-_INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
 _NUMBERS_RE = re.compile(r"\d+")
 _COLON_GAP_RE = re.compile(r"(?<=\d) ?: ?(?=\d)")
 
@@ -279,8 +276,7 @@ def _visible_text(root: lxml_html.HtmlElement) -> str:
         if element.getparent() is not None:
             element.drop_tree()
     _read_labels(root)
-    text = " ".join(root.itertext())[:_MAX_TEXT]
-    return _WS_RE.sub(" ", _INVISIBLE_RE.sub("", text.replace("\xa0", " "))).strip()
+    return clean_text(" ".join(root.itertext())[:_MAX_TEXT])
 
 
 def _read_labels(root: lxml_html.HtmlElement) -> None:
@@ -314,7 +310,7 @@ def _phrases(text: str) -> tuple[Phrase, ...]:
     )
     phrases: dict[str, Phrase] = {}
     for _, shown in found:
-        key = _WS_RE.sub(" ", shown.lower())
+        key = shown.lower()  # its whitespace is collapsed already
         phrases.setdefault(key, Phrase(key, shown))
     return tuple(phrases.values())
 
@@ -439,7 +435,8 @@ def _unit_rows(
         start, end = match.span()
         if taken.overlaps(start, end):
             continue
-        unit = match["unit"][0].lower()
+        # The rule's "s" also matches a long s, which only casefold() turns into an "s".
+        unit = match["unit"][0].casefold()
         pair = (start, end, int(match["value"]), unit)
         last = rows[-1][-1] if rows else None
         if (
@@ -580,13 +577,17 @@ def _numeric_time(match: re.Match[str], now: float) -> float | None:
 def _day_month_time(match: re.Match[str], now: float) -> float | None:
     """Return the time of "30 Sep 2026, 15:00 UTC" in epoch seconds."""
     day, month, year, hour, minute, half, zone, shift = match.groups()
-    return _dated(now, year, _MONTHS[month.lower()[:3]], int(day), hour, minute, half, zone, shift)
+    return _dated(
+        now, year, _MONTHS[month.casefold()[:3]], int(day), hour, minute, half, zone, shift
+    )
 
 
 def _month_day_time(match: re.Match[str], now: float) -> float | None:
     """Return the time of "Sep 30, 2026 at 3:00 PM UTC" in epoch seconds."""
     month, day, year, hour, minute, half, zone, shift = match.groups()
-    return _dated(now, year, _MONTHS[month.lower()[:3]], int(day), hour, minute, half, zone, shift)
+    return _dated(
+        now, year, _MONTHS[month.casefold()[:3]], int(day), hour, minute, half, zone, shift
+    )
 
 
 def _dotted_time(match: re.Match[str], now: float) -> float | None:

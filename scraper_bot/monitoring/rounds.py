@@ -18,11 +18,25 @@ async def live_pages(prober: HttpProber, deriver: SubUrlDeriver, root: str) -> l
     A sub-page is left out only when its probe shows it certainly does not exist (see
     ProbeResult).
     """
+    live, _ = await probe_pages(prober, deriver, root)
+    return live
+
+
+async def probe_pages(
+    prober: HttpProber, deriver: SubUrlDeriver, root: str
+) -> tuple[list[str], list[str]]:
+    """Return the pages to render, as :func:`live_pages` does, and the pages worth keeping.
+
+    Those are all the pages but the ones the server answered 404 or 410 for: a sub-page
+    whose probe only failed (a refused connection, say) sits this round out, but what we
+    know about it stays.
+    """
     probes = await asyncio.gather(*(prober.probe(url) for url in deriver.derive(root)))
     skipped = [probe.url for probe in probes if not probe.worth_rendering]
     if skipped:
         log.debug("[%s] not rendering absent pages: %s", root, ", ".join(skipped))
-    return [root, *(probe.url for probe in probes if probe.worth_rendering)]
+    live = [root, *(probe.url for probe in probes if probe.worth_rendering)]
+    return live, [root, *(probe.url for probe in probes if not probe.gone)]
 
 
 async def wait_or_stop(stop: asyncio.Event, seconds: float) -> None:

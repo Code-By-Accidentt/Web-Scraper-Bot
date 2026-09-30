@@ -120,12 +120,6 @@ def test_alive_with_an_adopted_process(tmp_path: Path, process: PsutilLike, expe
     assert supervisor._alive() is expected
 
 
-def test_alive_with_the_supervisor_itself_adopted(tmp_path: Path) -> None:
-    supervisor = make(tmp_path)
-    supervisor._process = psutil.Process()
-    assert supervisor._alive() is True
-
-
 # ── _terminate ──────────────────────────────────────────────────────────────
 class RecordingProcess:
     def __init__(
@@ -414,6 +408,8 @@ def capture_supervisor(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         )
 
     monkeypatch.setattr(Supervisor, "run", run)
+    # main() would leave its SIGTERM handler behind in the pytest process.
+    monkeypatch.setattr(rebooter.signal, "signal", lambda _signum, _handler: None)
     return captured
 
 

@@ -1,4 +1,7 @@
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from scraper_bot.chains.addresses.extractor import AddressExtractor
 from scraper_bot.models.addresses import Address, Chain, ConfirmedContract
@@ -191,6 +194,18 @@ async def test_a_skeleton_replaces_the_snapshot_only_after_three_rounds_in_a_row
     assert h.snapshots.load(URL).signature == h.signature(SKELETON)
 
 
+async def test_a_first_render_that_caught_the_page_loading_is_replaced_silently(
+    tmp_path: Path,
+) -> None:
+    h = Harness(tmp_path)
+    h.fetcher.html(URL, SKELETON, BIG)  # the last render repeats
+    assert (await h.checker.check(URL)).status is PageStatus.BASELINE
+    assert h.snapshots.load(URL).baseline
+    assert (await h.checker.check(URL)).status is PageStatus.UNCHANGED  # no change report
+    stored = h.snapshots.load(URL)
+    assert stored.signature == h.signature(BIG) and not stored.baseline
+
+
 async def test_http_errors_are_unavailable(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     h.fetcher.html(URL, PAGE_A, status=503)
@@ -378,7 +393,7 @@ async def test_candidates_carry_every_valid_address_from_both_renders(tmp_path: 
     assert outcome.status is PageStatus.CHANGED
     assert outcome.candidates == (usdc, sol, weth)  # rejected ones included, no duplicates
     assert h.tokens == (ConfirmedContract(weth, "Base"),)
-    assert h.validator.calls == [[usdc, sol], [weth]]  # the second render checks only news
+    assert h.validator.calls == [[usdc], [sol], [weth]]  # the second render checks only news
 
 
 async def test_block_on_the_confirming_render_keeps_the_snapshot(tmp_path: Path) -> None:
@@ -428,17 +443,55 @@ async def test_addresses_are_reported_before_the_confirming_render(tmp_path: Pat
         events.append("fetch")
         return await original(url, timeout=timeout, on_text=on_text)
 
+    observed: list[Observation] = []
+
     async def observe(observation: Observation) -> None:
         events.append("observe")
-        [sighting] = observation.sightings
-        assert sighting.context == "CA:" and sighting.hinted
-        assert [r.contract for r in observation.results] == [ConfirmedContract(token, "Base")]
-        assert observation.seen_at == h.now
+        observed.append(observation)
 
     h.fetcher.fetch = fetch  # type: ignore[method-assign]
     outcome = await h.checker.check(URL, on_observation=observe)
     assert outcome.status is PageStatus.CHANGED
     assert events == ["fetch", "observe", "fetch"]  # the alert does not wait for render two
+    [observation] = observed
+    [sighting] = observation.sightings
+    assert sighting.context == "Link CA:" and sighting.hinted  # the link before it counts too
+    assert [r.contract for r in observation.results] == [ConfirmedContract(token, "Base")]
+    assert observation.seen_at == h.now
+
+
+async def test_a_token_is_reported_without_waiting_for_a_slow_verdict_beside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("scraper_bot.pages.verdicts.TOKEN_GRACE", 0.0)
+    h = Harness(tmp_path)
+    token, wallet = Address(Chain.ETHEREUM, USDC_ETH), Address(Chain.ETHEREUM, WETH)
+    h.validator.confirm(token, "Base")
+    answered = asyncio.Event()
+    validate_many = h.validator.validate_many
+
+    async def slow_wallet(addresses, **options):  # type: ignore[no-untyped-def]
+        addresses = list(addresses)
+        if wallet in addresses:
+            await answered.wait()  # every network has to say it holds no code
+        return await validate_many(addresses, **options)
+
+    h.validator.validate_many = slow_wallet  # type: ignore[method-assign]
+    h.fetcher.html(URL, PAGE_A.replace("Hello", f"CA: {USDC_ETH} Deployer: {WETH}"))
+    seen: list[Observation] = []
+
+    async def observe(observation: Observation) -> None:
+        seen.append(observation)
+
+    check = asyncio.create_task(h.checker.check(URL, on_observation=observe))
+    async with asyncio.timeout(2):
+        while not seen:
+            await asyncio.sleep(0.01)
+    assert not check.done()
+    answered.set()
+    await check
+    verdicts = [([r.address for r in o.results], o.read) for o in seen]
+    assert verdicts == [([token], False), ([wallet], True)]  # only the last one is the read
 
 
 async def test_an_address_shown_while_loading_is_reported_before_the_page_is_read(

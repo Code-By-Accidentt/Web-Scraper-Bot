@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -10,7 +11,8 @@ from collections.abc import Awaitable, Callable
 from scraper_bot.chains.addresses.extractor import AddressExtractor
 from scraper_bot.chains.validator import ContractValidator
 from scraper_bot.models.addresses import ValidationResult
-from scraper_bot.models.pages import PageCheckOutcome, PageStatus, Signature, Snapshot
+from scraper_bot.models.launch import LaunchClues
+from scraper_bot.models.pages import ChangeReport, PageCheckOutcome, PageStatus, Signature, Snapshot
 from scraper_bot.models.sightings import Observation, Sighting, SightingSource
 from scraper_bot.pages.changes.detector import ChangeDetector
 from scraper_bot.pages.changes.noise import NoiseFilter
@@ -21,6 +23,7 @@ from scraper_bot.pages.fetching.blocking import BlockDetector
 from scraper_bot.pages.fetching.result import FetchResult, PageFetcher
 from scraper_bot.pages.launch import read_launch
 from scraper_bot.pages.sightings import find_sightings, shown_on_a_challenge
+from scraper_bot.pages.verdicts import observations
 from scraper_bot.settings.live import Tuning
 from scraper_bot.storage.snapshots import SnapshotStore
 
@@ -64,7 +67,9 @@ class PageChecker:
     what differs between the two renders is volatile and stays out of the report and the
     snapshot, and a render that differs only in shapes seen ticking needs no second render.
     Elements that keep changing across rounds are silenced by :class:`NoiseFilter`.
-    Renders much smaller than the stored snapshot replace it only after a few rounds.
+    Renders much smaller than the stored snapshot replace it only after a few rounds; a new
+    page's first snapshot much smaller than the next render (a loading skeleton) is replaced
+    without a report.
     """
 
     def __init__(
@@ -107,7 +112,8 @@ class PageChecker:
         ``on_observation`` hears first the addresses the page shows while it still loads,
         then the first render's addresses and verdicts, before any comparison, so a token
         alert waits neither for the page to settle nor for change detection. Later calls
-        carry only the addresses the second render adds.
+        carry only the addresses the second render adds. A render's verdicts may come in
+        several calls: a token's at once, those that take longer after it.
         """
         started = self._clock()
         first = await self._first_fetch(page_url, load_timeout, on_observation)
@@ -135,16 +141,12 @@ class PageChecker:
         else:
             # A 2xx "challenge" may be a real page with an unlucky title, so read what it shows.
             sightings = tuple(shown_on_a_challenge(found))
-        if recording and snapshot is not None:
-            # Saved before deep scan was on, so start remembering its script addresses now.
-            snapshot.deep_seen = deep_seen
-            self._snapshots.save(page_url, snapshot)
-        results = await self._validate(sightings)
         # A challenge or a blank render didn't show the page, so no appearance window opens.
         read = block is None and bool(current)
-        await self._observe(
-            on_observation, Observation(page_url, seen_at, sightings, results, started, read)
-        )
+        await self._report(on_observation, page_url, sightings, seen_at, started, read=read)
+        if recording and snapshot is not None:
+            # Saved before deep scan was on, so start remembering its script addresses now.
+            self._record_deep(page_url, snapshot, deep_seen)
         candidates = tuple(sighting.address for sighting in sightings)
         if block is not None:
             return PageCheckOutcome(
@@ -165,9 +167,9 @@ class PageChecker:
             )
         launch = None
         if self._tuning.auto_turbo:
-            launch = await asyncio.to_thread(read_launch, first.html, seen_at)
+            launch = await self._launch(page_url, first.html, seen_at)
         if snapshot is None:
-            self._snapshots.save(page_url, Snapshot(current, deep_seen=deep_seen))
+            self._snapshots.save(page_url, Snapshot(current, deep_seen=deep_seen, baseline=True))
             return PageCheckOutcome(
                 page_url,
                 PageStatus.BASELINE,
@@ -181,6 +183,10 @@ class PageChecker:
             snapshot, current
         ):
             self._small.pop(page_url, None)
+            if snapshot.baseline:
+                # It held when compared, so it's the page and not a loading skeleton.
+                snapshot.baseline = False
+                self._snapshots.save(page_url, snapshot)
             return PageCheckOutcome(
                 page_url,
                 PageStatus.UNCHANGED,
@@ -204,11 +210,9 @@ class PageChecker:
             shown = shown_on_a_challenge(await self._sightings(signature, second))
             new = tuple(s for s in shown if s.address not in set(candidates))
             if new:
-                more = await self._validate(new)
-                observation = Observation(
-                    page_url, seen_again, new, more, started_again, read=False
+                await self._report(
+                    on_observation, page_url, new, seen_again, started_again, read=False
                 )
-                await self._observe(on_observation, observation)
                 candidates += tuple(sighting.address for sighting in new)
         if block is not None or not second.ok:
             reason = block.reason if block is not None else second.reason
@@ -227,12 +231,14 @@ class PageChecker:
         )
         new = tuple(s for s in again if s.address not in seen)
         if new:
-            more = await self._validate(new)
-            observation = Observation(
-                page_url, seen_again, new, more, started_again, read=bool(confirmed)
+            await self._report(
+                on_observation, page_url, new, seen_again, started_again, read=bool(confirmed)
             )
-            await self._observe(on_observation, observation)
             candidates += tuple(sighting.address for sighting in new)
+        if recording and deep_seen != snapshot.deep_seen:
+            # The confirming render's script addresses count as already there too, even when
+            # this round stops before the comparison.
+            self._record_deep(page_url, snapshot, deep_seen)
         if not confirmed:
             return PageCheckOutcome(
                 page_url,
@@ -266,16 +272,19 @@ class PageChecker:
         report, accepted = await asyncio.to_thread(
             self._detector.diff, snapshot.signature, confirmed, page_url, ignore=volatile
         )
-        noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
         now = self._clock()
-        report, memory = await asyncio.to_thread(
-            noise.apply,
-            report,
-            snapshot.noise,
-            now,
-            before=snapshot.signature,
-            after=accepted,
-        )
+        if self._was_skeleton(page_url, snapshot, confirmed):
+            report, memory = ChangeReport(page_url), snapshot.noise
+        else:
+            noise = NoiseFilter(self._tuning.flap_window, self._tuning.flap_threshold)
+            report, memory = await asyncio.to_thread(
+                noise.apply,
+                report,
+                snapshot.noise,
+                now,
+                before=snapshot.signature,
+                after=accepted,
+            )
         ticking = await asyncio.to_thread(
             self._shapes.learn, snapshot.volatile, snapshot.signature, current, confirmed, now
         )
@@ -361,6 +370,65 @@ class PageChecker:
         if not sightings:
             return ()
         return tuple(await self._validator.validate_many(s.address for s in sightings))
+
+    async def _report(
+        self,
+        observer: Observer | None,
+        page_url: str,
+        sightings: tuple[Sighting, ...],
+        seen_at: float,
+        started: float | None,
+        *,
+        read: bool,
+    ) -> None:
+        """Check the sighted addresses and report what a render showed, a token without delay.
+
+        A token's verdict goes out at once in its own observation; the verdicts that take
+        longer follow in later ones. Returns once every verdict is reported.
+        """
+        found = observations(
+            self._validator, page_url, sightings, seen_at=seen_at, started=started, read=read
+        )
+        async with contextlib.aclosing(found):
+            async for observation in found:
+                await self._observe(observer, observation)
+
+    def _record_deep(
+        self, page_url: str, snapshot: Snapshot, deep_seen: frozenset[str] | None
+    ) -> None:
+        """Save the script addresses the page's first deep-scan round found with its snapshot."""
+        snapshot.deep_seen = deep_seen
+        self._snapshots.save(page_url, snapshot)
+
+    @staticmethod
+    async def _launch(page_url: str, html: str, read_at: float) -> LaunchClues | None:
+        """Return what a render says about a coming launch, or None when reading it fails.
+
+        That reading only guesses, so a failure is logged and never fails the page check.
+        """
+        try:
+            return await asyncio.to_thread(read_launch, html, read_at)
+        except Exception:
+            log.exception("reading the launch clues on %s failed", page_url)
+            return None
+
+    @staticmethod
+    def _was_skeleton(page_url: str, snapshot: Snapshot, render: Signature) -> bool:
+        """True when a new page's first snapshot is much smaller than ``render``.
+
+        The first render then caught the page still loading (a skeleton), so ``render``
+        replaces it without a change report. Only the first comparison of that snapshot asks.
+        """
+        stored = len(snapshot.signature)
+        if not snapshot.baseline or stored >= _SMALL_RENDER * len(render):
+            return False
+        log.info(
+            "%s: its first render caught it loading (%d vs %d nodes); replaced without a report",
+            page_url,
+            stored,
+            len(render),
+        )
+        return True
 
     @staticmethod
     async def _observe(observer: Observer | None, observation: Observation) -> None:

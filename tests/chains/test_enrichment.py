@@ -97,7 +97,7 @@ class Backend:
                 self.dex_status, content=body, headers={"content-type": "application/json"}
             )
         if self.rpc_down:
-            raise httpx.ConnectError("down", request=request)
+            raise httpx.ReadTimeout("down", request=request)  # final at once: no retry pauses
         body = json.loads(request.content)
         items = body if isinstance(body, list) else [body]
         answers = []
@@ -267,6 +267,11 @@ async def test_sui_package_is_resolved_to_its_coin() -> None:
     ]
     backend.sui_packages = {SUI_PKG: {"helpers": ["Config"]}}  # no coin inside
     assert await make(backend).enrich(SUI_PACKAGE_CONTRACT) == TokenInfo()
+    # The validator passes on the coin it found: no second search, and the links name it.
+    carried = ConfirmedContract(Address(Chain.SUI, SUI_PKG), "Sui", SUI_COIN)
+    info = await make(backend).enrich(carried)
+    assert info.coin_type == SUI_COIN and info.pair == "USDC/SUI"
+    assert token_links(carried)[0] == ("Suiscan", f"https://suiscan.xyz/mainnet/coin/{SUI_COIN}")
 
 
 async def test_non_finite_market_numbers_are_dropped() -> None:
@@ -407,7 +412,7 @@ async def test_also_on_names_only_the_networks_where_the_address_is_a_token() ->
             tuning=FakeTuning(),
             sui_rpc_url="https://sui.rpc",
         )
-        found = await enricher._also_on(ETH_CONTRACT, 0.5)  # Sonic answers too late
+        found = await enricher._also_on(ETH_CONTRACT, 0.1)  # Sonic answers too late
     assert found == {"also_on": (("Base", "LIMP"), ("BSC", None))}
 
 

@@ -31,9 +31,13 @@ from scraper_bot.telegram.client import TelegramClient
 from scraper_bot.telegram.commands.help import HELP_TEXT, SETTINGS_USAGE, TURBO_USAGE, usage
 from scraper_bot.telegram.commands.parsing import ParsedCommand, parse_command, parse_turbo_request
 from scraper_bot.telegram.markup import code, escape
-from scraper_bot.telegram.timefmt import format_clock, format_duration, format_schedule
+from scraper_bot.telegram.timefmt import format_clock, format_schedule
 from scraper_bot.telegram.views.settings import describe_setting, settings_overview
-from scraper_bot.telegram.views.status import describe_auto_window
+from scraper_bot.telegram.views.status import (
+    describe_auto_window,
+    describe_turbo,
+    describe_turbo_plan,
+)
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +119,7 @@ class BotCommands:
         command = parse_command(text, self._telegram.username)
         if command is None:
             return
-        if chat_id not in self._commanders:
+        if not self._may_command(chat_id):
             await self._answer_stranger(chat_id, command.name)
             return
         reply = await self.execute(chat_id, command)
@@ -158,6 +162,10 @@ class BotCommands:
                 f"⚠️ Internal error while running {code('/' + command.name)}: {code(detail)}\n"
                 f"The bot keeps running; details are in the log."
             )
+
+    def _may_command(self, chat_id: int) -> bool:
+        """Return True when the chat may command the bot, also as the supergroup it became."""
+        return chat_id in self._commanders or self._telegram.former_id(chat_id) in self._commanders
 
     async def _answer_stranger(self, chat_id: int, name: str) -> None:
         """Tell an unauthorised chat its chat id on /start (rate limited); ignore the rest."""
@@ -250,6 +258,9 @@ class BotCommands:
                 f"{escape(c.spec.format(c.new))}"
                 for c in changes
             )
+            error = self._preferences.save_error
+            if error is not None:
+                lines.append(f"⚠️ Applied now, {_not_saved(error)}.")
             return "\n".join(lines)
         return describe_setting(self._preferences, tokens[0])
 
@@ -263,9 +274,11 @@ class BotCommands:
         confirmed = len(tokens) > 2 and tokens[2].lower() == "confirm"
         change = self._preferences.set(tokens[0], tokens[1], confirmed=confirmed)
         spec = change.spec
+        error = self._preferences.save_error
+        applied = "applies immediately" if error is None else f"applied now, {_not_saved(error)}"
         return (
             f"✅ {code(spec.key)}: {escape(spec.format(change.old))} → "
-            f"{escape(spec.format(change.new))} (applies immediately)"
+            f"{escape(spec.format(change.new))} ({applied})"
         )
 
     def _describe_confirmation(self, exc: ConfirmationRequired) -> str:
@@ -307,24 +320,17 @@ class BotCommands:
     def _turbo_status(self) -> str:
         """Return the turbo sessions and auto-turbo windows, or the usage when there are none."""
         assert self._turbo is not None
-        lines = []
-        for session in self._turbo.active():
-            stats = session.stats
-            lines.append(
-                f"🚀 {escape(session.url)}: {stats.cycles} cycles, {stats.renders} renders, "
-                f"{len(stats.found)} confirmed, {session.pending_count} pending, "
-                f"{format_duration(session.seconds_left)} left; "
-                f"stop with {code(f'/turbo stop {session.url}')}"
-            )
-        for plan in self._turbo.scheduled():
-            when = format_schedule(plan.start_at, time.time())
-            lines.append(
-                f"⏰ {escape(plan.url)}: starts at {when} for "
-                f"{plan.minutes:.0f} min; "
-                f"cancel with {code(f'/turbo stop {plan.url}')}"
-            )
+        now = time.time()
+        lines = [
+            f"{describe_turbo(session)}; stop with {code(f'/turbo stop {session.url}')}"
+            for session in self._turbo.active()
+        ]
         lines += [
-            f"{describe_auto_window(window, time.time())}; "
+            f"{describe_turbo_plan(plan, now)}; cancel with {code(f'/turbo stop {plan.url}')}"
+            for plan in self._turbo.scheduled()
+        ]
+        lines += [
+            f"{describe_auto_window(window, now)}; "
             f"cancel with {code(f'/turbo stop {window.site_url}')}"
             for window in self._turbo.auto_windows()
         ]
@@ -444,3 +450,8 @@ class BotCommands:
         if isinstance(error, SiteNotPaused):
             return f"▶️ {escape(error.url)} is not paused."
         return f"❌ {escape(error)}"
+
+
+def _not_saved(error: str) -> str:
+    """Return the words for a settings change that preferences.json could not keep."""
+    return f"not saved ({escape(error)}), lasts until a restart"

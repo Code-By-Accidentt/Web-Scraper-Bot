@@ -82,17 +82,35 @@ async def test_api_and_transport_errors_return_false() -> None:
         assert await client.send_message(1, "boom") is False
 
 
-async def test_send_document_uses_multipart_upload() -> None:
+async def test_a_group_that_became_a_supergroup_is_followed_to_its_new_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    seen: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/sendDocument")
-        assert request.headers["content-type"].startswith("multipart/form-data")
-        assert b'filename="c.txt"' in request.content
-        assert b"0xabc" in request.content
-        return httpx.Response(200, json={"ok": True, "result": {}})
+        seen.append(form(request)["chat_id"])
+        if seen[-1] == "-1":  # what the Bot API answers once a group was upgraded
+            description = "Bad Request: group chat was upgraded to a supergroup chat"
+            return httpx.Response(
+                400,
+                json={
+                    "ok": False,
+                    "error_code": 400,
+                    "description": description,
+                    "parameters": {"migrate_to_chat_id": -100123},
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 5}})
 
     client, http = make_client(handler)
-    async with http:
-        assert await client.send_document(1, "c.txt", b"0xabc\n", "caption")
+    with caplog.at_level(logging.ERROR, logger="scraper_bot.telegram.client"):
+        async with http:
+            sent = await client.send_tracked(-1, "alert")
+            assert sent is not None and sent.chat_id == -100123  # the details edit goes there
+            assert await client.send_message(-1, "reply")
+    assert seen == ["-1", "-100123", "-100123"]  # resent, then sent there straight away
+    assert client.former_id(-100123) == -1  # so its commands count like the group's
+    assert "Put -100123 in place of -1 in TELEGRAM_CHAT_IDS" in caplog.text
 
 
 async def test_get_updates_returns_list_or_none() -> None:
@@ -106,8 +124,6 @@ async def test_get_updates_returns_list_or_none() -> None:
         assert request.url.params["timeout"] == "30"
         if not responses:
             raise httpx.ReadTimeout("slow", request=request)
-        if request.url.params.get("offset") == "10":
-            assert request.url.params["offset"] == "10"
         return responses.pop(0)
 
     client, http = make_client(handler)
@@ -266,6 +282,7 @@ async def test_broadcast_and_broadcast_document_reach_every_chat() -> None:
             messages.append(form(request)["chat_id"])
         else:
             assert request.url.path.endswith("/sendDocument")
+            assert request.headers["content-type"].startswith("multipart/form-data")
             documents.append(request.content)
         return httpx.Response(200, json={"ok": True, "result": {}})
 
@@ -368,10 +385,10 @@ async def test_a_quiet_chat_takes_a_short_burst_at_once_then_one_a_second() -> N
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramClient("123:secret", http, sleep=sleep, clock=lambda: now)
-        message = await client.send_tracked(1, "alert 0", patient=True)
+        message = await client.send_tracked(1, "alert 0")
         assert message is not None
         assert await client.edit_message_text(message, "alert 0 + details")
-        more = [client.send_tracked(1, f"alert {i}", patient=True) for i in range(1, 6)]
+        more = [client.send_tracked(1, f"alert {i}") for i in range(1, 6)]
         assert all(await asyncio.gather(*more))
     # An alert, its details and three more alerts go at once; then one a second.
     assert seen == [
@@ -409,7 +426,7 @@ async def test_a_patient_send_waits_out_a_long_flood_limit() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramClient("123:secret", http, sleep=record)
-        sent = await client.send_tracked(1, "alert", patient=True)
+        sent = await client.send_tracked(1, "alert")
     assert sent is not None and sent.message_id == 7 and waits == [35.0]
 
     answers[:] = [httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 35}})]
@@ -435,10 +452,7 @@ async def test_a_burst_waits_its_turn_and_a_flood_wait_pauses_the_whole_chat() -
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramClient("123:secret", http, sleep=sleep, clock=lambda: now)
-        alerts = [
-            asyncio.create_task(client.send_tracked(1, f"alert {i}", patient=True))
-            for i in range(10)
-        ]
+        alerts = [asyncio.create_task(client.send_tracked(1, f"alert {i}")) for i in range(10)]
         while len(seen) < 4:
             await asyncio.sleep(0)
         assert await client.send_message(1, "reply")  # a command reply skips the backlog
@@ -470,7 +484,7 @@ async def test_a_patient_send_rides_out_a_telegram_5xx() -> None:
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         client = TelegramClient("123:secret", http, sleep=sleep)
-        assert await client.send_document(1, "c.txt", b"0xabc\n", patient=True)
+        assert await client.send_tracked(1, "alert") is not None
         assert pauses == [2, 4]
         answers[:] = [httpx.Response(502, text="Bad Gateway"), answers[0]]
         assert not await client.send_message(1, "reply")  # a reply is not resent after a 5xx
@@ -498,7 +512,7 @@ async def test_only_requests_that_never_left_are_sent_again() -> None:
 
     client, http = make_client(lost_answer)
     async with http:
-        assert await client.send_message(1, "hi", patient=True) is False
+        assert await client.send_tracked(1, "hi") is None
     assert reads == ["sent"]  # never resent: that could duplicate the alert
 
 
@@ -574,7 +588,7 @@ async def test_a_patient_send_waits_longer_and_longer_while_offline() -> None:
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = TelegramClient("123:secret", http, sleep=sleep)
     async with http:
-        assert await client.send_message(1, "🔔 token", patient=True)
+        assert await client.send_tracked(1, "🔔 token") is not None
     assert pauses == [2, 4, 8, 16, 30, 30, 30]  # about two minutes offline
     pauses.clear()
     calls = 3  # three more failures: all a reply gets

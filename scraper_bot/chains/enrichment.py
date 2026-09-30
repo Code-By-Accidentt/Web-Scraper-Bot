@@ -173,14 +173,16 @@ class TokenEnricher:
         """Collect what can be learned about the token within ``enrich_timeout`` seconds.
 
         Each source has its own budget, so a slow network in "also on" costs neither the age
-        line nor the name or the market. A bare Sui package needs its coin type before the
-        market lookup, which then gets what is left. The chain's facts win over DexScreener's.
+        line nor the name or the market. A bare Sui package whose coin type the validator
+        did not pass on needs it before the market lookup, which then gets what is left. The
+        chain's facts win over DexScreener's.
         """
         budget = float(self._tuning.enrich_timeout)
         if budget <= 0:
             return TokenInfo()
         value = contract.address.value
-        if contract.address.chain is Chain.SUI and not is_sui_coin_type(value):
+        bare_package = contract.address.chain is Chain.SUI and not is_sui_coin_type(value)
+        if bare_package and not contract.coin_type:
             started = time.monotonic()
             on_chain = await self._bounded(self._chain_details(contract), budget, "chain")
             coin_type = on_chain.get("coin_type")
@@ -191,7 +193,7 @@ class TokenEnricher:
         else:
             on_chain, market, age, others = await asyncio.gather(
                 self._bounded(self._chain_details(contract), budget, "chain"),
-                self._bounded(self._market_details(contract), budget, "market"),
+                self._bounded(self._market_details(contract, contract.coin_type), budget, "market"),
                 self._bounded(self._age(contract), budget, "age"),
                 # We keep the networks that answer in time. The outer bound is just a safety net.
                 self._bounded(
@@ -226,7 +228,7 @@ class TokenEnricher:
             return await self._erc20_details(client, contract.address.value) if client else {}
         if contract.address.chain is Chain.SOLANA:
             return await self._solana_details(contract.address.value)
-        return await self._sui_details(self._sui, contract.address.value)
+        return await self._sui_details(self._sui, contract.address.value, contract.coin_type)
 
     @staticmethod
     async def _erc20_details(client: JsonRpcClient, address: str) -> dict[str, Any]:
@@ -277,19 +279,22 @@ class TokenEnricher:
         return details
 
     @staticmethod
-    async def _sui_details(client: JsonRpcClient, value: str) -> dict[str, Any]:
+    async def _sui_details(
+        client: JsonRpcClient, value: str, coin_type: str | None = None
+    ) -> dict[str, Any]:
         """Return the Sui coin's name, symbol, decimals and total supply.
 
-        A bare package id is first resolved to the coin it defines; that coin type is
-        returned too.
+        A bare package id is first resolved to the coin it defines, unless ``coin_type``
+        already names it; that coin type is returned too.
         """
-        if is_sui_coin_type(value):
-            coin_type, metadata = value, await coin_metadata(client, value)
-        else:
+        if coin_type is None and not is_sui_coin_type(value):
             found = await find_coin(client, value)
             if found is None:
                 return {}
             coin_type, metadata = found
+        else:
+            coin_type = coin_type or value
+            metadata = await coin_metadata(client, coin_type)
         details: dict[str, Any] = {}
         if coin_type != value:
             details["coin_type"] = coin_type

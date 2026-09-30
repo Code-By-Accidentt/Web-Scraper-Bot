@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 
 _NOTICE_WAIT = 2.0  # how long a caller waits for its notice to go out before moving on (s)
 _REPORT_WAIT = 10.0  # same for a problem report, since its caller wants to know it went out
+_ALERTS_OUT_WAIT = 300.0  # how long a follow-up notice waits for the alerts ahead of it (s)
 
 
 class Notifier:
@@ -71,6 +72,7 @@ class Notifier:
         self._background: set[asyncio.Future[Any]] = set()
         # Token alerts and documents that haven't gone out yet, so a summary can wait for them.
         self._unsent: set[asyncio.Future[Any]] = set()
+        self._outbox_failing = False  # a failed save was reported; quiet until a save works
         self.outbox: Outbox | None = None
 
     async def started(self, version: str, total_sites: int, running: int) -> None:
@@ -530,44 +532,63 @@ class Notifier:
         entry: OutboxEntry,
         out: asyncio.Future[None],
     ) -> None:
-        """Send the token alert first, then edit the token's details into it.
+        """Send the token alert to its chats and edit the token's details into each copy.
 
-        ``out`` is resolved once the send is over, which lets waiting notices go. Details
+        The sends are queued first and never wait for the details, which are looked up
+        meanwhile; a chat gets its edit once both its own send and the details are ready.
+        ``out`` is resolved once every send is over, which lets waiting notices go. Details
         never cost the alert: if they fail or add nothing, the first text stays.
         """
         text = "\n".join([*head, *middle, *link_lines(contract)])
+        sends = [
+            asyncio.ensure_future(self._send_alert(chat_id, text, entry))
+            for chat_id in list(entry.chats)
+        ]
+        all_sent = asyncio.gather(*sends, return_exceptions=True)
+        all_sent.add_done_callback(lambda _: _settle(out))
+        details = None
+        if self._enricher is not None:
+            details = asyncio.ensure_future(self._with_details(contract, head, middle))
         try:
-            sent = await self._send_tracked(text, entry)
+            await asyncio.gather(*(self._edit_in(send, details) for send in sends))
         finally:
-            if not out.done():
-                out.set_result(None)
-        if not sent or self._enricher is None:
-            return
+            if details is not None:
+                details.cancel()  # still running only when no chat got the alert
+            _settle(out)
+
+    async def _send_alert(self, chat_id: int, text: str, entry: OutboxEntry) -> SentMessage | None:
+        """Send a token alert to one chat, then strike that chat off the alert's outbox entry."""
+        message = await self._telegram.send_tracked(chat_id, text)
+        self._delivered(entry, chat_id)
+        return message
+
+    async def _with_details(
+        self, contract: ConfirmedContract, head: list[str], middle: list[str]
+    ) -> str | None:
+        """Return the alert text with the token's details, or None if they fail or add nothing."""
+        assert self._enricher is not None
         try:
             info = await self._enricher.enrich(contract)
             details = describe_token(info, self._clock())
         except Exception:
             log.warning("token details failed for %s", contract.address.value, exc_info=True)
-            return
+            return None
         if not [line for line in details if line != NO_PAIR_YET] and not info.coin_type:
+            return None
+        return "\n".join([*head, *details, *middle, *link_lines(contract, info.coin_type)])
+
+    async def _edit_in(
+        self,
+        send: asyncio.Future[SentMessage | None],
+        details: asyncio.Future[str | None] | None,
+    ) -> None:
+        """Edit the details into one chat's alert once its send and the details are done."""
+        message = await send
+        if message is None or details is None:
             return
-        text = "\n".join([*head, *details, *middle, *link_lines(contract, info.coin_type)])
-        await asyncio.gather(*(self._telegram.edit_message_text(m, text) for m in sent))
-
-    async def _send_tracked(self, text: str, entry: OutboxEntry) -> list[SentMessage]:
-        """Send ``text`` patiently to the chats of an alert; return the messages that went out.
-
-        Each chat is struck off the alert's outbox entry once its send is over.
-        """
-
-        async def send(chat_id: int) -> SentMessage | None:
-            """Send the alert to one chat, then strike that chat off the entry."""
-            message = await self._telegram.send_tracked(chat_id, text, patient=True)
-            self._delivered(entry, chat_id)
-            return message
-
-        sent = await asyncio.gather(*(send(chat_id) for chat_id in list(entry.chats)))
-        return [message for message in sent if message is not None]
+        text = await details
+        if text is not None:
+            await self._telegram.edit_message_text(message, text)
 
     def _spawn_alert(
         self,
@@ -652,8 +673,10 @@ class Notifier:
         if self.outbox is not None:
             try:
                 self.outbox.add(entry)
-            except OSError as exc:
+            except Exception as exc:  # any failure: the alert must go out all the same
                 self._outbox_failed(exc)
+            else:
+                self._outbox_failing = False
         return entry
 
     def _delivered(self, entry: OutboxEntry, chat_id: int) -> None:
@@ -662,12 +685,18 @@ class Notifier:
             return
         try:
             self.outbox.delivered(entry, chat_id)
-        except OSError as exc:
+        except Exception as exc:
             self._outbox_failed(exc)
 
-    def _outbox_failed(self, exc: OSError) -> None:
-        """Log and report that the outbox cannot be saved; the alerts still go out."""
+    def _outbox_failed(self, exc: Exception) -> None:
+        """Log that the outbox cannot be saved, and report it once until a save works again.
+
+        The alerts still go out.
+        """
         log.error("saving the outbox failed: %s", exc)
+        if self._outbox_failing:
+            return
+        self._outbox_failing = True
         self.report_later(
             "outbox-save",
             "Saving unsent alerts (outbox.json) failed",
@@ -739,7 +768,10 @@ class Notifier:
         self._ship_document(filename, "\n".join(lines) + "\n", caption)
 
 
-_ALERTS_OUT_WAIT = 300.0  # how long a follow-up notice waits for the alerts ahead of it (s)
+def _settle(future: asyncio.Future[None]) -> None:
+    """Mark ``future`` as done, unless it already is."""
+    if not future.done():
+        future.set_result(None)
 
 
 def _launch_at(timestamp: float, now: float) -> str:

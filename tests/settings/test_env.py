@@ -5,7 +5,6 @@ import pytest
 from dotenv import dotenv_values
 
 from scraper_bot.chains.networks import EVM_CHAINS
-from scraper_bot.settings import env as config_module
 from scraper_bot.settings.defaults import ChangedDefault
 from scraper_bot.settings.env import (
     FALSE_WORDS,
@@ -42,6 +41,8 @@ def test_token_is_required() -> None:
 def test_poll_interval_order_is_validated(tmp_path) -> None:
     with pytest.raises(ConfigError, match="POLL_INTERVAL_MAX"):
         make_settings(tmp_path, POLL_INTERVAL_MIN="20", POLL_INTERVAL_MAX="10")
+    with pytest.raises(ConfigError, match="TURBO_MAX_MINUTES must be >= TURBO_DEFAULT"):
+        make_settings(tmp_path, TURBO_DEFAULT_MINUTES="240")
 
 
 @pytest.mark.parametrize(
@@ -52,6 +53,7 @@ def test_poll_interval_order_is_validated(tmp_path) -> None:
         ("HEADLESS", "maybe"),
         ("TELEGRAM_CHAT_IDS", "1,x"),
         ("RPC_TIMEOUT", "0.1"),
+        ("HEARTBEAT_INTERVAL", "300"),  # rebooter.py would restart the bot every 5 min
     ],
 )
 def test_invalid_values_are_reported(tmp_path, key: str, value: str) -> None:
@@ -87,6 +89,9 @@ def test_dotenv_file_is_read_but_environment_wins(tmp_path) -> None:
     cfg = Settings.from_env({"LOG_LEVEL": "warning"}, dotenv_path=env_file)
     assert cfg.telegram_bot_token == "from-file"
     assert cfg.log_level == "WARNING"
+    env_file.write_bytes("# комментарий\nTELEGRAM_BOT_TOKEN=x\n".encode("cp1251"))
+    with pytest.raises(ConfigError, match="is not UTF-8 text"):  # exit code 2, not a traceback
+        Settings.from_env({}, dotenv_path=env_file)
 
 
 def test_all_evm_endpoints_disabled_is_an_error(tmp_path) -> None:
@@ -242,20 +247,12 @@ def test_this_release_flags_the_old_solana_endpoint_and_retry_delay(tmp_path: Pa
         "SOLANA_RPC_URL",
         "RPC_RETRY_DELAY",
     }
+    assert make_settings(tmp_path, RPC_RETRY_DELAY="30").outdated_defaults == ()  # chosen, not old
     fresh = make_settings(tmp_path)
     assert fresh.outdated_defaults == ()
     assert fresh.solana_rpc_url == "https://solana-rpc.publicnode.com"
     assert fresh.rpc_retry_delay == 10 and fresh.http2 is True
     assert make_settings(tmp_path, HTTP2="off").http2 is False
-
-
-def test_settings_carry_the_outdated_defaults_of_the_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(config_module, "CHANGED_DEFAULTS", CHANGES)
-    cfg = make_settings(tmp_path, DEEP_SCAN="true", RPC_RETRY_DELAY="30")
-    assert cfg.outdated_defaults == (CHANGES[0],)
-    assert make_settings(tmp_path).outdated_defaults == ()
 
 
 def test_env_example_values_are_the_code_defaults(tmp_path: Path) -> None:

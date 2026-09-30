@@ -141,6 +141,7 @@ class TurboManager:
         if start_at is not None and start_at > now + 1:
             plan = ScheduledTurbo(url, start_at, minutes)
             task = asyncio.create_task(self._start_later(plan), name=f"turbo-timer:{url}")
+            task.add_done_callback(lambda done, u=url: self._on_timer_done(u, done))
             self._scheduled[url] = (plan, task)
             return plan
         return await self._launch(url, minutes * 60)
@@ -256,4 +257,23 @@ class TurboManager:
                 f"Turbo session for {url} crashed",
                 f"{type(error).__name__}: {error}",
                 hint="The session is over; start it again with /turbo when the cause is fixed.",
+            )
+
+    def _on_timer_done(self, url: str, task: asyncio.Task[None]) -> None:
+        """Tell the user when a scheduled session failed to start.
+
+        A plan cancelled by /turbo stop, or called off by a shutdown, is no failure.
+        """
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None or isinstance(error, TurboNotRunning):
+            return
+        log.error("scheduled turbo session for %s failed to start: %r", url, error, exc_info=error)
+        if self._notifier is not None:
+            self._notifier.report_later(
+                f"turbo:{url}",
+                f"Scheduled turbo session for {url} did not start",
+                f"{type(error).__name__}: {error}",
+                hint="Start it with /turbo when the cause is fixed.",
             )

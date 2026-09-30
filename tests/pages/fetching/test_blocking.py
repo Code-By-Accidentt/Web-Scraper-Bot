@@ -223,7 +223,7 @@ def test_a_title_that_only_uses_the_words_is_a_page(title: str) -> None:
     assert inspect(status=200, html=f"<html><head><title>{title}</title></head></html>") is None
 
 
-def test_cloudflare_scripts_on_a_normal_page_do_not_make_a_challenge() -> None:
+def test_a_bare_503_is_an_outage_not_a_refusal() -> None:
     origin_error = (
         "<html><head><title>Service unavailable</title>"
         "<script src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'></script></head>"
@@ -231,6 +231,11 @@ def test_cloudflare_scripts_on_a_normal_page_do_not_make_a_challenge() -> None:
     )
     signal = inspect(status=503, html=origin_error, headers={"server": "cloudflare"})
     assert signal is not None and signal.protection == "Cloudflare"  # the CDN, no challenge
+    assert signal.outage  # the server behind it is down (a deploy, maintenance)
+    refused = inspect(status=None, error="Page.goto: net::ERR_CONNECTION_REFUSED at x")
+    assert refused is not None and refused.outage
+    assert not inspect(status=503, html=CHALLENGE).outage  # "Just a moment...": a refusal
+    assert not inspect(status=503, html="", headers={"x-amzn-waf-action": "block"}).outage
 
 
 def test_the_widget_search_stays_fast_on_hostile_markup() -> None:

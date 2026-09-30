@@ -194,7 +194,11 @@ async def test_full_site_lifecycle_through_commands(tmp_path: Path) -> None:
 
 async def test_usage_hints_and_errors(tmp_path: Path) -> None:
     _, telegram, commands = make(tmp_path)
-    assert await send(commands, telegram, "/add") == "Usage: /add <url>"
+    for name in ("add", "remove", "pause", "resume", "notify", "nonotifi"):
+        assert await send(commands, telegram, f"/{name}") == f"Usage: /{name} <url>"
+    # An alias answers with the name that was typed.
+    assert await send(commands, telegram, "/mute") == "Usage: /mute <url>"
+    assert await send(commands, telegram, "/unmute") == "Usage: /unmute <url>"
     assert (await send(commands, telegram, "/add not a url")).startswith("❌")
     assert "Unknown command /bogus" in await send(commands, telegram, "/bogus")
     assert "is not monitored" in await send(commands, telegram, "/pause nothing.io")
@@ -265,9 +269,12 @@ def test_parse_turbo_request() -> None:
     assert parse_turbo_request(["x.io", "5", "in", "2h"], NOW).start_at == NOW + 7200
     at = parse_turbo_request(["x.io", "at", "23:59"], NOW).start_at
     assert at is not None and NOW < at <= NOW + 86_400
+    assert parse_turbo_request(["x.io", "in", "168h"], NOW).start_at == NOW + 7 * 86_400
     for bad in (["x.io", "in", "soon"], ["x.io", "at", "25:00"], ["x.io", "bogus"]):
         with pytest.raises(ValueError):
             parse_turbo_request(bad, NOW)
+    with pytest.raises(ValueError, match="at most 7 days"):  # /status could not show it
+        parse_turbo_request(["x.io", "in", "9999999h"], NOW)
 
 
 def make_turbo() -> TurboManager:
@@ -298,7 +305,7 @@ async def test_turbo_commands(tmp_path: Path) -> None:
         assert (await send(commands, telegram, "/turbo example.com in 1h")).startswith(
             "⏰ Turbo for https://example.com scheduled at "
         )
-        assert "starts at" in await send(commands, telegram, "/turbo")
+        assert "scheduled at" in await send(commands, telegram, "/turbo")
         assert (await send(commands, telegram, "/turbo x.io bogus")).startswith("❌")
         await send(commands, telegram, "/turbo stop example.com")
         assert "for 1 min." in await send(commands, telegram, "/turbo example.com 0")
@@ -346,6 +353,21 @@ async def test_set_validates_confirms_and_persists(tmp_path: Path) -> None:
     reset = await send(commands, telegram, "/settings reset all")
     assert "poll_interval_min: 10 s → 4 s" in reset and "require_erc20: off → on" in reset
     assert await send(commands, telegram, "/set") == strip_markup(SETTINGS_USAGE)
+
+
+async def test_a_setting_that_cannot_be_saved_still_applies_until_a_restart(
+    tmp_path: Path,
+) -> None:
+    manager, telegram, _ = make(tmp_path)
+    (tmp_path / "data").write_text("a file where the data directory should be", encoding="utf-8")
+    prefs = Preferences(make_settings(tmp_path), tmp_path / "data" / "prefs.json")
+    commands = BotCommands(manager, telegram, alert_chat_ids=(1,), preferences=prefs)
+    reply = await send(commands, telegram, "/set poll_interval_min 10")
+    assert reply.startswith("✅ poll_interval_min: 4 s → 10 s (applied now, not saved (")
+    assert reply.endswith("), lasts until a restart)")
+    assert prefs.poll_interval_min == 10
+    reset = await send(commands, telegram, "/settings reset all")
+    assert reset.splitlines()[-1].startswith("⚠️ Applied now, not saved (")
 
 
 async def test_settings_cannot_be_read_or_changed_from_other_chats(tmp_path: Path) -> None:
@@ -430,15 +452,6 @@ async def test_mute_and_unmute_aliases(tmp_path: Path) -> None:
         assert manager.sites()[0].notifications_enabled is True
     finally:
         await manager.shutdown()
-
-
-async def test_usage_hints_for_every_url_command(tmp_path: Path) -> None:
-    _, telegram, commands = make(tmp_path)
-    for name in ("remove", "pause", "resume", "notify", "nonotifi"):
-        assert await send(commands, telegram, f"/{name}") == f"Usage: /{name} <url>"
-    # An alias answers with the name that was typed.
-    assert await send(commands, telegram, "/mute") == "Usage: /mute <url>"
-    assert await send(commands, telegram, "/unmute") == "Usage: /unmute <url>"
 
 
 async def test_list_shows_stopped_blocked_and_last_change(tmp_path: Path) -> None:

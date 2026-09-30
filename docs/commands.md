@@ -39,15 +39,17 @@ argument answers with its usage line, under the name that was typed (`/mute` ans
 
 | Command | Effect |
 | --- | --- |
-| `/turbo <url> [minutes] [at HH:MM \| in 10m]` | Render the site's root page and its live sub-pages, `turbo_max_pages` pages in all (root included), every `turbo_interval` seconds and announce every new confirmed token at once. An address that is not a token yet is checked every `turbo_recheck_interval` seconds and announced the moment it is deployed; what a page shows on its first good render and already exists is old news. Stops after `turbo_stop_after` confirmed tokens, the timer, `/turbo stop` or a block. `minutes` defaults to `turbo_default_minutes` and is capped at `turbo_max_minutes`. `at 15:30` / `in 10m` (or `2h`) arm it for later; `at` means the server's clock and time zone, which the reply shows together with the time left. |
+| `/turbo <url> [minutes] [at HH:MM \| in 10m]` | Render the site's root page and its live sub-pages, `turbo_max_pages` pages in all (root included), every `turbo_interval` seconds and announce every new confirmed token at once. An address that is not a token yet is checked every `turbo_recheck_interval` seconds and announced the moment it is deployed; what a page shows on its first good render and already exists is old news. Stops after `turbo_stop_after` confirmed tokens, the timer, `/turbo stop` or a block. `minutes` defaults to `turbo_default_minutes` and is capped at `turbo_max_minutes`. `at 15:30` / `in 10m` (or `2h`, at most `168h`: 7 days) arm it for later; `at` means the server's clock and time zone, which the reply shows together with the time left. |
 | `/turbo stop <url>` | End a session or cancel a scheduled one, and end the site's auto-turbo window. |
 | `/turbo` | Status of running and scheduled sessions and of the auto-turbo windows. |
 
 Replies: `🚀 Turbo started for …: 4 page(s) every 2s for 30 min.`, `⏰ Turbo for …
 scheduled at 2026-09-23 15:30 (UTC+03:00, in 2h 5m) for 30 min. Cancel with /turbo stop …`, `⏹️ Turbo stopped
 for …`, `🚀 Turbo is already running (or scheduled) for …`, `❌ Turbo limit reached: at
-most 1 site(s) at a time.`, `❌ No turbo session for …`. Sessions do not survive a
-restart.
+most 1 site(s) at a time.`, `❌ No turbo session for …`. `/turbo` shows the sessions
+like `/status`, with the command that ends each: `🚀 Turbo …: 41 cycles, 164 renders, 0
+confirmed, 2 pending, 28m 40s left; stop with /turbo stop …`, `⏰ Turbo …: scheduled at …
+for 30 min; cancel with /turbo stop …`. Sessions do not survive a restart.
 
 ### Auto-turbo
 
@@ -104,7 +106,7 @@ again.
 
 | Command | Effect |
 | --- | --- |
-| `/unverified <url> on` | Announce every new address on the site at once (wallets and example addresses included) and re-check it on-chain every `unverified_recheck_minutes` for `unverified_watch_hours`; alerts above `unverified_max_per_hour` become one digest. Per site, persisted. |
+| `/unverified <url> on` | Announce every new address on the site at once (wallets and example addresses included) and re-check it on-chain every `unverified_recheck_minutes` for `unverified_watch_hours` (at most 25 per round, those checked longest ago first); alerts above `unverified_max_per_hour` become one digest. Per site, persisted. |
 | `/unverified <url> off` | Back to confirmed contracts only. |
 | `/unverified` | Which sites have the mode on. |
 
@@ -122,6 +124,9 @@ Replies: `✅ poll_interval_min: 4 s → 6 s (applies immediately)`, `⚠️ Bel
 most sites rate-limit or block the bot's IP. To apply anyway, repeat: /set
 poll_interval_min 2 confirm`, `♻️ Restored .env values: …`, `❌ unknown setting 'x';
 /settings lists them all`, `❌ poll_interval_min must not exceed poll_interval_max (10)`.
+When `data/preferences.json` cannot be written, the change still applies and the reply
+says `(applied now, not saved (…), lasts until a restart)` (after a reset: `⚠️ Applied
+now, not saved (…), lasts until a restart.`).
 
 The full list of live keys is in [configuration.md](configuration.md).
 
@@ -129,20 +134,20 @@ The full list of live keys is in [configuration.md](configuration.md).
 
 | Command | Effect |
 | --- | --- |
-| `/status` | Version and uptime, browser state, sites with their last round (duration, pages rendered, rounds), last change, what the light mode polls (`light: 2 page(s) and 1 API(s) every 1 s, 1 rendered every 30 s`, and `through the browser` for a site that refuses plain requests), pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), RPC endpoints that stopped answering, turbo sessions and auto-turbo windows, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
+| `/status` | Version and uptime, browser state, sites with their last round (duration, pages rendered, rounds), last change, what the light mode polls (`light: 2 page(s) and 1 API(s) every 1 s, 1 rendered every 30 s`, and `through the browser` for a site that refuses plain requests), pages timing out (from their 🐢 alert to their ✅), block state (with the protection when known), a server that seems down (`⚠️ server down? HTTP 503 since 14:02`: a bare 503 or a refused connection, which sends no alert), RPC endpoints that stopped answering, turbo sessions and auto-turbo windows, addresses waiting to become a token, cache sizes. A site whose monitor crashed shows `⛔ stopped by an error: it restarts on its own, /resume restarts it now` and counts as stopped. |
 | `/help` | The command list. |
 | `/start` | Your chat id (needed for `TELEGRAM_CHAT_IDS`) plus the command list. |
 
 Example `/status`:
 
 ```text
-🤖 scraper-bot 2.3.0, up 3h 12m
+🤖 scraper-bot 2.3.1, up 3h 12m
 Browser: connected
 ⚠️ RPC not answering: Fantom for 2m 10s
 Sites: 2 total, 2 running, 0 paused
 • https://app.flutch.fun: last round 4s ago (2.0s, 4 page(s), 1187 rounds); last change 2026-09-23 12:01; light: 4 page(s) and 1 API(s) every 1 s
 • https://docs.example.io: last round 6s ago (1.3s, 1 page(s), 1190 rounds); 🐢 1 page(s) timing out
-🚀 Turbo https://app.flutch.fun: 41 cycles, 0 confirmed, 2 pending, 28m 40s left
+🚀 Turbo https://app.flutch.fun: 41 cycles, 164 renders, 0 confirmed, 2 pending, 28m 40s left
 ⏰ Auto-turbo https://docs.example.io: countdown “Launch in 02:10:00”; from 2026-09-30 14:50 (UTC+00:00, in 2h) until 16:00
 ⏳ 3 address(es) watched until they become a token
 Address cache: 14 known contract(s), 231 rejected
